@@ -1775,6 +1775,13 @@ func (e *CookieExtension) Len() int {
 }
 
 func (e *CookieExtension) Read(b []byte) (int, error) {
+	if len(e.Cookie) == 0 {
+		return 0, errors.New("tls: cookie extension cannot have empty cookie")
+	}
+	if len(e.Cookie) > 65531 {
+		return 0, errors.New("tls: cookie too long")
+	}
+
 	cookieLen := len(e.Cookie)
 
 	if len(b) < e.Len() {
