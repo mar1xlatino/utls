@@ -401,12 +401,18 @@ func aesgcmPreferred(ciphers []uint16) bool {
 }
 
 func cipherRC4(key, iv []byte, isRead bool) any {
-	cipher, _ := rc4.NewCipher(key)
+	cipher, err := rc4.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
 	return cipher
 }
 
 func cipher3DES(key, iv []byte, isRead bool) any {
-	block, _ := des.NewTripleDESCipher(key)
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		panic(err)
+	}
 	if isRead {
 		return cipher.NewCBCDecrypter(block, iv)
 	}
@@ -414,7 +420,10 @@ func cipher3DES(key, iv []byte, isRead bool) any {
 }
 
 func cipherAES(key, iv []byte, isRead bool) any {
-	block, _ := aes.NewCipher(key)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
 	if isRead {
 		return cipher.NewCBCDecrypter(block, iv)
 	}
