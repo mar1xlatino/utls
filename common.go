@@ -986,11 +986,30 @@ func (c *Config) Clone() *Config {
 	}
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
+
+	// Deep copy NameToCertificate map to prevent shared state
+	var nameToCert map[string]*Certificate
+	if c.NameToCertificate != nil {
+		nameToCert = make(map[string]*Certificate, len(c.NameToCertificate))
+		for k, v := range c.NameToCertificate {
+			nameToCert[k] = v
+		}
+	}
+
+	// Deep copy ApplicationSettings map including byte slice values
+	var appSettings map[string][]byte
+	if c.ApplicationSettings != nil {
+		appSettings = make(map[string][]byte, len(c.ApplicationSettings))
+		for k, v := range c.ApplicationSettings {
+			appSettings[k] = append([]byte(nil), v...)
+		}
+	}
+
 	return &Config{
 		Rand:                                c.Rand,
 		Time:                                c.Time,
 		Certificates:                        c.Certificates,
-		NameToCertificate:                   c.NameToCertificate,
+		NameToCertificate:                   nameToCert,
 		GetCertificate:                      c.GetCertificate,
 		GetClientCertificate:                c.GetClientCertificate,
 		GetConfigForClient:                  c.GetConfigForClient,
@@ -998,7 +1017,7 @@ func (c *Config) Clone() *Config {
 		VerifyConnection:                    c.VerifyConnection,
 		RootCAs:                             c.RootCAs,
 		NextProtos:                          c.NextProtos,
-		ApplicationSettings:                 c.ApplicationSettings,
+		ApplicationSettings:                 appSettings,
 		ServerName:                          c.ServerName,
 		ClientAuth:                          c.ClientAuth,
 		ClientCAs:                           c.ClientCAs,
