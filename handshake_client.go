@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -539,9 +540,19 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 
 	// Set the pre_shared_key extension. See RFC 8446, Section 4.2.11.1.
 	ticketAge := c.config.time().Sub(time.Unix(int64(session.createdAt), 0))
+
+	// Prevent integer overflow when converting ticketAge to uint32 milliseconds.
+	// If the ticket is older than ~49.7 days (math.MaxUint32 milliseconds),
+	// the conversion would wrap around, making old tickets appear young.
+	// Skip resumption in this case as the ticket is too old anyway.
+	ticketAgeMs := int64(ticketAge / time.Millisecond)
+	if ticketAgeMs < 0 || ticketAgeMs > math.MaxUint32 {
+		return nil, nil, nil, nil
+	}
+
 	identity := pskIdentity{
 		label:               session.ticket,
-		obfuscatedTicketAge: uint32(ticketAge/time.Millisecond) + session.ageAdd,
+		obfuscatedTicketAge: uint32(ticketAgeMs) + session.ageAdd,
 	}
 	hello.pskIdentities = []pskIdentity{identity}
 	hello.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
