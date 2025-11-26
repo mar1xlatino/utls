@@ -141,6 +141,11 @@ func (e *SNIExtension) Read(b []byte) (int, error) {
 	if len(hostName) == 0 {
 		return 0, io.EOF
 	}
+	// SNI extension data length is 5 + len(hostName), must fit in uint16.
+	// Maximum hostname length is 65530 bytes (65535 - 5 byte overhead).
+	if len(hostName) > 65530 {
+		return 0, errors.New("tls: server name too long for SNI extension")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -617,6 +622,14 @@ type ALPNExtension struct {
 }
 
 func (e *ALPNExtension) writeToUConn(uc *UConn) error {
+	for _, proto := range e.AlpnProtocols {
+		if len(proto) == 0 {
+			return errors.New("tls: ALPN protocol cannot be empty")
+		}
+		if len(proto) > 255 {
+			return errors.New("tls: ALPN protocol too long (max 255 bytes)")
+		}
+	}
 	uc.config.NextProtos = e.AlpnProtocols
 	uc.HandshakeState.Hello.AlpnProtocols = e.AlpnProtocols
 	return nil
@@ -633,6 +646,13 @@ func (e *ALPNExtension) Len() int {
 func (e *ALPNExtension) Read(b []byte) (int, error) {
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
+	}
+
+	// Validate protocol lengths before writing (defense in depth)
+	for _, s := range e.AlpnProtocols {
+		if len(s) == 0 || len(s) > 255 {
+			return 0, errors.New("tls: invalid ALPN protocol length (must be 1-255 bytes)")
+		}
 	}
 
 	b[0] = byte(extensionALPN >> 8)
@@ -714,6 +734,13 @@ func (e *applicationSettingsExtension) Len(supportedProtocols []string) int {
 func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []string) (int, error) {
 	if len(b) < e.Len(supportedProtocols) {
 		return 0, io.ErrShortBuffer
+	}
+
+	// Validate protocol lengths before writing (defense in depth)
+	for _, s := range supportedProtocols {
+		if len(s) == 0 || len(s) > 255 {
+			return 0, errors.New("tls: invalid ALPS protocol length (must be 1-255 bytes)")
+		}
 	}
 
 	// Read Type.
@@ -1246,6 +1273,12 @@ func (e *KeyShareExtension) keySharesLen() int {
 }
 
 func (e *KeyShareExtension) Read(b []byte) (int, error) {
+	// RFC 8446 Section 4.2.8: key_exchange has minimum length of 1 byte
+	for _, ks := range e.KeyShares {
+		if len(ks.Data) == 0 {
+			return 0, errors.New("tls: key_share extension has empty key data")
+		}
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
