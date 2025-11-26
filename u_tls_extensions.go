@@ -358,6 +358,14 @@ func (e *SupportedPointsExtension) Len() int {
 }
 
 func (e *SupportedPointsExtension) Read(b []byte) (int, error) {
+	// Points list is prefixed with 1-byte length, max 255 entries
+	if len(e.SupportedPoints) > 255 {
+		return 0, errors.New("tls: too many ec_point_formats (max 255)")
+	}
+	// RFC 4492: at minimum, uncompressed point format must be supported
+	if len(e.SupportedPoints) == 0 {
+		return 0, errors.New("tls: ec_point_formats extension cannot be empty")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -1813,7 +1821,10 @@ func (e *FakeRecordSizeLimitExtension) Read(b []byte) (int, error) {
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
-	// https://tools.ietf.org/html/draft-balfanz-tls-channelid-00
+	// RFC 8449: record_size_limit must be between 64 and 16384 (2^14)
+	if e.Limit < 64 || e.Limit > 16384 {
+		return 0, errors.New("tls: record_size_limit must be between 64 and 16384")
+	}
 	b[0] = byte(fakeRecordSizeLimit >> 8)
 	b[1] = byte(fakeRecordSizeLimit & 0xff)
 
