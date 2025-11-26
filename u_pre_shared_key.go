@@ -371,6 +371,10 @@ func (e *FakePreSharedKeyExtension) Read(b []byte) (int, error) {
 	if !e.OmitEmptyPsk && e.Len() == 0 {
 		return 0, ErrEmptyPsk
 	}
+	// RFC 8446: number of binders must match number of identities
+	if len(e.Identities) != len(e.Binders) {
+		return 0, errors.New("tls: FakePreSharedKeyExtension.Read failed: binder count must match identity count")
+	}
 	for _, b := range e.Binders {
 		if !(anyTrue(validHashLen, func(_ int, valid *int) bool {
 			return len(b) == *valid
@@ -465,6 +469,11 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 		bindersLength -= uint16(binderLength)
 	}
 
+	// RFC 8446: number of binders must match number of identities
+	if len(e.Identities) != len(e.Binders) {
+		return 0, errors.New("tls: invalid PSK extension: binder count must match identity count")
+	}
+
 	return fullLen, nil
 }
 
@@ -476,6 +485,11 @@ func (e *FakePreSharedKeyExtension) UnmarshalJSON(data []byte) error {
 
 	if err := json.Unmarshal(data, &pskAccepter); err != nil {
 		return err
+	}
+
+	// RFC 8446: number of binders must match number of identities
+	if len(pskAccepter.PskIdentities) != len(pskAccepter.PskBinders) {
+		return errors.New("tls: invalid PSK JSON: binder count must match identity count")
 	}
 
 	e.Identities = pskAccepter.PskIdentities
