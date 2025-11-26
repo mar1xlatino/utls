@@ -1571,19 +1571,7 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 		go func() {
 			select {
 			case <-handshakeCtx.Done():
-				// Close the connection with timeout to prevent goroutine leak
-				// if the underlying connection's Close() blocks (e.g., hung socket)
-				closeDone := make(chan struct{})
-				go func() {
-					_ = c.conn.Close()
-					close(closeDone)
-				}()
-				select {
-				case <-closeDone:
-					// Close completed normally
-				case <-time.After(5 * time.Second):
-					// Close timed out, proceed anyway to avoid blocking forever
-				}
+				_ = c.conn.Close()
 				interruptRes <- handshakeCtx.Err()
 			case <-done:
 				interruptRes <- nil
