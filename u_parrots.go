@@ -1440,6 +1440,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&FakeRecordSizeLimitExtension{
 					Limit: 0x4001,
 				},
+				&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle},
 				&GREASEEncryptedClientHelloExtension{
 					CandidateCipherSuites: []HPKESymmetricCipherSuite{
 						{
