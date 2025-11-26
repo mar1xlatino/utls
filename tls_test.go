@@ -903,6 +903,8 @@ func TestCloneNonFuncFields(t *testing.T) {
 			continue // these are unexported fields that are handled separately
 		case "ApplicationSettings": // [UTLS] ALPS (Application Settings)
 			f.Set(reflect.ValueOf(map[string][]byte{"a": {1}}))
+		case "RecordPadding": // [UTLS] TLS 1.3 record padding
+			f.Set(reflect.ValueOf(&RecordPaddingConfig{Enabled: true, MinPadding: 1, MaxPadding: 16}))
 		default:
 			t.Errorf("all fields must be accounted for, but saw unknown field %q", fn)
 		}
