@@ -1555,7 +1555,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					ECDSAWithP384AndSHA384,
 					ECDSAWithSHA1,
 					PSSWithSHA384,
-					PSSWithSHA384,
 					PKCS1WithSHA384,
 					PSSWithSHA512,
 					PKCS1WithSHA512,
@@ -1619,7 +1618,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA256,
 					ECDSAWithP384AndSHA384,
 					ECDSAWithSHA1,
-					PSSWithSHA384,
 					PSSWithSHA384,
 					PKCS1WithSHA384,
 					PSSWithSHA512,
@@ -1712,7 +1710,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA256,
 					ECDSAWithP384AndSHA384,
 					ECDSAWithSHA1,
-					PSSWithSHA384,
 					PSSWithSHA384,
 					PKCS1WithSHA384,
 					PSSWithSHA512,
@@ -2813,7 +2810,23 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 		uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
 	}
 	if GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension1) == GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2) {
-		uconn.greaseSeed[ssl_grease_extension2] ^= 0x1010
+		// Generate a new random seed that produces a different GREASE value.
+		// The original XOR by 0x1010 created a detectable fingerprint because
+		// (grease_ext1 ^ grease_ext2) was always 0x0000 or 0x1010, whereas real
+		// Chrome/BoringSSL generates independent random GREASE values.
+		// GREASE values (0x?A?A pattern per RFC 8701) depend only on bits 4-7 of the seed.
+		var newSeedBytes [2]byte
+		_, err = io.ReadFull(uconn.config.rand(), newSeedBytes[:])
+		if err != nil {
+			return errors.New("tls: short read from Rand for GREASE dedup: " + err.Error())
+		}
+		newSeed := binary.LittleEndian.Uint16(newSeedBytes[:])
+		ext1Nibble := uconn.greaseSeed[ssl_grease_extension1] & 0xf0
+		// If the random seed would produce the same GREASE value, shift to next nibble
+		if (newSeed & 0xf0) == ext1Nibble {
+			newSeed = (newSeed &^ 0xf0) | (((newSeed & 0xf0) + 0x10) & 0xf0)
+		}
+		uconn.greaseSeed[ssl_grease_extension2] = newSeed
 	}
 
 	hello.CipherSuites = make([]uint16, len(p.CipherSuites))
