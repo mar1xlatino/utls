@@ -12,9 +12,33 @@ import (
 	"crypto/subtle"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 
 	"golang.org/x/crypto/cryptobyte"
+)
+
+// Sentinel errors for session ticket decryption failures.
+// These allow callers to distinguish between different failure modes.
+var (
+	// ErrTicketDecryptionFailed indicates the session ticket could not be decrypted.
+	// This typically occurs when MAC verification fails due to:
+	//   - Expired tickets encrypted with rotated-out keys
+	//   - Forged or tampered tickets
+	//   - Tickets from a different server or cluster
+	// This error is not returned by DecryptTicket (which returns nil, nil for
+	// backward compatibility) but can be used by custom UnwrapSession implementations.
+	ErrTicketDecryptionFailed = errors.New("tls: session ticket decryption failed")
+
+	// ErrTicketTooShort indicates the session ticket is shorter than the minimum
+	// required length (AES block size + HMAC-SHA256 size).
+	ErrTicketTooShort = errors.New("tls: session ticket too short")
+
+	// ErrTicketParsingFailed indicates the session ticket was successfully decrypted
+	// (MAC verification passed) but the decrypted payload could not be parsed.
+	// This is a security-relevant condition: a cryptographically valid ticket with
+	// corrupt contents may indicate data corruption, a bug, or a sophisticated attack.
+	ErrTicketParsingFailed = errors.New("tls: session ticket parsing failed after successful decryption")
 )
 
 // A SessionState is a resumable session.
@@ -348,16 +372,29 @@ func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, er
 // DecryptTicket decrypts a ticket encrypted by [Config.EncryptTicket]. It can
 // be used as a [Config.UnwrapSession] implementation.
 //
-// If the ticket can't be decrypted or parsed, DecryptTicket returns (nil, nil).
+// If the ticket can't be decrypted (MAC verification fails), DecryptTicket
+// returns (nil, nil). This is expected behavior for expired, forged, or
+// mismatched tickets.
+//
+// If the ticket is successfully decrypted but cannot be parsed, DecryptTicket
+// returns (nil, ErrTicketParsingFailed) with the underlying error wrapped.
+// This indicates a cryptographically valid ticket with corrupt contents,
+// which may be a security concern.
 func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionState, error) {
 	ticketKeys := c.ticketKeys(nil)
 	stateBytes := c.decryptTicket(identity, ticketKeys)
 	if stateBytes == nil {
+		// Decryption failed (MAC mismatch, ticket too short, etc.)
+		// This is expected for old/forged tickets - return nil to ignore
 		return nil, nil
 	}
 	s, err := ParseSessionState(stateBytes)
 	if err != nil {
-		return nil, nil // drop unparsable tickets on the floor
+		// SECURITY: Ticket passed MAC verification but payload is corrupt.
+		// This is unexpected and may indicate data corruption, a bug in
+		// ticket generation, or a sophisticated attack. Return error so
+		// callers can log/monitor this condition.
+		return nil, fmt.Errorf("%w: %v", ErrTicketParsingFailed, err)
 	}
 	return s, nil
 }
