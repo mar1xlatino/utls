@@ -99,7 +99,9 @@ func (g *GREASETransportParameter) ID() uint64 {
 func (g *GREASETransportParameter) Value() []byte {
 	if len(g.ValueOverride) == 0 {
 		g.ValueOverride = make([]byte, g.Length)
-		rand.Read(g.ValueOverride)
+		if _, err := rand.Read(g.ValueOverride); err != nil {
+			panic("tls: failed to generate GREASE parameter: " + err.Error())
+		}
 	}
 	return g.ValueOverride
 }
