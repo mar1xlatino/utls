@@ -37,7 +37,13 @@ type cacheEntry struct {
 // for the BoringSSL reference.
 type certCache struct {
 	sync.Map
+	count atomic.Int64
 }
+
+// maxCertCacheEntries limits the certificate cache size to prevent unbounded
+// memory growth. Go finalizers are not guaranteed to run promptly, so entries
+// with zero refs may accumulate. This limit triggers proactive eviction.
+const maxCertCacheEntries = 10000
 
 var globalCertCache = new(certCache)
 
@@ -70,7 +76,24 @@ func (cc *certCache) active(e *cacheEntry) *activeCert {
 
 // evict removes a cacheEntry from the cache.
 func (cc *certCache) evict(e *cacheEntry) {
-	cc.Delete(string(e.cert.Raw))
+	if _, deleted := cc.LoadAndDelete(string(e.cert.Raw)); deleted {
+		cc.count.Add(-1)
+	}
+}
+
+// evictStale removes entries with zero active references. This is a safety
+// mechanism to clean up entries whose finalizers have not run yet, preventing
+// unbounded cache growth in long-running processes.
+func (cc *certCache) evictStale() {
+	cc.Range(func(key, value any) bool {
+		entry := value.(*cacheEntry)
+		if entry.refs.Load() == 0 {
+			if _, deleted := cc.LoadAndDelete(key); deleted {
+				cc.count.Add(-1)
+			}
+		}
+		return true
+	})
 }
 
 // newCert returns a x509.Certificate parsed from der. If there is already a copy
@@ -82,6 +105,12 @@ func (cc *certCache) newCert(der []byte) (*activeCert, error) {
 		return cc.active(entry.(*cacheEntry)), nil
 	}
 
+	// Proactively evict stale entries if approaching capacity.
+	// This prevents unbounded growth when finalizers lag behind.
+	if cc.count.Load() >= maxCertCacheEntries {
+		cc.evictStale()
+	}
+
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
 		return nil, err
@@ -91,5 +120,6 @@ func (cc *certCache) newCert(der []byte) (*activeCert, error) {
 	if entry, loaded := cc.LoadOrStore(string(der), entry); loaded {
 		return cc.active(entry.(*cacheEntry)), nil
 	}
+	cc.count.Add(1)
 	return cc.active(entry), nil
 }
