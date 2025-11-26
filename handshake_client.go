@@ -1171,10 +1171,11 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 			}
 		} else {
 			opts := x509.VerifyOptions{
-				Roots:       c.config.RootCAs,
-				CurrentTime: c.config.time(),
+				Roots:         c.config.RootCAs,
+				CurrentTime:   c.config.time(),
 				// DNSName:       c.serverName, // [uTLS]
 				Intermediates: x509.NewCertPool(),
+				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 			}
 
 			// [UTLS SECTION START]
@@ -1207,10 +1208,11 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	} else if !c.config.InsecureSkipVerify {
 		// [UTLS SECTION START]
 		opts := x509.VerifyOptions{
-			Roots:       c.config.RootCAs,
-			CurrentTime: c.config.time(),
+			Roots:         c.config.RootCAs,
+			CurrentTime:   c.config.time(),
 			// DNSName:       c.serverName, // [uTLS]
 			Intermediates: x509.NewCertPool(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		}
 
 		if c.config.InsecureSkipTimeVerify {
