@@ -362,8 +362,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
 					VersionTLS12,
-					VersionTLS11,
-					VersionTLS10,
 				}},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -434,8 +432,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
 					VersionTLS12,
-					VersionTLS11,
-					VersionTLS10,
 				}},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -1538,7 +1534,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				TLS_RSA_WITH_AES_128_CBC_SHA256,
 				TLS_RSA_WITH_AES_256_CBC_SHA,
 				TLS_RSA_WITH_AES_128_CBC_SHA,
-				0xc008,
+				FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_RSA_WITH_3DES_EDE_CBC_SHA,
 			},
@@ -1602,7 +1598,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				TLS_RSA_WITH_AES_128_CBC_SHA256,
 				TLS_RSA_WITH_AES_256_CBC_SHA,
 				TLS_RSA_WITH_AES_128_CBC_SHA,
-				0xc008,
+				FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_RSA_WITH_3DES_EDE_CBC_SHA,
 			},
@@ -1681,7 +1677,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				TLS_RSA_WITH_AES_128_CBC_SHA256,
 				TLS_RSA_WITH_AES_256_CBC_SHA,
 				TLS_RSA_WITH_AES_128_CBC_SHA,
-				0xc008,
+				FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
 				TLS_RSA_WITH_3DES_EDE_CBC_SHA,
 			},
@@ -1741,10 +1737,10 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CipherSuites: []uint16{
 				TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 				TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				0xcca9, // Cipher Suite: TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca9)
+				TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
 				TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 				TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				0xcca8, // Cipher Suite: TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca8)
+				TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 				TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 				TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
 				TLS_RSA_WITH_AES_128_GCM_SHA256,
