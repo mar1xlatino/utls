@@ -458,6 +458,9 @@ func (e *SignatureAlgorithmsExtension) Len() int {
 }
 
 func (e *SignatureAlgorithmsExtension) Read(b []byte) (int, error) {
+	if len(e.SupportedSignatureAlgorithms) == 0 {
+		return 0, errors.New("tls: signature_algorithms extension cannot be empty")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -1409,12 +1412,13 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 	// Validate algorithm IDs per RFC 8879 Section 7.3:
 	// - 1 = zlib (RFC 8879)
 	// - 2 = brotli (RFC 8879)
-	// - 65280-65535 = reserved for private/experimental use
+	// - 3 = zstd (RFC 8879)
+	// - 16384-65535 = reserved for private/experimental use
 	for _, alg := range e.Algorithms {
-		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli
-		isExperimentalRange := alg >= 65280 && alg <= 65535
+		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
+		isExperimentalRange := alg >= 16384 && alg <= 65535
 		if !isStandardAlgorithm && !isExperimentalRange {
-			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1=zlib, 2=brotli, or 65280-65535 for experimental)", alg)
+			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1=zlib, 2=brotli, 3=zstd, or 16384-65535 for experimental)", alg)
 		}
 	}
 
@@ -1453,6 +1457,18 @@ func (e *UtlsCompressCertExtension) Write(b []byte) (int, error) {
 			return 0, errors.New("unable to read cert compression algorithms extension data")
 		}
 		methods = append(methods, CertCompressionAlgo(method))
+	}
+
+	// Validate parsed algorithms per RFC 8879
+	if len(methods) == 0 {
+		return 0, errors.New("tls: compress_certificate extension requires at least one algorithm")
+	}
+	for _, alg := range methods {
+		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
+		isExperimentalRange := alg >= 16384 && alg <= 65535
+		if !isStandardAlgorithm && !isExperimentalRange {
+			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d", alg)
+		}
 	}
 
 	e.Algorithms = methods
@@ -2243,6 +2259,10 @@ func (e *FakeRecordSizeLimitExtension) Write(b []byte) (int, error) {
 	extData := cryptobyte.String(b)
 	if !extData.ReadUint16(&e.Limit) {
 		return 0, errors.New("unable to read record size limit extension data")
+	}
+	// RFC 8449: record_size_limit must be between 64 and 16385 (2^14+1)
+	if e.Limit < 64 || e.Limit > 16385 {
+		return 0, errors.New("tls: record_size_limit must be between 64 and 16385")
 	}
 	return fullLen, nil
 }
