@@ -111,8 +111,9 @@ type Conn struct {
 
 	// bytesSent counts the bytes of application data sent.
 	// packetsSent counts packets.
-	bytesSent   int64
-	packetsSent int64
+	// These counters use atomic operations for thread-safe concurrent access.
+	bytesSent   atomic.Int64
+	packetsSent atomic.Int64
 
 	// retryCount counts the number of consecutive non-advancing records
 	// received by Conn.readRecord. That is, records that neither advance the
@@ -480,7 +481,8 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
 
 // encrypt encrypts payload, adding the appropriate nonce and/or MAC, and
 // appends it to record, which must already contain the record header.
-func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, error) {
+// For TLS 1.3, paddingLen specifies how many zero bytes to add after the ContentType.
+func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader, paddingLen int) ([]byte, error) {
 	if hc.cipher == nil {
 		return append(record, payload...), nil
 	}
@@ -526,7 +528,17 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, err
 			record = append(record, record[0])
 			record[0] = byte(recordTypeApplicationData)
 
-			n := len(payload) + 1 + c.Overhead()
+			// [uTLS] Add TLS 1.3 record padding per RFC 8446 Section 5.4
+			// Padding zeros are added after ContentType byte
+			if paddingLen > 0 {
+				// Clamp padding to not exceed record limits
+				paddingLen = ClampPaddingToRecordLimit(len(payload), paddingLen)
+				// Append padding zeros (make() initializes to zeros)
+				padding := make([]byte, paddingLen)
+				record = append(record, padding...)
+			}
+
+			n := len(payload) + 1 + paddingLen + c.Overhead()
 			record[3] = byte(n >> 8)
 			record[4] = byte(n)
 
@@ -898,7 +910,7 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 		return maxPlaintext
 	}
 
-	if c.bytesSent >= recordSizeBoostThreshold {
+	if c.bytesSent.Load() >= recordSizeBoostThreshold {
 		return maxPlaintext
 	}
 
@@ -927,8 +939,8 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 	}
 
 	// Allow packet growth in arithmetic progression up to max.
-	pkt := c.packetsSent
-	c.packetsSent++
+	// Atomically increment and get the previous value (Add returns new value).
+	pkt := c.packetsSent.Add(1) - 1
 	if pkt > 1000 {
 		return maxPlaintext // avoid overflow in multiply below
 	}
@@ -947,7 +959,7 @@ func (c *Conn) write(data []byte) (int, error) {
 	}
 
 	n, err := c.conn.Write(data)
-	c.bytesSent += int64(n)
+	c.bytesSent.Add(int64(n))
 	return n, err
 }
 
@@ -957,7 +969,7 @@ func (c *Conn) flush() (int, error) {
 	}
 
 	n, err := c.conn.Write(c.sendBuf)
-	c.bytesSent += int64(n)
+	c.bytesSent.Add(int64(n))
 	c.sendBuf = nil
 	c.buffering = false
 	return n, err
@@ -1022,8 +1034,14 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 		outBuf[3] = byte(m >> 8)
 		outBuf[4] = byte(m)
 
+		// [uTLS] Generate TLS 1.3 record padding if configured
+		paddingLen := 0
+		if c.vers == VersionTLS13 && c.config.RecordPadding != nil {
+			paddingLen = c.config.RecordPadding.GeneratePadding()
+		}
+
 		var err error
-		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand())
+		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand(), paddingLen)
 		if err != nil {
 			return n, err
 		}

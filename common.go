@@ -838,6 +838,13 @@ type Config struct {
 	// improve latency.
 	DynamicRecordSizingDisabled bool
 
+	// RecordPadding controls TLS 1.3 record padding per RFC 8446 Section 5.4.
+	// When set, padding zeros are added to TLS 1.3 records to resist traffic
+	// analysis attacks. Padding is only applied to TLS 1.3 connections.
+	// If nil, no padding is added (default behavior for compatibility).
+	// Use DefaultRecordPaddingConfig() for Chrome-like padding behavior.
+	RecordPadding *RecordPaddingConfig // [uTLS]
+
 	// Renegotiation controls what types of renegotiation are supported.
 	// The default, none, is correct for the vast majority of applications.
 	Renegotiation RenegotiationSupport
@@ -1011,6 +1018,7 @@ func (c *Config) Clone() *Config {
 		CurvePreferences:                    c.CurvePreferences,
 		PQSignatureSchemesEnabled:           c.PQSignatureSchemesEnabled, // [UTLS]
 		DynamicRecordSizingDisabled:         c.DynamicRecordSizingDisabled,
+		RecordPadding:                       c.RecordPadding, // [uTLS]
 		Renegotiation:                       c.Renegotiation,
 		KeyLogWriter:                        c.KeyLogWriter,
 		EncryptedClientHelloConfigList:      c.EncryptedClientHelloConfigList,
