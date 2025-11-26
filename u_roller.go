@@ -57,8 +57,8 @@ func (c *Roller) Dial(network, addr, serverName string) (*UConn, error) {
 	workingHelloId := c.WorkingHelloID // keep using same helloID, if it works
 	c.HelloIDMu.Unlock()
 
-	// Shuffle the local copy (no lock needed - it's our private copy)
-	c.r.rand.Shuffle(len(helloIDs), func(i, j int) {
+	// Shuffle the local copy using thread-safe Shuffle method
+	c.r.Shuffle(len(helloIDs), func(i, j int) {
 		helloIDs[i], helloIDs[j] = helloIDs[j], helloIDs[i]
 	})
 	if workingHelloId != nil {

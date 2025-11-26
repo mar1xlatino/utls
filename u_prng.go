@@ -180,6 +180,14 @@ func (p *prng) Perm(n int) []int {
 	return p.rand.Perm(n)
 }
 
+// Shuffle is equivalent to math/rand.Shuffle.
+// Thread-safe wrapper that acquires randMutex before calling rand.Shuffle.
+func (p *prng) Shuffle(n int, swap func(i, j int)) {
+	p.randMutex.Lock()
+	defer p.randMutex.Unlock()
+	p.rand.Shuffle(n, swap)
+}
+
 // Range selects a random integer in [min, max].
 // If min < 0, min is set to 0. If max < min, min is returned.
 func (p *prng) Range(min, max int) int {

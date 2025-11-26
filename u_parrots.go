@@ -3007,7 +3007,7 @@ func generateRandomizedSpec(
 		p.TLSVersMax = VersionTLS13
 		tls13ciphers := make([]uint16, len(defaultCipherSuitesTLS13))
 		copy(tls13ciphers, defaultCipherSuitesTLS13)
-		r.rand.Shuffle(len(tls13ciphers), func(i, j int) {
+		r.Shuffle(len(tls13ciphers), func(i, j int) {
 			tls13ciphers[i], tls13ciphers[j] = tls13ciphers[j], tls13ciphers[i]
 		})
 		// appending TLS 1.3 ciphers before TLS 1.2, since that's what popular implementations do
@@ -3050,7 +3050,7 @@ func generateRandomizedSpec(
 		}
 	}
 
-	r.rand.Shuffle(len(sigAndHashAlgos), func(i, j int) {
+	r.Shuffle(len(sigAndHashAlgos), func(i, j int) {
 		sigAndHashAlgos[i], sigAndHashAlgos[j] = sigAndHashAlgos[j], sigAndHashAlgos[i]
 	})
 	sigAndHash := SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: sigAndHashAlgos}
@@ -3157,7 +3157,7 @@ func generateRandomizedSpec(
 		// TODO: randomly add DelegatedCredentialsExtension, once it is
 		// sufficiently popular.
 	}
-	r.rand.Shuffle(len(p.Extensions), func(i, j int) {
+	r.Shuffle(len(p.Extensions), func(i, j int) {
 		p.Extensions[i], p.Extensions[j] = p.Extensions[j], p.Extensions[i]
 	})
 
