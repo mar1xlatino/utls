@@ -243,6 +243,15 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	if !extData.ReadUint16LengthPrefixed(&ignored) {
 		return fullLen, errors.New("bad encapsulated key")
 	}
+	// Validate encapsulated key size: must not be empty and must have reasonable bounds.
+	// X25519 uses 32 bytes, P-256 uses 65 bytes, P-384/P-521 use more. 256 bytes covers all KEMs.
+	const maxEncapsulatedKeyLen = 256
+	if len(ignored) == 0 {
+		return fullLen, errors.New("tls: empty encapsulated key")
+	}
+	if len(ignored) > maxEncapsulatedKeyLen {
+		return fullLen, fmt.Errorf("tls: encapsulated key too large: %d > %d", len(ignored), maxEncapsulatedKeyLen)
+	}
 	g.EncapsulatedKey = make([]byte, len(ignored))
 	n, err := rand.Read(g.EncapsulatedKey)
 	if err != nil {
@@ -256,9 +265,18 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	if !extData.ReadUint16LengthPrefixed(&ignored) {
 		return fullLen, errors.New("bad payload")
 	}
+	// Validate payload size: must contain at least AEAD overhead + 1 byte of plaintext,
+	// and must not exceed reasonable bounds to prevent memory exhaustion.
+	const maxPayloadLen = 16384 // 16KB is sufficient for any realistic ECH payload
 	cipherOverhead := cipherLen(g.cipherSuite.AeadId, 0)
-	if len(ignored) < cipherOverhead {
-		return fullLen, fmt.Errorf("tls: payload too short for AEAD overhead: %d < %d", len(ignored), cipherOverhead)
+	if len(ignored) == 0 {
+		return fullLen, errors.New("tls: empty ECH payload")
+	}
+	if len(ignored) <= cipherOverhead {
+		return fullLen, fmt.Errorf("tls: payload too short for AEAD overhead: %d <= %d", len(ignored), cipherOverhead)
+	}
+	if len(ignored) > maxPayloadLen {
+		return fullLen, fmt.Errorf("tls: ECH payload too large: %d > %d", len(ignored), maxPayloadLen)
 	}
 	g.CandidatePayloadLens = []uint16{uint16(len(ignored) - cipherOverhead)}
 
