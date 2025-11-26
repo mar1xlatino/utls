@@ -126,6 +126,23 @@ type SNIExtension struct {
 	ServerName string // not an array because go crypto/tls doesn't support multiple SNIs
 }
 
+// validateSNIHostname validates hostname per RFC 6066 Section 3.
+// Returns error if hostname contains invalid characters.
+func validateSNIHostname(hostname string) error {
+	if len(hostname) == 0 {
+		return errors.New("tls: SNI hostname is empty")
+	}
+	// RFC 6066 Section 3: hostname must use ASCII encoding.
+	// Control characters and non-ASCII bytes are not permitted.
+	for i := 0; i < len(hostname); i++ {
+		c := hostname[i]
+		if c < 0x20 || c >= 0x7F {
+			return errors.New("tls: SNI hostname contains invalid character")
+		}
+	}
+	return nil
+}
+
 func (e *SNIExtension) Len() int {
 	// Literal IP addresses, absolute FQDNs, and empty strings are not permitted as SNI values.
 	// See RFC 6066, Section 3.
@@ -142,6 +159,10 @@ func (e *SNIExtension) Read(b []byte) (int, error) {
 	hostName := hostnameInSNI(e.ServerName)
 	if len(hostName) == 0 {
 		return 0, io.EOF
+	}
+	// Validate hostname characters per RFC 6066.
+	if err := validateSNIHostname(hostName); err != nil {
+		return 0, err
 	}
 	// SNI extension data length is 5 + len(hostName), must fit in uint16.
 	// Maximum hostname length is 65530 bytes (65535 - 5 byte overhead).
@@ -197,6 +218,10 @@ func (e *SNIExtension) Write(b []byte) (int, error) {
 		serverName = string(serverNameBytes)
 		if strings.HasSuffix(serverName, ".") {
 			return fullLen, errors.New("SNI value may not include a trailing dot")
+		}
+		// Validate hostname characters per RFC 6066.
+		if err := validateSNIHostname(serverName); err != nil {
+			return fullLen, err
 		}
 	}
 	// clientHelloSpec.Extensions = append(clientHelloSpec.Extensions, &SNIExtension{}) // gaukas moved this line out from the loop.
@@ -546,6 +571,10 @@ func (e *StatusRequestV2Extension) Write(b []byte) (int, error) {
 
 	if statusType != statusV2TypeOCSP {
 		return fullLen, errors.New("status request v2 extension statusType is not statusV2TypeOCSP(2)")
+	}
+
+	if !extData.Empty() {
+		return fullLen, errors.New("status request v2 extension has trailing data")
 	}
 
 	return fullLen, nil
@@ -1716,6 +1745,24 @@ func (e *PSKKeyExchangeModesExtension) Read(b []byte) (int, error) {
 
 	if len(e.Modes) > 255 {
 		return 0, errors.New("too many PSK Key Exchange modes")
+	}
+
+	// RFC 8446 Section 4.2.9: modes list cannot be empty
+	if len(e.Modes) == 0 {
+		return 0, errors.New("tls: PSK key exchange modes list cannot be empty per RFC 8446")
+	}
+
+	// Validate mode values and check for duplicates
+	seen := make(map[uint8]bool, len(e.Modes))
+	for _, mode := range e.Modes {
+		// Valid modes per RFC 8446: psk_ke (0) and psk_dhe_ke (1)
+		if mode != pskModePlain && mode != pskModeDHE {
+			return 0, fmt.Errorf("tls: invalid PSK key exchange mode %d, must be 0 (psk_ke) or 1 (psk_dhe_ke)", mode)
+		}
+		if seen[mode] {
+			return 0, fmt.Errorf("tls: duplicate PSK key exchange mode %d", mode)
+		}
+		seen[mode] = true
 	}
 
 	b[0] = byte(extensionPSKModes >> 8)
