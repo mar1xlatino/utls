@@ -256,7 +256,11 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	if !extData.ReadUint16LengthPrefixed(&ignored) {
 		return fullLen, errors.New("bad payload")
 	}
-	g.CandidatePayloadLens = []uint16{uint16(len(ignored) - cipherLen(g.cipherSuite.AeadId, 0))}
+	cipherOverhead := cipherLen(g.cipherSuite.AeadId, 0)
+	if len(ignored) < cipherOverhead {
+		return fullLen, fmt.Errorf("tls: payload too short for AEAD overhead: %d < %d", len(ignored), cipherOverhead)
+	}
+	g.CandidatePayloadLens = []uint16{uint16(len(ignored) - cipherOverhead)}
 
 	return fullLen, nil
 }
