@@ -171,6 +171,12 @@ func initializationGuardWithErr[E Initializable, I func(E)](extension E, initial
 	}
 	initializer(extension)
 	if !extension.IsInitialized() {
+		// Check if the extension provides a specific error reason
+		if errProvider, ok := any(extension).(InitErrorProvider); ok {
+			if initErr := errProvider.GetInitError(); initErr != nil {
+				return fmt.Errorf("tls: initialization failed: %w", initErr)
+			}
+		}
 		return errors.New("tls: initialization failed: the extension is not initialized after initialization")
 	}
 	return nil

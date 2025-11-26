@@ -819,3 +819,12 @@ type Initializable interface {
 	// If false is returned, utls will initialize the extension.
 	IsInitialized() bool
 }
+
+// InitErrorProvider is an optional interface that extensions can implement to provide
+// specific error reasons when initialization fails. This helps with debugging by
+// providing detailed error messages instead of generic "initialization failed" errors.
+type InitErrorProvider interface {
+	// GetInitError returns the error that occurred during initialization, or nil if
+	// initialization succeeded or hasn't been attempted yet.
+	GetInitError() error
+}

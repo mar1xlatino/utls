@@ -1,6 +1,9 @@
 package tls
 
-import "io"
+import (
+	"errors"
+	"io"
+)
 
 type ISessionTicketExtension interface {
 	TLSExtension
@@ -22,6 +25,7 @@ type SessionTicketExtension struct {
 	Session     *SessionState
 	Ticket      []byte
 	Initialized bool
+	InitError   error // Stores the reason if initialization failed
 }
 
 func (e *SessionTicketExtension) writeToUConn(uc *UConn) error {
@@ -57,16 +61,36 @@ func (e *SessionTicketExtension) IsInitialized() bool {
 }
 
 func (e *SessionTicketExtension) InitializeByUtls(session *SessionState, ticket []byte) {
-	// Validate preconditions - return early if invalid (initialization will fail gracefully)
+	// Clear any previous error
+	e.InitError = nil
+
+	// Validate preconditions - set specific error and return if invalid
 	if e.Initialized {
-		return // Already initialized, skip re-initialization
+		e.InitError = errors.New("tls: session ticket extension already initialized")
+		return
 	}
-	if session == nil || ticket == nil || session.version != VersionTLS12 {
-		return // Invalid session or not TLS 1.2, leave uninitialized
+	if session == nil {
+		e.InitError = errors.New("tls: session ticket initialization failed: session is nil")
+		return
 	}
+	if ticket == nil {
+		e.InitError = errors.New("tls: session ticket initialization failed: ticket is nil")
+		return
+	}
+	if session.version != VersionTLS12 {
+		e.InitError = errors.New("tls: session ticket initialization failed: session version mismatch (expected TLS 1.2)")
+		return
+	}
+
 	e.Session = session
 	e.Ticket = ticket
 	e.Initialized = true
+}
+
+// GetInitError returns the error that occurred during initialization, or nil if successful.
+// Implements InitErrorProvider interface.
+func (e *SessionTicketExtension) GetInitError() error {
+	return e.InitError
 }
 
 func (e *SessionTicketExtension) UnmarshalJSON(_ []byte) error {
