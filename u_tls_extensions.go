@@ -769,11 +769,19 @@ func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []strin
 		return 0, io.ErrShortBuffer
 	}
 
-	// Validate protocol lengths before writing (defense in depth)
+	// Validate protocol lengths and compute total size to check for uint16 overflow
+	var totalProtocolBytes int
 	for _, s := range supportedProtocols {
 		if len(s) == 0 || len(s) > 255 {
 			return 0, errors.New("tls: invalid ALPS protocol length (must be 1-255 bytes)")
 		}
+		totalProtocolBytes += 1 + len(s) // 1 byte length prefix + protocol string
+	}
+
+	// Extension data layout: 2 bytes (ALPS list length) + protocol entries
+	// The ALPS list length field is uint16, so max value is 65535
+	if totalProtocolBytes > 65535 {
+		return 0, errors.New("tls: ALPS extension data too large (exceeds 65535 bytes)")
 	}
 
 	// Read Type.
@@ -900,7 +908,12 @@ func (e *ApplicationSettingsExtensionNew) Write(b []byte) (int, error) {
 }
 
 // SCTExtension implements signed_certificate_timestamp (18)
+// RFC 6962 Section 3.3.1
 type SCTExtension struct {
+	// SCTs holds Signed Certificate Timestamps received from server.
+	// In ClientHello this should be empty (client advertises support).
+	// Servers populate this field when sending SCTs.
+	SCTs [][]byte
 }
 
 func (e *SCTExtension) writeToUConn(uc *UConn) error {
@@ -909,30 +922,104 @@ func (e *SCTExtension) writeToUConn(uc *UConn) error {
 }
 
 func (e *SCTExtension) Len() int {
-	return 4
+	if len(e.SCTs) == 0 {
+		// Empty extension: 2 bytes type + 2 bytes length (0)
+		return 4
+	}
+	// 2 bytes type + 2 bytes extension length + 2 bytes SCT list length
+	extLen := 2
+	for _, sct := range e.SCTs {
+		// Each SCT: 2 bytes length + data
+		extLen += 2 + len(sct)
+	}
+	return 4 + extLen
 }
 
 func (e *SCTExtension) Read(b []byte) (int, error) {
-	if len(b) < e.Len() {
-		return 0, io.ErrShortBuffer
-	}
 	// https://tools.ietf.org/html/rfc6962#section-3.3.1
 	// In ClientHello, SCT extension must be empty (RFC 6962)
 	// Only servers include actual SCTs in the extension
+	extLen := e.Len()
+	if len(b) < extLen {
+		return 0, io.ErrShortBuffer
+	}
+
+	// Calculate extension data length (excluding type and length fields)
+	dataLen := extLen - 4
+	// Validate extension data fits in uint16 length field
+	if dataLen > 65535 {
+		return 0, errors.New("tls: SCT extension data too large for uint16 length field")
+	}
+
 	b[0] = byte(extensionSCT >> 8)
 	b[1] = byte(extensionSCT)
-	// Write zero uint16 for the zero-length extension_data
-	b[2] = 0
-	b[3] = 0
-	return e.Len(), io.EOF
+	b[2] = byte(dataLen >> 8)
+	b[3] = byte(dataLen)
+
+	if len(e.SCTs) == 0 {
+		// Empty extension is valid for ClientHello (advertising support)
+		return extLen, io.EOF
+	}
+
+	// Write SCT list length
+	sctListLen := dataLen - 2
+	b[4] = byte(sctListLen >> 8)
+	b[5] = byte(sctListLen)
+
+	// Write individual SCTs
+	offset := 6
+	for _, sct := range e.SCTs {
+		sctLen := len(sct)
+		b[offset] = byte(sctLen >> 8)
+		b[offset+1] = byte(sctLen)
+		copy(b[offset+2:], sct)
+		offset += 2 + sctLen
+	}
+
+	return extLen, io.EOF
 }
 
 func (e *SCTExtension) UnmarshalJSON(_ []byte) error {
 	return nil // no-op
 }
 
-func (e *SCTExtension) Write(_ []byte) (int, error) {
-	return 0, nil
+func (e *SCTExtension) Write(b []byte) (int, error) {
+	fullLen := len(b)
+
+	// Empty extension data is valid - client advertises support without timestamps
+	if fullLen == 0 {
+		e.SCTs = nil
+		return 0, nil
+	}
+
+	extData := cryptobyte.String(b)
+
+	// Read SCT list (uint16 length-prefixed)
+	var sctList cryptobyte.String
+	if !extData.ReadUint16LengthPrefixed(&sctList) {
+		return 0, errors.New("tls: unable to read SCT list length")
+	}
+
+	// Empty SCT list after length prefix is valid (advertises support)
+	if sctList.Empty() {
+		e.SCTs = nil
+		return fullLen, nil
+	}
+
+	// Parse individual SCTs
+	var scts [][]byte
+	for !sctList.Empty() {
+		var sct []byte
+		if !readUint16LengthPrefixed(&sctList, &sct) {
+			return 0, errors.New("tls: unable to read SCT data")
+		}
+		if len(sct) == 0 {
+			return 0, errors.New("tls: empty SCT in SCT list")
+		}
+		scts = append(scts, sct)
+	}
+	e.SCTs = scts
+	return fullLen, nil
 }
 
 // GenericExtension allows to include in ClientHello arbitrary unsupported extensions.
@@ -1446,7 +1533,6 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 
 // expectedKeyShareSize returns the expected public key size for a given curve ID.
 // Returns -1 if the curve ID is unknown or variable-length (GREASE).
-// Returns 0 if the curve is valid but key data should be auto-generated (nil Data allowed).
 //
 // Key sizes per RFC 8446 Section 4.2.8.2 and RFC 7748/SEC1:
 //   - X25519: 32 bytes (RFC 7748)
@@ -1491,11 +1577,18 @@ func isValidKeyShareGroup(group CurveID) bool {
 }
 
 // validateKeyShare validates a single KeyShare entry.
-// If Data is nil, validation is skipped (key will be generated).
-// For GREASE values, any non-empty data is accepted.
+// Group ID is always validated. If Data is nil, size validation is skipped
+// (key will be auto-generated). For GREASE values, any non-empty data is accepted.
 // For known curves, the data length must match the expected public key size.
 func validateKeyShare(ks KeyShare) error {
-	// Skip validation if Data is nil (key will be auto-generated)
+	// Always validate group ID first - invalid groups must be rejected
+	// regardless of whether Data is present
+	if !isValidKeyShareGroup(ks.Group) {
+		return fmt.Errorf("tls: key_share has invalid group ID %d", ks.Group)
+	}
+
+	// If Data is nil, key will be auto-generated - skip size validation
+	// but group validation above ensures only valid groups reach key generation
 	if ks.Data == nil {
 		return nil
 	}
@@ -1505,12 +1598,7 @@ func validateKeyShare(ks KeyShare) error {
 		return fmt.Errorf("tls: key_share for group %d has empty key data", ks.Group)
 	}
 
-	// Validate group ID
-	if !isValidKeyShareGroup(ks.Group) {
-		return fmt.Errorf("tls: key_share has invalid group ID %d", ks.Group)
-	}
-
-	// For GREASE values, any non-empty data is valid
+	// For GREASE values, any non-empty data is valid (RFC 8701)
 	if ks.Group == GREASE_PLACEHOLDER || isGREASEUint16(uint16(ks.Group)) {
 		return nil
 	}
@@ -1708,6 +1796,23 @@ func (e *SupportedVersionsExtension) Read(b []byte) (int, error) {
 	extLen := 2 * len(e.Versions)
 	if extLen > 255 {
 		return 0, errors.New("too many supported versions")
+	}
+
+	// Validate versions: must be valid TLS versions (0x0300-0x0304) or GREASE values
+	// Also check for duplicates
+	seen := make(map[uint16]struct{}, len(e.Versions))
+	for _, v := range e.Versions {
+		// Check for duplicates
+		if _, exists := seen[v]; exists {
+			return 0, fmt.Errorf("tls: duplicate version 0x%04x in supported_versions extension", v)
+		}
+		seen[v] = struct{}{}
+
+		// Valid versions: SSL 3.0 (0x0300), TLS 1.0-1.3 (0x0301-0x0304), or GREASE values
+		isValidTLSVersion := v >= VersionSSL30 && v <= VersionTLS13
+		if !isValidTLSVersion && !isGREASEUint16(v) {
+			return 0, fmt.Errorf("tls: invalid version 0x%04x in supported_versions extension", v)
+		}
 	}
 
 	b[0] = byte(extensionSupportedVersions >> 8)
