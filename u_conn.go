@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"net"
 	"slices"
 	"strconv"
@@ -630,10 +631,35 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 
 	extensionsLen := 0
 	var paddingExt *UtlsPaddingExtension // reference to padding extension, if present
+
+	// Check for duplicate extension types (RFC 8446 forbids duplicates)
+	seenExts := make(map[uint16]bool)
+	var extBuf []byte // reusable buffer for reading extension type
+
 	for _, ext := range uconn.Extensions {
 		if pe, ok := ext.(*UtlsPaddingExtension); !ok {
-			// If not padding - just add length of extension to total length
-			extensionsLen += ext.Len()
+			extLen := ext.Len()
+			// Check for duplicate extension types
+			// Extensions with Len() >= 4 have at least type (2 bytes) + length (2 bytes)
+			if extLen >= 4 {
+				// Ensure buffer is large enough for this extension
+				if cap(extBuf) < extLen {
+					extBuf = make([]byte, extLen)
+				} else {
+					extBuf = extBuf[:extLen]
+				}
+				// Read extension to get its type from first 2 bytes
+				// Read() is idempotent - safe to call multiple times
+				if n, err := ext.Read(extBuf); n >= 2 && (err == nil || err == io.EOF) {
+					extType := uint16(extBuf[0])<<8 | uint16(extBuf[1])
+					if seenExts[extType] {
+						return fmt.Errorf("tls: duplicate extension type %d", extType)
+					}
+					seenExts[extType] = true
+				}
+			}
+			// Add length of extension to total length
+			extensionsLen += extLen
 		} else {
 			// If padding - process it later
 			if paddingExt == nil {

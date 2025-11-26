@@ -907,3 +907,99 @@ func TestDowngradeCanaryUTLS(t *testing.T) {
 
 	}
 }
+
+// TestDuplicateExtensionDetection verifies that MarshalClientHelloNoECH rejects
+// duplicate extension types, matching the behavior of the parsing side
+// (handshake_messages.go) which rejects duplicates per RFC 8446.
+func TestDuplicateExtensionDetection(t *testing.T) {
+	tests := []struct {
+		name        string
+		extensions  []TLSExtension
+		expectError bool
+		errorSubstr string
+	}{
+		{
+			name: "no duplicates - should succeed",
+			extensions: []TLSExtension{
+				&SNIExtension{ServerName: "example.com"},
+				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
+				&SupportedCurvesExtension{Curves: []CurveID{X25519, CurveP256}},
+			},
+			expectError: false,
+		},
+		{
+			name: "duplicate SNI extension - should fail",
+			extensions: []TLSExtension{
+				&SNIExtension{ServerName: "example.com"},
+				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13}},
+				&SNIExtension{ServerName: "other.com"}, // duplicate
+			},
+			expectError: true,
+			errorSubstr: "duplicate extension type",
+		},
+		{
+			name: "duplicate SupportedCurves - should fail",
+			extensions: []TLSExtension{
+				&SupportedCurvesExtension{Curves: []CurveID{X25519}},
+				&SNIExtension{ServerName: "example.com"},
+				&SupportedCurvesExtension{Curves: []CurveID{CurveP256}}, // duplicate
+			},
+			expectError: true,
+			errorSubstr: "duplicate extension type",
+		},
+		{
+			name: "duplicate GenericExtension with same ID - should fail",
+			extensions: []TLSExtension{
+				&GenericExtension{Id: 0x1234, Data: []byte{1, 2, 3}},
+				&SNIExtension{ServerName: "example.com"},
+				&GenericExtension{Id: 0x1234, Data: []byte{4, 5, 6}}, // duplicate ID
+			},
+			expectError: true,
+			errorSubstr: "duplicate extension type",
+		},
+		{
+			name: "different GenericExtension IDs - should succeed",
+			extensions: []TLSExtension{
+				&GenericExtension{Id: 0x1234, Data: []byte{1, 2, 3}},
+				&GenericExtension{Id: 0x5678, Data: []byte{4, 5, 6}},
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				ServerName: "example.com",
+			}
+			uconn := UClient(&net.TCPConn{}, config, HelloCustom)
+
+			// Set extensions directly on UConn to bypass ApplyPreset validation
+			// This tests MarshalClientHelloNoECH's duplicate detection specifically
+			uconn.Extensions = tt.extensions
+			uconn.HandshakeState.Hello.CipherSuites = []uint16{
+				TLS_AES_128_GCM_SHA256,
+				TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			}
+			uconn.HandshakeState.Hello.CompressionMethods = []byte{0x00}
+			uconn.HandshakeState.Hello.Random = make([]byte, 32)
+			uconn.HandshakeState.Hello.SessionId = make([]byte, 32)
+			uconn.HandshakeState.Hello.Vers = VersionTLS12
+
+			// Try to marshal the ClientHello
+			err := uconn.MarshalClientHelloNoECH()
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error for duplicate extensions, got nil")
+				} else if tt.errorSubstr != "" && !strings.Contains(err.Error(), tt.errorSubstr) {
+					t.Errorf("expected error containing %q, got %q", tt.errorSubstr, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
