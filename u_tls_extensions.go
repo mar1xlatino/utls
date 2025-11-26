@@ -565,6 +565,13 @@ func (e *SignatureAlgorithmsCertExtension) Len() int {
 }
 
 func (e *SignatureAlgorithmsCertExtension) Read(b []byte) (int, error) {
+	// Extension data must fit in uint16 (max 65535): 2 + 2*N <= 65535, so max N = 32766
+	if len(e.SupportedSignatureAlgorithms) > 32766 {
+		return 0, errors.New("tls: too many cert signature algorithms (max 32766)")
+	}
+	if len(e.SupportedSignatureAlgorithms) == 0 {
+		return 0, errors.New("tls: signature_algorithms_cert extension cannot be empty")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -1019,8 +1026,12 @@ func (e *ExtendedMasterSecretExtension) UnmarshalJSON(_ []byte) error {
 	return nil // no-op
 }
 
-func (e *ExtendedMasterSecretExtension) Write(_ []byte) (int, error) {
-	// https://tools.ietf.org/html/rfc7627
+func (e *ExtendedMasterSecretExtension) Write(b []byte) (int, error) {
+	// RFC 7627 Section 5.1: extended_master_secret extension MUST have
+	// zero-length extension_data. The entire encoding is 00 17 00 00.
+	if len(b) != 0 {
+		return 0, errors.New("tls: extended_master_secret extension must have empty data per RFC 7627")
+	}
 	return 0, nil
 }
 
@@ -1279,10 +1290,15 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 		return 0, errors.New("tls: too many compression algorithms (max 127)")
 	}
 
-	// Validate algorithm IDs per RFC 8879: 1=zlib, 2=brotli, 3=zstd
+	// Validate algorithm IDs per RFC 8879 Section 7.3:
+	// - 1 = zlib (RFC 8879)
+	// - 2 = brotli (RFC 8879)
+	// - 65280-65535 = reserved for private/experimental use
 	for _, alg := range e.Algorithms {
-		if alg < CertCompressionZlib || alg > CertCompressionZstd {
-			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1-3)", alg)
+		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli
+		isExperimentalRange := alg >= 65280 && alg <= 65535
+		if !isStandardAlgorithm && !isExperimentalRange {
+			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1=zlib, 2=brotli, or 65280-65535 for experimental)", alg)
 		}
 	}
 
@@ -1576,9 +1592,14 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
+	// e.Len() is called above, which sets e.marshalResult via Marshal()
+	// TLS extension data length is encoded as uint16, so max 65535 bytes
+	if len(e.marshalResult) > 65535 {
+		return 0, errors.New("tls: QUIC transport parameters too large for TLS extension (max 65535 bytes)")
+	}
+
 	b[0] = byte(extensionQUICTransportParameters >> 8)
 	b[1] = byte(extensionQUICTransportParameters)
-	// e.Len() is called before so that e.marshalResult is set
 	b[2] = byte((len(e.marshalResult)) >> 8)
 	b[3] = byte(len(e.marshalResult))
 	copy(b[4:], e.marshalResult)
@@ -1980,7 +2001,12 @@ func (e *FakeChannelIDExtension) Read(b []byte) (int, error) {
 	return e.Len(), io.EOF
 }
 
-func (e *FakeChannelIDExtension) Write(_ []byte) (int, error) {
+func (e *FakeChannelIDExtension) Write(b []byte) (int, error) {
+	// draft-balfanz-tls-channelid: Channel ID extension has zero-length data.
+	// This is a flag-only extension signaling support without payload.
+	if len(b) != 0 {
+		return 0, errors.New("tls: channel_id extension must have empty data")
+	}
 	return 0, nil
 }
 
@@ -2014,7 +2040,12 @@ func (e *FakeEncryptThenMACExtension) Read(b []byte) (int, error) {
 	return 4, io.EOF
 }
 
-func (e *FakeEncryptThenMACExtension) Write(_ []byte) (int, error) {
+func (e *FakeEncryptThenMACExtension) Write(b []byte) (int, error) {
+	// RFC 7366: encrypt_then_mac extension MUST have zero-length extension_data.
+	// This is a flag-only extension with no payload.
+	if len(b) != 0 {
+		return 0, errors.New("tls: encrypt_then_mac extension must have empty data per RFC 7366")
+	}
 	return 0, nil
 }
 
