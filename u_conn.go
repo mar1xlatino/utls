@@ -679,6 +679,17 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 	binary.Write(bufferedWriter, binary.BigEndian, hello.CompressionMethods)
 
 	if len(uconn.Extensions) > 0 {
+		// Validate PSK extension is last if present (RFC 8446 Section 4.2.11)
+		pskIndex := -1
+		for i, ext := range uconn.Extensions {
+			if _, ok := ext.(PreSharedKeyExtension); ok {
+				pskIndex = i
+			}
+		}
+		if pskIndex != -1 && pskIndex != len(uconn.Extensions)-1 {
+			return errors.New("tls: pre_shared_key extension must be last")
+		}
+
 		binary.Write(bufferedWriter, binary.BigEndian, uint16(extensionsLen))
 		for _, ext := range uconn.Extensions {
 			if _, err := bufferedWriter.ReadFrom(ext); err != nil {
