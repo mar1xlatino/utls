@@ -714,10 +714,14 @@ var DefaultWeights = Weights{
 // https://tools.ietf.org/html/draft-ietf-tls-grease-01
 const GREASE_PLACEHOLDER = 0x0a0a
 
+// isGREASEUint16 validates if a uint16 value is a valid GREASE value per RFC 8701.
+// Valid GREASE values follow the pattern 0x?a?a where ? is the same nibble (0-15):
+// 0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+// 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa
 func isGREASEUint16(v uint16) bool {
-	// First byte is same as second byte
-	// and lowest nibble is 0xa
-	return ((v >> 8) == v&0xff) && v&0xf == 0xa
+	// Check that both low nibbles are 0xa (the GREASE pattern)
+	// and that both bytes are identical
+	return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0xff)
 }
 
 func unGREASEUint16(v uint16) uint16 {

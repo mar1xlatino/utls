@@ -39,6 +39,8 @@ func ExtensionFromID(id uint16) TLSExtension {
 		return &UtlsPaddingExtension{}
 	case extensionExtendedMasterSecret:
 		return &ExtendedMasterSecretExtension{}
+	case fakeExtensionEncryptThenMAC:
+		return &FakeEncryptThenMACExtension{}
 	case fakeExtensionTokenBinding:
 		return &FakeTokenBindingExtension{}
 	case utlsExtensionCompressCertificate:
@@ -1064,8 +1066,19 @@ func (e *UtlsGREASEExtension) Read(b []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
-	b[0] = byte(e.Value >> 8)
-	b[1] = byte(e.Value)
+	// Use GREASE_PLACEHOLDER if Value is unset (zero)
+	value := e.Value
+	if value == 0 {
+		value = GREASE_PLACEHOLDER
+	}
+
+	// Validate that Value is a valid GREASE value per RFC 8701
+	if !isGREASEUint16(value) {
+		return 0, fmt.Errorf("invalid GREASE extension ID 0x%04x: must follow 0x?a?a pattern per RFC 8701", value)
+	}
+
+	b[0] = byte(value >> 8)
+	b[1] = byte(value)
 	b[2] = byte(len(e.Body) >> 8)
 	b[3] = byte(len(e.Body))
 	if len(e.Body) > 0 {
@@ -1350,10 +1363,15 @@ func (e *KeyShareExtension) keySharesLen() int {
 }
 
 func (e *KeyShareExtension) Read(b []byte) (int, error) {
-	// RFC 8446 Section 4.2.8: key_exchange has minimum length of 1 byte
-	for _, ks := range e.KeyShares {
+	// Validate all key shares before serialization (defense-in-depth)
+	for i, ks := range e.KeyShares {
+		// For Read, Data must be present and non-empty
 		if len(ks.Data) == 0 {
-			return 0, errors.New("tls: key_share extension has empty key data")
+			return 0, fmt.Errorf("tls: key_share at index %d has empty key data", i)
+		}
+		// Validate group ID and key size
+		if err := validateKeyShare(ks); err != nil {
+			return 0, err
 		}
 	}
 	if len(b) < e.Len() {
@@ -1410,7 +1428,94 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 	return fullLen, nil
 }
 
+// expectedKeyShareSize returns the expected public key size for a given curve ID.
+// Returns -1 if the curve ID is unknown or variable-length (GREASE).
+// Returns 0 if the curve is valid but key data should be auto-generated (nil Data allowed).
+//
+// Key sizes per RFC 8446 Section 4.2.8.2 and RFC 7748/SEC1:
+//   - X25519: 32 bytes (RFC 7748)
+//   - P-256: 65 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+32+32)
+//   - P-384: 97 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+48+48)
+//   - P-521: 133 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+66+66)
+//   - X25519MLKEM768: 1216 bytes (MLKEM768 encapsulation key (1184) + X25519 (32))
+//   - X25519Kyber768Draft00: 1216 bytes (X25519 (32) + MLKEM768 encapsulation key (1184))
+func expectedKeyShareSize(group CurveID) int {
+	switch group {
+	case X25519:
+		return 32
+	case CurveP256:
+		return 65
+	case CurveP384:
+		return 97
+	case CurveP521:
+		return 133
+	case X25519MLKEM768, X25519Kyber768Draft00:
+		// MLKEM768 encapsulation key size (1184) + X25519 public key size (32)
+		return 1184 + 32
+	default:
+		// GREASE or unknown curves return -1 (variable/unknown size)
+		return -1
+	}
+}
+
+// isValidKeyShareGroup returns true if the CurveID is a valid group for key shares.
+// Valid groups are: standard ECDH curves, X25519, post-quantum hybrids, and GREASE.
+func isValidKeyShareGroup(group CurveID) bool {
+	switch group {
+	case X25519, CurveP256, CurveP384, CurveP521:
+		return true
+	case X25519MLKEM768, X25519Kyber768Draft00:
+		return true
+	case GREASE_PLACEHOLDER:
+		return true
+	default:
+		// Check if it's a GREASE value (pattern: 0x?a?a where ? are same nibble)
+		return isGREASEUint16(uint16(group))
+	}
+}
+
+// validateKeyShare validates a single KeyShare entry.
+// If Data is nil, validation is skipped (key will be generated).
+// For GREASE values, any non-empty data is accepted.
+// For known curves, the data length must match the expected public key size.
+func validateKeyShare(ks KeyShare) error {
+	// Skip validation if Data is nil (key will be auto-generated)
+	if ks.Data == nil {
+		return nil
+	}
+
+	// Empty key data is invalid per RFC 8446 Section 4.2.8
+	if len(ks.Data) == 0 {
+		return fmt.Errorf("tls: key_share for group %d has empty key data", ks.Group)
+	}
+
+	// Validate group ID
+	if !isValidKeyShareGroup(ks.Group) {
+		return fmt.Errorf("tls: key_share has invalid group ID %d", ks.Group)
+	}
+
+	// For GREASE values, any non-empty data is valid
+	if ks.Group == GREASE_PLACEHOLDER || isGREASEUint16(uint16(ks.Group)) {
+		return nil
+	}
+
+	// Validate key size for known curves
+	expectedSize := expectedKeyShareSize(ks.Group)
+	if expectedSize > 0 && len(ks.Data) != expectedSize {
+		return fmt.Errorf("tls: key_share for group %d has invalid size %d (expected %d bytes)",
+			ks.Group, len(ks.Data), expectedSize)
+	}
+
+	return nil
+}
+
 func (e *KeyShareExtension) writeToUConn(uc *UConn) error {
+	// Validate all key shares before applying to connection
+	for i, ks := range e.KeyShares {
+		if err := validateKeyShare(ks); err != nil {
+			return fmt.Errorf("tls: invalid key share at index %d: %w", i, err)
+		}
+	}
 	uc.HandshakeState.Hello.KeyShares = e.KeyShares
 	return nil
 }
@@ -1713,6 +1818,16 @@ type NPNExtension struct {
 }
 
 func (e *NPNExtension) writeToUConn(uc *UConn) error {
+	// Validate NextProtos for later use (client selection after server response)
+	// Per NPN spec, protocol names have the same constraints as ALPN
+	for _, proto := range e.NextProtos {
+		if len(proto) == 0 {
+			return errors.New("tls: NPN protocol cannot be empty")
+		}
+		if len(proto) > 255 {
+			return errors.New("tls: NPN protocol too long (max 255 bytes)")
+		}
+	}
 	uc.config.NextProtos = e.NextProtos
 	uc.HandshakeState.Hello.NextProtoNeg = true
 	return nil
@@ -1866,6 +1981,40 @@ func (e *FakeChannelIDExtension) UnmarshalJSON(_ []byte) error {
 	return nil
 }
 
+// FakeEncryptThenMACExtension implements encrypt_then_mac (22)
+// RFC 7366: This is a flag extension with no data payload.
+// The client sends this to indicate support for encrypt-then-MAC mode.
+type FakeEncryptThenMACExtension struct{}
+
+func (e *FakeEncryptThenMACExtension) writeToUConn(uc *UConn) error {
+	return nil
+}
+
+func (e *FakeEncryptThenMACExtension) Len() int {
+	return 4
+}
+
+func (e *FakeEncryptThenMACExtension) Read(b []byte) (int, error) {
+	if len(b) < 4 {
+		return 0, io.ErrShortBuffer
+	}
+	// RFC 7366: encrypt_then_mac extension type
+	b[0] = byte(fakeExtensionEncryptThenMAC >> 8)
+	b[1] = byte(fakeExtensionEncryptThenMAC)
+	// Zero-length extension data (flag-only extension, no payload)
+	b[2] = 0
+	b[3] = 0
+	return 4, io.EOF
+}
+
+func (e *FakeEncryptThenMACExtension) Write(_ []byte) (int, error) {
+	return 0, nil
+}
+
+func (e *FakeEncryptThenMACExtension) UnmarshalJSON(_ []byte) error {
+	return nil
+}
+
 // FakeRecordSizeLimitExtension implements record_size_limit (28)
 // but with no support.
 type FakeRecordSizeLimitExtension struct {
@@ -1938,6 +2087,19 @@ func (e *FakeTokenBindingExtension) Len() int {
 }
 
 func (e *FakeTokenBindingExtension) Read(b []byte) (int, error) {
+	// Validate key parameters list is not empty
+	if len(e.KeyParameters) == 0 {
+		return 0, errors.New("tls: token_binding extension requires at least one key parameter")
+	}
+	// Key parameters length is stored in a single byte (uint8), max 255
+	if len(e.KeyParameters) > 255 {
+		return 0, errors.New("tls: token_binding extension key parameters list too long (max 255)")
+	}
+	// Validate version is reasonable (RFC 8472 defines version 1.0)
+	// Allow some flexibility for future versions but catch obviously invalid values
+	if e.MajorVersion > 10 {
+		return 0, fmt.Errorf("tls: token_binding extension major version %d exceeds reasonable maximum (10)", e.MajorVersion)
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
