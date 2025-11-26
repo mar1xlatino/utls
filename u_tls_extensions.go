@@ -752,6 +752,10 @@ func (e *applicationSettingsExtension) Len(supportedProtocols []string) int {
 }
 
 func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []string) (int, error) {
+	if len(supportedProtocols) == 0 {
+		return 0, errors.New("tls: ALPS extension requires at least one protocol")
+	}
+
 	if len(b) < e.Len(supportedProtocols) {
 		return 0, io.ErrShortBuffer
 	}
@@ -904,9 +908,13 @@ func (e *SCTExtension) Read(b []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 	// https://tools.ietf.org/html/rfc6962#section-3.3.1
+	// In ClientHello, SCT extension must be empty (RFC 6962)
+	// Only servers include actual SCTs in the extension
 	b[0] = byte(extensionSCT >> 8)
 	b[1] = byte(extensionSCT)
-	// zero uint16 for the zero-length extension_data
+	// Write zero uint16 for the zero-length extension_data
+	b[2] = 0
+	b[3] = 0
 	return e.Len(), io.EOF
 }
 
@@ -992,14 +1000,17 @@ func (e *ExtendedMasterSecretExtension) Len() int {
 }
 
 func (e *ExtendedMasterSecretExtension) Read(b []byte) (int, error) {
-	if len(b) < e.Len() {
+	if len(b) < 4 {
 		return 0, io.ErrShortBuffer
 	}
 	// https://tools.ietf.org/html/rfc7627
+	// Extension type (23 = extended_master_secret)
 	b[0] = byte(extensionExtendedMasterSecret >> 8)
 	b[1] = byte(extensionExtendedMasterSecret)
-	// The length is 0
-	return e.Len(), io.EOF
+	// Extension data length: 0 (this is a flag-only extension, no payload)
+	b[2] = 0
+	b[3] = 0
+	return 4, io.EOF
 }
 
 func (e *ExtendedMasterSecretExtension) UnmarshalJSON(_ []byte) error {
@@ -1841,7 +1852,9 @@ func (e *FakeChannelIDExtension) Read(b []byte) (int, error) {
 	// https://tools.ietf.org/html/draft-balfanz-tls-channelid-00
 	b[0] = byte(extensionID >> 8)
 	b[1] = byte(extensionID & 0xff)
-	// The length is 0
+	// Zero-length extension data (signals support without payload)
+	b[2] = 0
+	b[3] = 0
 	return e.Len(), io.EOF
 }
 
@@ -1999,6 +2012,14 @@ func (e *FakeDelegatedCredentialsExtension) Len() int {
 }
 
 func (e *FakeDelegatedCredentialsExtension) Read(b []byte) (int, error) {
+	if len(e.SupportedSignatureAlgorithms) == 0 {
+		return 0, errors.New("tls: delegated_credentials extension requires at least one signature algorithm")
+	}
+	// 2 bytes per algorithm, 2 byte length prefix, max 65533 for data in uint16 field
+	// (65535 - 2 byte list length prefix) / 2 = 32766 max algorithms
+	if len(e.SupportedSignatureAlgorithms) > 32766 {
+		return 0, errors.New("tls: too many signature algorithms in delegated_credentials")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
