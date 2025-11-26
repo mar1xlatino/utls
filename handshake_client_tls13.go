@@ -765,6 +765,22 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
 	// Either a PSK or a certificate is always used, but not both.
 	// See RFC 8446, Section 4.1.1.
 	if hs.usingPSK {
+		// Verify that cached certificates have not expired since session was established.
+		// This prevents accepting expired/invalid certificates on session resumption.
+		// Skip this check if InsecureSkipVerify is set, consistent with initial handshake behavior.
+		// See Issue 31641 for context on why full re-verification is not performed.
+		if !c.config.InsecureSkipVerify && len(hs.session.peerCertificates) > 0 {
+			cert := hs.session.peerCertificates[0]
+			now := c.config.time()
+			if now.After(cert.NotAfter) {
+				c.sendAlert(alertCertificateExpired)
+				return errors.New("tls: server certificate has expired since session was established")
+			}
+			if now.Before(cert.NotBefore) {
+				c.sendAlert(alertCertificateExpired)
+				return errors.New("tls: server certificate is not yet valid")
+			}
+		}
 		// Make sure the connection is still being verified whether or not this
 		// is a resumption. Resumptions currently don't reverify certificates so
 		// they don't call verifyServerCertificate. See Issue 31641.
