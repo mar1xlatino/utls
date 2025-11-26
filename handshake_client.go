@@ -397,8 +397,14 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	session *SessionState, earlySecret *tls13.EarlySecret, binderKey []byte, err error) {
 	// [UTLS SECTION START]
 	if c.utls.sessionController != nil {
-		c.utls.sessionController.onEnterLoadSessionCheck()
-		defer c.utls.sessionController.onLoadSessionReturn()
+		if err = c.utls.sessionController.onEnterLoadSessionCheck(); err != nil {
+			return nil, nil, nil, err
+		}
+		defer func() {
+			if returnErr := c.utls.sessionController.onLoadSessionReturn(); returnErr != nil && err == nil {
+				err = returnErr
+			}
+		}()
 	}
 	// [UTLS SECTION END]
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
@@ -544,8 +550,14 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	earlySecret = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)
 	binderKey = earlySecret.ResumptionBinderKey()
 	// [UTLS SECTION START]
-	if c.utls.sessionController != nil && !c.utls.sessionController.shouldLoadSessionWriteBinders() {
-		return
+	if c.utls.sessionController != nil {
+		shouldWrite, writeErr := c.utls.sessionController.shouldLoadSessionWriteBinders()
+		if writeErr != nil {
+			return nil, nil, nil, writeErr
+		}
+		if !shouldWrite {
+			return
+		}
 	}
 	// [UTLS SECTION END]
 	transcript := cipherSuite.hash.New()

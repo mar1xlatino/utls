@@ -110,7 +110,9 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		if uconn.clientHelloBuildStatus == BuildByGoTLS {
 			return nil
 		}
-		uAssert(uconn.clientHelloBuildStatus == NotBuilt, "BuildHandshakeState failed: invalid call, client hello has already been built by utls")
+		if uconn.clientHelloBuildStatus != NotBuilt {
+			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built by utls")
+		}
 
 		// use default Golang ClientHello.
 		hello, keySharePrivate, ech, err := uconn.makeClientHello()
@@ -124,7 +126,9 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		uconn.echCtx = ech
 		uconn.clientHelloBuildStatus = BuildByGoTLS
 	} else {
-		uAssert(uconn.clientHelloBuildStatus == BuildByUtls || uconn.clientHelloBuildStatus == NotBuilt, "BuildHandshakeState failed: invalid call, client hello has already been built by go-tls")
+		if !(uconn.clientHelloBuildStatus == BuildByUtls || uconn.clientHelloBuildStatus == NotBuilt) {
+			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built by go-tls")
+		}
 		if uconn.clientHelloBuildStatus == NotBuilt {
 			err := uconn.applyPresetByID(uconn.ClientHelloID)
 			if err != nil {
@@ -153,8 +157,12 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		}
 
 		if loadSession {
-			uconn.uApplyPatch()
-			uconn.sessionController.finalCheck()
+			if err := uconn.uApplyPatch(); err != nil {
+				return err
+			}
+			if err := uconn.sessionController.finalCheck(); err != nil {
+				return err
+			}
 			uconn.clientHelloBuildStatus = BuildByUtls
 		}
 
@@ -169,35 +177,54 @@ func (uconn *UConn) uLoadSession() error {
 	switch uconn.sessionController.shouldLoadSession() {
 	case shouldReturn:
 	case shouldSetTicket:
-		uconn.sessionController.setSessionTicketToUConn()
+		if err := uconn.sessionController.setSessionTicketToUConn(); err != nil {
+			return err
+		}
 	case shouldSetPsk:
-		uconn.sessionController.setPskToUConn()
+		if err := uconn.sessionController.setPskToUConn(); err != nil {
+			return err
+		}
 	case shouldLoad:
 		hello := uconn.HandshakeState.Hello.getPrivatePtr()
-		uconn.sessionController.utlsAboutToLoadSession()
+		if err := uconn.sessionController.utlsAboutToLoadSession(); err != nil {
+			return err
+		}
 		session, earlySecret, binderKey, err := uconn.loadSession(hello)
 		if session == nil || err != nil {
 			return err
 		}
 		if session.version == VersionTLS12 {
 			// We use the session ticket extension for tls 1.2 session resumption
-			uconn.sessionController.initSessionTicketExt(session, hello.sessionTicket)
-			uconn.sessionController.setSessionTicketToUConn()
+			if err := uconn.sessionController.initSessionTicketExt(session, hello.sessionTicket); err != nil {
+				return err
+			}
+			if err := uconn.sessionController.setSessionTicketToUConn(); err != nil {
+				return err
+			}
 		} else {
-			uconn.sessionController.initPskExt(session, earlySecret, binderKey, hello.pskIdentities)
+			if err := uconn.sessionController.initPskExt(session, earlySecret, binderKey, hello.pskIdentities); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func (uconn *UConn) uApplyPatch() {
+func (uconn *UConn) uApplyPatch() error {
 	helloLen := len(uconn.HandshakeState.Hello.Raw)
 	if uconn.sessionController.shouldUpdateBinders() {
-		uconn.sessionController.updateBinders()
-		uconn.sessionController.setPskToUConn()
+		if err := uconn.sessionController.updateBinders(); err != nil {
+			return err
+		}
+		if err := uconn.sessionController.setPskToUConn(); err != nil {
+			return err
+		}
 	}
-	uAssert(helloLen == len(uconn.HandshakeState.Hello.Raw), "tls: uApplyPatch Failed: the patch should never change the length of the marshaled clientHello")
+	if helloLen != len(uconn.HandshakeState.Hello.Raw) {
+		return errors.New("tls: uApplyPatch Failed: the patch should never change the length of the marshaled clientHello")
+	}
+	return nil
 }
 
 func (uconn *UConn) DidTls12Resume() bool {

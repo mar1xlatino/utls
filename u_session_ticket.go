@@ -57,8 +57,13 @@ func (e *SessionTicketExtension) IsInitialized() bool {
 }
 
 func (e *SessionTicketExtension) InitializeByUtls(session *SessionState, ticket []byte) {
-	uAssert(!e.Initialized, "tls: InitializeByUtls failed: the SessionTicketExtension is initialized")
-	uAssert(session.version == VersionTLS12 && session != nil && ticket != nil, "tls: InitializeByUtls failed: the session is not a tls 1.2 session")
+	// Validate preconditions - return early if invalid (initialization will fail gracefully)
+	if e.Initialized {
+		return // Already initialized, skip re-initialization
+	}
+	if session == nil || ticket == nil || session.version != VersionTLS12 {
+		return // Invalid session or not TLS 1.2, leave uninitialized
+	}
 	e.Session = session
 	e.Ticket = ticket
 	e.Initialized = true

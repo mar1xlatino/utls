@@ -95,36 +95,42 @@ type UnimplementedPreSharedKeyExtension struct{}
 
 func (UnimplementedPreSharedKeyExtension) mustEmbedUnimplementedPreSharedKeyExtension() {}
 
+// ErrUnimplementedPreSharedKeyExtension is returned when an unimplemented PreSharedKeyExtension method is called.
+var ErrUnimplementedPreSharedKeyExtension = errors.New("tls: PreSharedKeyExtension method is not implemented; you must embed UnimplementedPreSharedKeyExtension and override all methods")
+
 func (*UnimplementedPreSharedKeyExtension) IsInitialized() bool {
-	panic("tls: IsInitialized is not implemented for the PreSharedKeyExtension")
+	// Returns false as default; callers should override this method
+	return false
 }
 
 func (*UnimplementedPreSharedKeyExtension) InitializeByUtls(session *SessionState, earlySecret []byte, binderKey []byte, identities []PskIdentity) {
-	panic("tls: Initialize is not implemented for the PreSharedKeyExtension")
+	// No-op default; callers should override this method
 }
 
 func (*UnimplementedPreSharedKeyExtension) writeToUConn(*UConn) error {
-	panic("tls: writeToUConn is not implemented for the PreSharedKeyExtension")
+	return ErrUnimplementedPreSharedKeyExtension
 }
 
 func (*UnimplementedPreSharedKeyExtension) Len() int {
-	panic("tls: Len is not implemented for the PreSharedKeyExtension")
+	// Returns 0 as default; callers should override this method
+	return 0
 }
 
 func (*UnimplementedPreSharedKeyExtension) Read([]byte) (int, error) {
-	panic("tls: Read is not implemented for the PreSharedKeyExtension")
+	return 0, ErrUnimplementedPreSharedKeyExtension
 }
 
 func (*UnimplementedPreSharedKeyExtension) GetPreSharedKeyCommon() PreSharedKeyCommon {
-	panic("tls: GetPreSharedKeyCommon is not implemented for the PreSharedKeyExtension")
+	// Returns empty struct as default; callers should override this method
+	return PreSharedKeyCommon{}
 }
 
 func (*UnimplementedPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) error {
-	panic("tls: ReadWithRawHello is not implemented for the PreSharedKeyExtension")
+	return ErrUnimplementedPreSharedKeyExtension
 }
 
 func (*UnimplementedPreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
-	panic("tls: SetOmitEmptyPsk is not implemented for the PreSharedKeyExtension")
+	// No-op default; callers should override this method
 }
 
 // UtlsPreSharedKeyExtension is an extension used to set the PSK extension in the
@@ -335,7 +341,10 @@ func (e *FakePreSharedKeyExtension) IsInitialized() bool {
 }
 
 func (e *FakePreSharedKeyExtension) InitializeByUtls(session *SessionState, earlySecret []byte, binderKey []byte, identities []PskIdentity) {
-	panic("InitializeByUtls failed: don't let utls initialize FakePreSharedKeyExtension; provide your own identities and binders or use UtlsPreSharedKeyExtension")
+	// FakePreSharedKeyExtension should not be initialized by utls.
+	// Users must provide their own identities and binders, or use UtlsPreSharedKeyExtension.
+	// Leaving extension uninitialized will cause IsInitialized() to return false,
+	// signaling to callers that initialization failed.
 }
 
 func (e *FakePreSharedKeyExtension) writeToUConn(uc *UConn) error {
