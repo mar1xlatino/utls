@@ -40,6 +40,13 @@ func (e *SessionTicketExtension) Len() int {
 }
 
 func (e *SessionTicketExtension) Read(b []byte) (int, error) {
+	// Session tickets can be large but must fit in TLS extension limits.
+	// Extension data length is stored as uint16 (max 65535).
+	// Header is 4 bytes (2 type + 2 length), so max ticket is 65531.
+	if len(e.Ticket) > 65531 {
+		return 0, errors.New("tls: session ticket too long")
+	}
+
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
