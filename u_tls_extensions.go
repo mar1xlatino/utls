@@ -274,6 +274,14 @@ func (e *SupportedCurvesExtension) Len() int {
 }
 
 func (e *SupportedCurvesExtension) Read(b []byte) (int, error) {
+	// Extension header (4) + list length (2) + 2 bytes per curve
+	// Must fit in uint16 (max 65535), so max curves = (65535 - 6) / 2 = 32764
+	if len(e.Curves) > 32764 {
+		return 0, errors.New("tls: too many supported curves (max 32764)")
+	}
+	if len(e.Curves) == 0 {
+		return 0, errors.New("tls: supported_groups extension cannot be empty")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -1496,6 +1504,9 @@ func (e *SupportedVersionsExtension) Len() int {
 }
 
 func (e *SupportedVersionsExtension) Read(b []byte) (int, error) {
+	if len(e.Versions) == 0 {
+		return 0, errors.New("tls: supported_versions extension cannot be empty")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
