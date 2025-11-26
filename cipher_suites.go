@@ -621,6 +621,13 @@ func (c *cthWrapper) Sum(b []byte) []byte         { return c.h.ConstantTimeSum(b
 
 func newConstantTimeHash(h func() hash.Hash) func() hash.Hash {
 	boring.Unreachable()
+	// Test if the hash implements constantTimeHash at runtime.
+	// Go 1.25+ removed ConstantTimeSum from some hash implementations,
+	// so we gracefully fall back to the regular hash if unavailable.
+	testHash := h()
+	if _, ok := testHash.(constantTimeHash); !ok {
+		return h
+	}
 	return func() hash.Hash {
 		return &cthWrapper{h().(constantTimeHash)}
 	}
