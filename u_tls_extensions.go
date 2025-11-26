@@ -2040,9 +2040,9 @@ func (e *FakeRecordSizeLimitExtension) Read(b []byte) (int, error) {
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
-	// RFC 8449: record_size_limit must be between 64 and 16384 (2^14)
-	if e.Limit < 64 || e.Limit > 16384 {
-		return 0, errors.New("tls: record_size_limit must be between 64 and 16384")
+	// RFC 8449: record_size_limit must be between 64 and 16385 (2^14+1)
+	if e.Limit < 64 || e.Limit > 16385 {
+		return 0, errors.New("tls: record_size_limit must be between 64 and 16385")
 	}
 	b[0] = byte(fakeRecordSizeLimit >> 8)
 	b[1] = byte(fakeRecordSizeLimit & 0xff)
