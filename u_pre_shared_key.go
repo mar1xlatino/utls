@@ -264,6 +264,10 @@ func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 	if !e.OmitEmptyPsk && e.Len() == 0 {
 		return 0, ErrEmptyPsk
 	}
+	// RFC 8446: number of binders must match number of identities
+	if len(e.Identities) != len(e.Binders) {
+		return 0, errors.New("tls: UtlsPreSharedKeyExtension.Read failed: binder count must match identity count")
+	}
 	return readPskIntoBytes(b, e.Identities, e.Binders)
 }
 
