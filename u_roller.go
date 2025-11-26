@@ -50,15 +50,17 @@ func NewRoller() (*Roller, error) {
 //    Dial("tcp4", "google.com:443", "google.com")
 //    Dial("tcp", "10.23.144.22:443", "mywebserver.org")
 func (c *Roller) Dial(network, addr, serverName string) (*UConn, error) {
+	c.HelloIDMu.Lock()
+	// Copy HelloIDs while holding the lock to prevent race condition
 	helloIDs := make([]ClientHelloID, len(c.HelloIDs))
 	copy(helloIDs, c.HelloIDs)
-	c.r.rand.Shuffle(len(c.HelloIDs), func(i, j int) {
-		helloIDs[i], helloIDs[j] = helloIDs[j], helloIDs[i]
-	})
-
-	c.HelloIDMu.Lock()
 	workingHelloId := c.WorkingHelloID // keep using same helloID, if it works
 	c.HelloIDMu.Unlock()
+
+	// Shuffle the local copy (no lock needed - it's our private copy)
+	c.r.rand.Shuffle(len(helloIDs), func(i, j int) {
+		helloIDs[i], helloIDs[j] = helloIDs[j], helloIDs[i]
+	})
 	if workingHelloId != nil {
 		helloIDFound := false
 		for i, ID := range helloIDs {
