@@ -468,6 +468,9 @@ func (e *SignatureAlgorithmsExtension) Write(b []byte) (int, error) {
 }
 
 func (e *SignatureAlgorithmsExtension) writeToUConn(uc *UConn) error {
+	if len(e.SupportedSignatureAlgorithms) == 0 {
+		return errors.New("tls: signature_algorithms extension cannot be empty")
+	}
 	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
 	return nil
 }
@@ -601,6 +604,9 @@ func (e *SignatureAlgorithmsCertExtension) Write(b []byte) (int, error) {
 }
 
 func (e *SignatureAlgorithmsCertExtension) writeToUConn(uc *UConn) error {
+	if len(e.SupportedSignatureAlgorithms) == 0 {
+		return errors.New("tls: signature_algorithms_cert extension cannot be empty")
+	}
 	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
 	return nil
 }
