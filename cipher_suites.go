@@ -432,10 +432,16 @@ func macSHA1(key []byte) hash.Hash {
 	return hmac.New(h, key)
 }
 
-// macSHA256 returns a SHA-256 based MAC. This is only supported in TLS 1.2 and
-// is currently only used in disabled-by-default cipher suites.
+// macSHA256 returns a SHA-256 based constant time MAC. This is only supported
+// in TLS 1.2 and is currently only used in disabled-by-default cipher suites.
 func macSHA256(key []byte) hash.Hash {
-	return hmac.New(sha256.New, key)
+	h := sha256.New
+	// Apply constant-time hash to prevent Lucky13-style timing attacks.
+	// Same protection as macSHA1 for consistency and security.
+	if !boring.Enabled {
+		h = newConstantTimeHash(h)
+	}
+	return hmac.New(h, key)
 }
 
 type aead interface {
