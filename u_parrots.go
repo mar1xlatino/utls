@@ -1267,8 +1267,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 						CurveP256,
 						CurveP384,
 						CurveP521,
-						256,
-						257,
+						FakeCurveFFDHE2048,
+						FakeCurveFFDHE3072,
 					},
 				},
 				&SupportedPointsExtension{
@@ -1374,8 +1374,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 						CurveP256,
 						CurveP384,
 						CurveP521,
-						256,
-						257,
+						FakeCurveFFDHE2048,
+						FakeCurveFFDHE3072,
 					},
 				},
 				&SupportedPointsExtension{
@@ -1558,7 +1558,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA1,
 				}},
 				&StatusRequestExtension{},
-				&NPNExtension{},
 				&SCTExtension{},
 				&ALPNExtension{AlpnProtocols: []string{"h2", "h2-16", "h2-15", "h2-14", "spdy/3.1", "spdy/3", "http/1.1"}},
 				&SupportedPointsExtension{SupportedPoints: []byte{
