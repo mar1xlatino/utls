@@ -256,6 +256,10 @@ func (e *StatusRequestExtension) Write(b []byte) (int, error) {
 		return fullLen, errors.New("status request extension statusType is not statusTypeOCSP(1)")
 	}
 
+	if !extData.Empty() {
+		return fullLen, errors.New("status request extension has trailing data")
+	}
+
 	return fullLen, nil
 }
 
@@ -1111,15 +1115,31 @@ func (e *UtlsPaddingExtension) writeToUConn(uc *UConn) error {
 
 func (e *UtlsPaddingExtension) Len() int {
 	if e.WillPad {
-		return 4 + e.PaddingLen
-	} else {
-		return 0
+		// Validate PaddingLen to prevent negative values or overflow
+		if e.PaddingLen < 0 {
+			return 0
+		}
+		// Max extension data is 65535 bytes (uint16), header is 4 bytes
+		paddingLen := e.PaddingLen
+		if paddingLen > 65531 {
+			paddingLen = 65531
+		}
+		return 4 + paddingLen
 	}
+	return 0
 }
 
 func (e *UtlsPaddingExtension) Update(clientHelloUnpaddedLen int) {
 	if e.GetPaddingLen != nil {
 		e.PaddingLen, e.WillPad = e.GetPaddingLen(clientHelloUnpaddedLen)
+		// Validate callback result to prevent negative or overflow values
+		if e.PaddingLen < 0 {
+			e.PaddingLen = 0
+			e.WillPad = false
+		} else if e.PaddingLen > 65531 {
+			// Max extension data is 65535 bytes (uint16), header is 4 bytes
+			e.PaddingLen = 65531
+		}
 	}
 }
 
@@ -1127,15 +1147,25 @@ func (e *UtlsPaddingExtension) Read(b []byte) (int, error) {
 	if !e.WillPad {
 		return 0, io.EOF
 	}
-	if len(b) < e.Len() {
+	// Validate PaddingLen before writing to buffer
+	if e.PaddingLen < 0 {
+		return 0, errors.New("tls: negative padding length")
+	}
+	// Max extension data is 65535 bytes (uint16), header is 4 bytes
+	paddingLen := e.PaddingLen
+	if paddingLen > 65531 {
+		paddingLen = 65531
+	}
+	totalLen := 4 + paddingLen
+	if len(b) < totalLen {
 		return 0, io.ErrShortBuffer
 	}
-	// https://tools.ietf.org/html/rfc7627
+	// https://tools.ietf.org/html/rfc7685 (TLS padding extension)
 	b[0] = byte(utlsExtensionPadding >> 8)
 	b[1] = byte(utlsExtensionPadding)
-	b[2] = byte(e.PaddingLen >> 8)
-	b[3] = byte(e.PaddingLen)
-	return e.Len(), io.EOF
+	b[2] = byte(paddingLen >> 8)
+	b[3] = byte(paddingLen)
+	return totalLen, io.EOF
 }
 
 func (e *UtlsPaddingExtension) UnmarshalJSON(b []byte) error {
@@ -1214,13 +1244,28 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
+
+	// Validate algorithms list is not empty (RFC 8879 requires at least one algorithm)
+	if len(e.Algorithms) == 0 {
+		return 0, errors.New("tls: compress_certificate extension requires at least one algorithm")
+	}
+
+	// Each algorithm is 2 bytes, length field is 1 byte (max 255), so max 127 algorithms
+	if len(e.Algorithms) > 127 {
+		return 0, errors.New("tls: too many compression algorithms (max 127)")
+	}
+
+	// Validate algorithm IDs per RFC 8879: 1=zlib, 2=brotli, 3=zstd
+	for _, alg := range e.Algorithms {
+		if alg < CertCompressionZlib || alg > CertCompressionZstd {
+			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1-3)", alg)
+		}
+	}
+
 	b[0] = byte(utlsExtensionCompressCertificate >> 8)
 	b[1] = byte(utlsExtensionCompressCertificate & 0xff)
 
 	extLen := 2 * len(e.Algorithms)
-	if extLen > 255 {
-		return 0, errors.New("too many certificate compression methods")
-	}
 
 	// Extension data length.
 	b[2] = byte((extLen + 1) >> 8)
@@ -1709,6 +1754,11 @@ func (e *RenegotiationInfoExtension) Len() int {
 }
 
 func (e *RenegotiationInfoExtension) Read(b []byte) (int, error) {
+	// RFC 5746: renegotiated_connection is prefixed with 1-byte length, max 255 bytes
+	if len(e.RenegotiatedConnection) > 255 {
+		return 0, errors.New("tls: renegotiation_info data exceeds maximum length of 255 bytes")
+	}
+
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
