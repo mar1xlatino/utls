@@ -923,6 +923,11 @@ func (e *GenericExtension) Len() int {
 }
 
 func (e *GenericExtension) Read(b []byte) (int, error) {
+	// Extension data length is stored as uint16 (max 65535).
+	// Header is 4 bytes (2 type + 2 length), so max data is 65531.
+	if len(e.Data) > 65531 {
+		return 0, errors.New("tls: extension data too long")
+	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
