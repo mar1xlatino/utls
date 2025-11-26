@@ -67,7 +67,8 @@ func newSaltedPRNGSeed(seed *PRNGSeed, salt string) (*PRNGSeed, error) {
 // functions.
 type prng struct {
 	rand              *rand.Rand
-	randomStreamMutex sync.Mutex
+	randMutex         sync.Mutex // protects rand (math/rand.Rand is not thread-safe)
+	randomStreamMutex sync.Mutex // protects randomStream
 	randomStream      sha3.ShakeHash
 }
 
@@ -156,6 +157,8 @@ func (p *prng) Intn(n int) int {
 	if n <= 0 {
 		return 0
 	}
+	p.randMutex.Lock()
+	defer p.randMutex.Unlock()
 	return p.rand.Intn(n)
 }
 
@@ -165,11 +168,15 @@ func (p *prng) Int63n(n int64) int64 {
 	if n <= 0 {
 		return 0
 	}
+	p.randMutex.Lock()
+	defer p.randMutex.Unlock()
 	return p.rand.Int63n(n)
 }
 
-// Intn is equivalent to math/read.Perm.
+// Perm is equivalent to math/rand.Perm.
 func (p *prng) Perm(n int) []int {
+	p.randMutex.Lock()
+	defer p.randMutex.Unlock()
 	return p.rand.Perm(n)
 }
 
