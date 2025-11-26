@@ -49,7 +49,7 @@ type GREASEEncryptedClientHelloExtension struct {
 	CandidateConfigIds    []uint8
 	configId              uint8    // randomly picked from CandidateConfigIds or generated if empty
 	EncapsulatedKey       []byte   // if empty, will generate random bytes
-	CandidatePayloadLens  []uint16 // Pre-encryption. If 0, will pick 128(+16=144)
+	CandidatePayloadLens  []uint16 // Pre-encryption. If 0, will pick 190(+16=206)
 	payload               []byte   // payload should be calculated ONCE and stored here, HRR will reuse this
 
 	initOnce sync.Once
@@ -129,7 +129,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 
 		if len(g.payload) == 0 {
 			if len(g.CandidatePayloadLens) == 0 {
-				g.CandidatePayloadLens = []uint16{128}
+				g.CandidatePayloadLens = []uint16{190}
 			}
 
 			// randomly pick one from the list
@@ -297,6 +297,8 @@ func (*UnimplementedECHExtension) mustEmbedUnimplementedECHExtension() {
 }
 
 // BoringGREASEECH returns a GREASE scheme BoringSSL uses by default.
+// Payload lengths match real Chrome/BoringSSL behavior to avoid fingerprinting.
+// Based on BoringSSL ssl/encrypted_client_hello.cc GREASE ECH generation.
 func BoringGREASEECH() *GREASEEncryptedClientHelloExtension {
 	return &GREASEEncryptedClientHelloExtension{
 		CandidateCipherSuites: []HPKESymmetricCipherSuite{
@@ -305,6 +307,6 @@ func BoringGREASEECH() *GREASEEncryptedClientHelloExtension {
 				AeadId: dicttls.AEAD_AES_128_GCM,
 			},
 		},
-		CandidatePayloadLens: []uint16{128, 160, 192, 224}, // +16: 144, 176, 208, 240
+		CandidatePayloadLens: []uint16{190, 222, 254}, // +16: 206, 238, 270
 	}
 }
