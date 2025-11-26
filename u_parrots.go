@@ -2056,7 +2056,6 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 						ECDSAWithP384AndSHA384,
 						ECDSAWithSHA1,
 						PSSWithSHA384,
-						PSSWithSHA384,
 						PKCS1WithSHA384,
 						PSSWithSHA512,
 						PKCS1WithSHA512,
