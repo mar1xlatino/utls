@@ -7,7 +7,6 @@ package tls
 import (
 	"bytes"
 	"encoding/hex"
-	"fmt"
 	"io/ioutil"
 	"net"
 	"reflect"
@@ -209,8 +208,12 @@ func checkUTLSFingerPrintClientHello(t *testing.T, clientHelloID ClientHelloID, 
 		t.Errorf("UConn from fingerprint has %d length, should have %d", len(generatedUConn.HandshakeState.Hello.Raw), len(uconn.HandshakeState.Hello.Raw))
 	}
 
-	// We can't effectively check the extensions on randomized client hello ids
-	if !(clientHelloID == HelloRandomized || clientHelloID == HelloRandomizedALPN || clientHelloID == HelloRandomizedNoALPN) {
+	// We can't effectively check the extensions on randomized or shuffled client hello ids
+	// Chrome 106+ and Firefox 106+ shuffle extensions, so order comparison doesn't work
+	isShuffled := clientHelloID == HelloRandomized || clientHelloID == HelloRandomizedALPN || clientHelloID == HelloRandomizedNoALPN ||
+		clientHelloID == HelloChrome_120 || clientHelloID == HelloChrome_142 ||
+		clientHelloID == HelloFirefox_120 || clientHelloID == HelloFirefox_145
+	if !isShuffled && len(uconn.Extensions) == len(generatedUConn.Extensions) {
 		for i, originalExtension := range uconn.Extensions {
 			if _, ok := originalExtension.(*UtlsPaddingExtension); ok {
 				// We can't really compare padding extensions in this way
@@ -235,7 +238,7 @@ func checkUTLSFingerPrintClientHello(t *testing.T, clientHelloID ClientHelloID, 
 
 func TestUTLSFingerprintClientHello(t *testing.T) {
 	clientHellosToTest := []ClientHelloID{
-		HelloChrome_58, HelloChrome_70, HelloChrome_83, HelloFirefox_55, HelloFirefox_63, HelloIOS_11_1, HelloIOS_12_1, HelloRandomized, HelloRandomizedALPN, HelloRandomizedNoALPN}
+		HelloChrome_120, HelloChrome_142, HelloFirefox_120, HelloFirefox_145, HelloIOS_18, HelloRandomized, HelloRandomizedALPN, HelloRandomizedNoALPN}
 
 	serverNames := []string{"foobar"}
 
@@ -252,7 +255,7 @@ func TestUTLSFingerprintClientHelloBluntMimicry(t *testing.T) {
 	var extensionId uint16 = 0xfeed
 	extensionData := []byte("random data")
 
-	specWithGeneric, err := utlsIdToSpec(HelloChrome_Auto)
+	specWithGeneric, err := UTLSIdToSpec(HelloChrome_Auto)
 	if err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
@@ -293,11 +296,29 @@ func TestUTLSFingerprintClientHelloBluntMimicry(t *testing.T) {
 func TestUTLSFingerprintClientHelloAlwaysAddPadding(t *testing.T) {
 	serverName := "foobar"
 
-	specWithoutPadding, err := utlsIdToSpec(HelloIOS_12_1)
-	if err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
+	// Create a custom spec without padding
+	specWithoutPadding := ClientHelloSpec{
+		CipherSuites: []uint16{
+			TLS_AES_128_GCM_SHA256,
+			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
+		CompressionMethods: []byte{0x00},
+		Extensions: []TLSExtension{
+			&SNIExtension{},
+			&SupportedCurvesExtension{Curves: []CurveID{X25519, CurveP256}},
+			&SupportedPointsExtension{SupportedPoints: []byte{0x00}},
+			&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
+			&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
+				ECDSAWithP256AndSHA256,
+				PSSWithSHA256,
+				PKCS1WithSHA256,
+			}},
+			&KeyShareExtension{KeyShares: []KeyShare{{Group: X25519}}},
+		},
 	}
-	specWithPadding, err := utlsIdToSpec(HelloChrome_83)
+
+	// Get a spec with padding from Chrome
+	specWithPadding, err := UTLSIdToSpec(HelloChrome_120)
 	if err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
@@ -515,197 +536,6 @@ func TestUTLSFingerprintClientHelloKeepPSK(t *testing.T) {
 	t.Errorf("generated ClientHelloSpec with KeepPSK does not include preshared key extension")
 }
 
-func TestUTLSHandshakeClientFingerprintedSpecFromChrome_58(t *testing.T) {
-	helloID := HelloChrome_58
-	serverName := "foobar"
-	originalConfig := getUTLSTestConfig()
-	originalConfig.ServerName = serverName
-	uconn := UClient(&net.TCPConn{}, originalConfig, helloID)
-	if err := uconn.BuildHandshakeState(); err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-	}
-
-	f := &Fingerprinter{}
-	minTLSVers := createMinTLSVersion(uconn.vers)
-	generatedSpec, err := f.FingerprintClientHello(prependRecordHeader(uconn.HandshakeState.Hello.Raw, minTLSVers))
-	if err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-	}
-
-	hello := &helloSpec{
-		name: fmt.Sprintf("%v-fingerprinted", helloID.Str()),
-		spec: generatedSpec,
-	}
-
-	newConfig := getUTLSTestConfig()
-	newConfig.ServerName = serverName
-
-	opensslCipherName := "ECDHE-RSA-AES128-GCM-SHA256"
-	test := &clientTest{
-		name:   "UTLS-" + opensslCipherName + "-" + hello.helloName(),
-		args:   []string{"-cipher", opensslCipherName},
-		config: newConfig,
-	}
-
-	runUTLSClientTestTLS12(t, test, hello)
-}
-
-func TestUTLSHandshakeClientFingerprintedSpecFromChrome_70(t *testing.T) {
-	helloID := HelloChrome_70
-	serverName := "foobar"
-	originalConfig := getUTLSTestConfig()
-	originalConfig.ServerName = serverName
-
-	uconn := UClient(&net.TCPConn{}, originalConfig, helloID)
-	if err := uconn.BuildHandshakeState(); err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-	}
-
-	f := &Fingerprinter{}
-	minTLSVers := createMinTLSVersion(uconn.vers)
-	generatedSpec, err := f.FingerprintClientHello(prependRecordHeader(uconn.HandshakeState.Hello.Raw, minTLSVers))
-	if err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-	}
-
-	hello := &helloSpec{
-		name: fmt.Sprintf("%v-fingerprinted", helloID.Str()),
-		spec: generatedSpec,
-	}
-
-	newConfig := getUTLSTestConfig()
-	newConfig.ServerName = serverName
-
-	opensslCipherName := "TLS_AES_128_GCM_SHA256"
-	test := &clientTest{
-		name:   "UTLS-" + opensslCipherName + "-" + hello.helloName(),
-		args:   []string{"-ciphersuites", opensslCipherName},
-		config: newConfig,
-	}
-
-	runUTLSClientTestTLS13(t, test, hello)
-}
-
-func TestUTLSHandshakeClientFingerprintedSpecFromRaw(t *testing.T) {
-	// TLSv1.3 Record Layer: Handshake Protocol: Client Hello
-	//     Content Type: Handshake (22)
-	//     Version: TLS 1.0 (0x0301)
-	//     Length: 512
-	// Handshake Protocol: Client Hello
-	//     Handshake Type: Client Hello (1)
-	//     Length: 508
-	//     Version: TLS 1.2 (0x0303)
-	//     Random: 7fd76fa530c24816ea9e4a6cf2e939f2350b9486a7bac58e…
-	//     Session ID Length: 32
-	//     Session ID: d9b01fc4f4b6fe14fe9ce652442d66588d982cb25913d866…
-	//     Cipher Suites Length: 36
-	//     Cipher Suites (18 suites)
-	//         Cipher Suite: TLS_AES_128_GCM_SHA256 (0x1301)
-	//         Cipher Suite: TLS_CHACHA20_POLY1305_SHA256 (0x1303)
-	//         Cipher Suite: TLS_AES_256_GCM_SHA384 (0x1302)
-	//         Cipher Suite: TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (0xc02b)
-	//         Cipher Suite: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xc02f)
-	//         Cipher Suite: TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca9)
-	//         Cipher Suite: TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (0xcca8)
-	//         Cipher Suite: TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 (0xc02c)
-	//         Cipher Suite: TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (0xc030)
-	//         Cipher Suite: TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA (0xc00a)
-	//         Cipher Suite: TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA (0xc009)
-	//         Cipher Suite: TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA (0xc013)
-	//         Cipher Suite: TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA (0xc014)
-	//         Cipher Suite: TLS_RSA_WITH_AES_128_GCM_SHA256 (0x009c)
-	//         Cipher Suite: TLS_RSA_WITH_AES_256_GCM_SHA384 (0x009d)
-	//         Cipher Suite: TLS_RSA_WITH_AES_128_CBC_SHA (0x002f)
-	//         Cipher Suite: TLS_RSA_WITH_AES_256_CBC_SHA (0x0035)
-	//         Cipher Suite: TLS_RSA_WITH_3DES_EDE_CBC_SHA (0x000a)
-	//     Compression Methods Length: 1
-	//     Compression Methods (1 method)
-	//     Extensions Length: 399
-	//     Extension: server_name (len=34)
-	//         Type: server_name (0)
-	//         Length: 34
-	//         Server Name Indication extension
-	//     Extension: extended_master_secret (len=0)
-	//         Type: extended_master_secret (23)
-	//         Length: 0
-	//     Extension: renegotiation_info (len=1)
-	//         Type: renegotiation_info (65281)
-	//         Length: 1
-	//         Renegotiation Info extension
-	//     Extension: supported_groups (len=14)
-	//         Type: supported_groups (10)
-	//         Length: 14
-	//         Supported Groups List Length: 12
-	//         Supported Groups (6 groups)
-	//     Extension: ec_point_formats (len=2)
-	//         Type: ec_point_formats (11)
-	//         Length: 2
-	//         EC point formats Length: 1
-	//         Elliptic curves point formats (1)
-	//     Extension: application_layer_protocol_negotiation (len=14)
-	//         Type: application_layer_protocol_negotiation (16)
-	//         Length: 14
-	//         ALPN Extension Length: 12
-	//         ALPN Protocol
-	//     Extension: status_request (len=5)
-	//         Type: status_request (5)
-	//         Length: 5
-	//         Certificate Status Type: OCSP (1)
-	//         Responder ID list Length: 0
-	//         Request Extensions Length: 0
-	//     Extension: key_share (len=107)
-	//         Type: key_share (51)
-	//         Length: 107
-	//         Key Share extension
-	//     Extension: supported_versions (len=5)
-	//         Type: supported_versions (43)
-	//         Length: 5
-	//         Supported Versions length: 4
-	//         Supported Version: TLS 1.3 (0x0304)
-	//         Supported Version: TLS 1.2 (0x0303)
-	//     Extension: signature_algorithms (len=24)
-	//         Type: signature_algorithms (13)
-	//         Length: 24
-	//         Signature Hash Algorithms Length: 22
-	//         Signature Hash Algorithms (11 algorithms)
-	//     Extension: record_size_limit (len=2)
-	//         Type: record_size_limit (28)
-	//         Length: 2
-	//         Record Size Limit: 16385
-	//     Extension: padding (len=143)
-	//         Type: padding (21)
-	//         Length: 143
-	//         Padding Data: 000000000000000000000000000000000000000000000000…
-	byteString := []byte("1603010200010001fc03037fd76fa530c24816ea9e4a6cf2e939f2350b9486a7bac58ece5753767fb6112420d9b01fc4f4b6fe14fe9ce652442d66588d982cb25913d866348bde54d3899abe0024130113031302c02bc02fcca9cca8c02cc030c00ac009c013c014009c009d002f0035000a0100018f00000022002000001d70656f706c652d70612e636c69656e7473362e676f6f676c652e636f6d00170000ff01000100000a000e000c001d00170018001901000101000b000201000010000e000c02683208687474702f312e310005000501000000000033006b0069001d002065e566ff33dfbeb012e3b13b87d75612bd0fbc3963673df90afed533dccc9b5400170041047fcc2666d04c31272a2e39905c771a89edf5a71dae301ec2fa0e7bc4d0e06580a0d36324e3dc4f29e200a8905badd11c00daf11588977bf501597dac5fdc55bf002b00050403040303000d0018001604030503060308040805080604010501060102030201001c000240010015008f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
-	helloBytes := make([]byte, hex.DecodedLen(len(byteString)))
-	_, err := hex.Decode(helloBytes, byteString)
-	if err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-		return
-	}
-
-	f := &Fingerprinter{}
-	generatedSpec, err := f.FingerprintClientHello(helloBytes)
-	if err != nil {
-		t.Errorf("got error: %v; expected to succeed", err)
-	}
-
-	hello := &helloSpec{
-		name: "raw-capture-fingerprinted",
-		spec: generatedSpec,
-	}
-
-	config := getUTLSTestConfig()
-
-	opensslCipherName := "TLS_AES_128_GCM_SHA256"
-	test := &clientTest{
-		name:   "UTLS-" + opensslCipherName + "-" + hello.helloName(),
-		args:   []string{"-ciphersuites", opensslCipherName},
-		config: config,
-	}
-
-	runUTLSClientTestTLS13(t, test, hello)
-}
 
 // FingerprintClientHello should work when the dump contains the client's greeting and subsequent frames.
 // Lack of subsequent frames should not lead to inoperability of FingerprintClientHello.

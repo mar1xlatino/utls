@@ -723,6 +723,10 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		hs.masterSecret = masterFromPreMasterSecret(c.vers, hs.suite, preMasterSecret,
 			hs.clientHello.random, hs.hello.random)
 	}
+	// Zero the pre-master secret immediately after deriving the master secret
+	// to minimize the window where it could be extracted from memory.
+	zeroSlice(preMasterSecret)
+
 	if err := c.config.writeKeyLog(keyLogLabelTLS12, hs.clientHello.random, hs.masterSecret); err != nil {
 		c.sendAlert(alertInternalError)
 		return err

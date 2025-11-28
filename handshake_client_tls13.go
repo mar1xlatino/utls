@@ -652,6 +652,9 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 	}
 
 	handshakeSecret := earlySecret.HandshakeSecret(sharedKey)
+	// Zero the shared key immediately after deriving the handshake secret
+	// to minimize the window where it could be extracted from memory.
+	zeroSlice(sharedKey)
 
 	clientSecret := handshakeSecret.ClientHandshakeTrafficSecret(hs.transcript)
 	c.out.setTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, clientSecret)

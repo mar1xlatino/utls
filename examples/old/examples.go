@@ -355,11 +355,11 @@ func main() {
 		fmt.Printf("#> HttpGetDefault response: %+s\n", dumpResponseNoBody(response))
 	}
 
-	response, err = HttpGetByHelloID(requestHostname, requestAddr, tls.HelloChrome_62)
+	response, err = HttpGetByHelloID(requestHostname, requestAddr, tls.HelloChrome_120)
 	if err != nil {
-		fmt.Printf("#> HttpGetByHelloID(HelloChrome_62) failed: %+v\n", err)
+		fmt.Printf("#> HttpGetByHelloID(HelloChrome_120) failed: %+v\n", err)
 	} else {
-		fmt.Printf("#> HttpGetByHelloID(HelloChrome_62) response: %+s\n", dumpResponseNoBody(response))
+		fmt.Printf("#> HttpGetByHelloID(HelloChrome_120) response: %+s\n", dumpResponseNoBody(response))
 	}
 
 	response, err = HttpGetConsistentRandomized(requestHostname, requestAddr)
@@ -383,11 +383,11 @@ func main() {
 		fmt.Printf("#> HttpGetTicket response: %+s\n", dumpResponseNoBody(response))
 	}
 
-	response, err = HttpGetTicketHelloID(requestHostname, requestAddr, tls.HelloFirefox_56)
+	response, err = HttpGetTicketHelloID(requestHostname, requestAddr, tls.HelloFirefox_120)
 	if err != nil {
-		fmt.Printf("#> HttpGetTicketHelloID(HelloFirefox_56) failed: %+v\n", err)
+		fmt.Printf("#> HttpGetTicketHelloID(HelloFirefox_120) failed: %+v\n", err)
 	} else {
-		fmt.Printf("#> HttpGetTicketHelloID(HelloFirefox_56) response: %+s\n", dumpResponseNoBody(response))
+		fmt.Printf("#> HttpGetTicketHelloID(HelloFirefox_120) response: %+s\n", dumpResponseNoBody(response))
 	}
 
 	response, err = HttpGetCustom(requestHostname, requestAddr)

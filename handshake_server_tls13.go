@@ -762,6 +762,10 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 		earlySecret = tls13.NewEarlySecret(hs.suite.hash.New, nil)
 	}
 	hs.handshakeSecret = earlySecret.HandshakeSecret(hs.sharedKey)
+	// Zero the shared key immediately after deriving the handshake secret
+	// to minimize the window where it could be extracted from memory.
+	zeroSlice(hs.sharedKey)
+	hs.sharedKey = nil
 
 	clientSecret := hs.handshakeSecret.ClientHandshakeTrafficSecret(hs.transcript)
 	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, clientSecret)

@@ -231,10 +231,19 @@ func (hc *halfConn) changeCipherSpec() error {
 }
 
 func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) {
+	// Zero the old traffic secret before replacing it to minimize
+	// the window where it could be extracted from memory.
+	if hc.trafficSecret != nil {
+		zeroSlice(hc.trafficSecret)
+	}
 	hc.trafficSecret = secret
 	hc.level = level
 	key, iv := suite.trafficKey(secret)
 	hc.cipher = suite.aead(key, iv)
+	// Zero the derived key and IV after AEAD construction.
+	// Note: AEAD implementations typically copy these internally.
+	zeroSlice(key)
+	zeroSlice(iv)
 	for i := range hc.seq {
 		hc.seq[i] = 0
 	}

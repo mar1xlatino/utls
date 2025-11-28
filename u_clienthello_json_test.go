@@ -8,9 +8,7 @@ import (
 )
 
 func TestClientHelloSpecJSONUnmarshaler(t *testing.T) {
-	testClientHelloSpecJSONUnmarshaler(t, "testdata/ClientHello-JSON-Chrome102.json", HelloChrome_102)
-	testClientHelloSpecJSONUnmarshaler(t, "testdata/ClientHello-JSON-Firefox105.json", HelloFirefox_105)
-	testClientHelloSpecJSONUnmarshaler(t, "testdata/ClientHello-JSON-iOS14.json", HelloIOS_14)
+	// Chrome102, Firefox105, iOS14 removed - pre-shuffling profiles deprecated
 	testClientHelloSpecJSONUnmarshaler(t, "testdata/ClientHello-JSON-Edge106.json", HelloEdge_106)
 }
 
@@ -29,7 +27,7 @@ func testClientHelloSpecJSONUnmarshaler(
 		t.Fatal(err)
 	}
 
-	truthSpec, _ := utlsIdToSpec(truthClientHelloID)
+	truthSpec, _ := UTLSIdToSpec(truthClientHelloID)
 	jsonSpec := chsju.ClientHelloSpec()
 
 	// Compare CipherSuites
@@ -64,9 +62,7 @@ func testClientHelloSpecJSONUnmarshaler(
 }
 
 func TestClientHelloSpecUnmarshalJSON(t *testing.T) {
-	testClientHelloSpecUnmarshalJSON(t, "testdata/ClientHello-JSON-Chrome102.json", HelloChrome_102)
-	testClientHelloSpecUnmarshalJSON(t, "testdata/ClientHello-JSON-Firefox105.json", HelloFirefox_105)
-	testClientHelloSpecUnmarshalJSON(t, "testdata/ClientHello-JSON-iOS14.json", HelloIOS_14)
+	// Chrome102, Firefox105, iOS14 removed - pre-shuffling profiles deprecated
 	testClientHelloSpecUnmarshalJSON(t, "testdata/ClientHello-JSON-Edge106.json", HelloEdge_106)
 }
 
@@ -85,7 +81,7 @@ func testClientHelloSpecUnmarshalJSON(
 		t.Fatal(err)
 	}
 
-	truthSpec, _ := utlsIdToSpec(truthClientHelloID)
+	truthSpec, _ := UTLSIdToSpec(truthClientHelloID)
 
 	// Compare CipherSuites
 	if !reflect.DeepEqual(jsonSpec.CipherSuites, truthSpec.CipherSuites) {

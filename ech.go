@@ -214,7 +214,6 @@ func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, e
 
 // [uTLS SECTION END]
 
-// func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, error) {
 func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength int, outerExts []uint16) ([]byte, error) { // uTLS
 	h, err := inner.marshalMsgReorderOuterExts(true, outerExts)
 	if err != nil {
@@ -461,6 +460,10 @@ func validDNSName(name string) bool {
 	for _, l := range labels {
 		labelLen := len(l)
 		if labelLen == 0 {
+			return false
+		}
+		// RFC 1035 Section 2.3.4: labels must be 63 octets or less
+		if labelLen > 63 {
 			return false
 		}
 		for i, r := range l {

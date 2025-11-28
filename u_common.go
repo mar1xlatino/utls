@@ -5,23 +5,29 @@
 package tls
 
 import (
-	"crypto/hmac"
-	"crypto/sha512"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"log"
+	"runtime"
 
 	"github.com/refraction-networking/utls/internal/helper"
 	"golang.org/x/crypto/cryptobyte"
 )
 
+// zeroSlice zeroes a byte slice to erase sensitive key material from memory.
+// This is a defense-in-depth measure against memory dump attacks.
+// The runtime.KeepAlive call prevents the compiler from optimizing away the zeroing.
+func zeroSlice(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+	runtime.KeepAlive(b)
+}
+
 // Naming convention:
 // Unsupported things are prefixed with "Fake"
 // Things, supported by utls, but not crypto/tls' are prefixed with "utls"
-// Supported things, that have changed their ID are prefixed with "Old"
-// Supported but disabled things are prefixed with "Disabled". We will _enable_ them.
 
 // TLS handshake message types.
 const (
@@ -52,15 +58,7 @@ const (
 )
 
 const (
-	OLD_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256   = uint16(0xcc13)
-	OLD_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = uint16(0xcc14)
-
-	DISABLED_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 = uint16(0xc024)
-	DISABLED_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384   = uint16(0xc028)
-	DISABLED_TLS_RSA_WITH_AES_256_CBC_SHA256         = uint16(0x003d)
-
-	FAKE_OLD_TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = uint16(0xcc15) // we can try to craft these ciphersuites
-	FAKE_TLS_DHE_RSA_WITH_AES_128_GCM_SHA256           = uint16(0x009e) // from existing pieces, if needed
+	FAKE_TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 = uint16(0x009e) // from existing pieces, if needed
 
 	FAKE_TLS_DHE_RSA_WITH_AES_128_CBC_SHA    = uint16(0x0033)
 	FAKE_TLS_DHE_RSA_WITH_AES_256_CBC_SHA    = uint16(0x0039)
@@ -396,10 +394,15 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 
 				// need to add (zero) data per each key share, [10, 10, 0, 1] => [10, 10, 0, 1, 0]
+				// Each key share entry is 4 bytes: 2 bytes group ID + 2 bytes length
+				keyShareData := data["key_share"]
+				if len(keyShareData)%4 != 0 {
+					return errors.New("key_share data length must be divisible by 4")
+				}
 				fixedData := make([]byte, 0)
-				for i := 0; i < len(data["key_share"]); i += 4 {
-					fixedData = append(fixedData, data["key_share"][i:i+4]...)
-					for j := 0; j < int(data["key_share"][i+3]); j++ {
+				for i := 0; i+4 <= len(keyShareData); i += 4 {
+					fixedData = append(fixedData, keyShareData[i:i+4]...)
+					for j := 0; j < int(keyShareData[i+3]); j++ {
 						fixedData = append(fixedData, 0)
 					}
 				}
@@ -601,71 +604,50 @@ var (
 	HelloRandomizedALPN   = ClientHelloID{helloRandomizedALPN, helloAutoVers, nil, nil}
 	HelloRandomizedNoALPN = ClientHelloID{helloRandomizedNoALPN, helloAutoVers, nil, nil}
 
-	// The rest will will parrot given browser.
-	HelloFirefox_Auto = HelloFirefox_120
-	HelloFirefox_55   = ClientHelloID{helloFirefox, "55", nil, nil}
-	HelloFirefox_56   = ClientHelloID{helloFirefox, "56", nil, nil}
-	HelloFirefox_63   = ClientHelloID{helloFirefox, "63", nil, nil}
-	HelloFirefox_65   = ClientHelloID{helloFirefox, "65", nil, nil}
-	HelloFirefox_99   = ClientHelloID{helloFirefox, "99", nil, nil}
-	HelloFirefox_102  = ClientHelloID{helloFirefox, "102", nil, nil}
-	HelloFirefox_105  = ClientHelloID{helloFirefox, "105", nil, nil}
+	// The rest will parrot given browser.
+	// NOTE: Pre-Chrome 106 and pre-Firefox 106 profiles removed - they lack extension
+	// shuffling and are easily detectable.
+
+	// Firefox profiles (106+ have extension shuffling)
+	HelloFirefox_Auto = HelloFirefox_145
 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
+	HelloFirefox_145  = ClientHelloID{helloFirefox, "145", nil, nil} // Extension shuffling (NSS 3.84+)
 
-	HelloChrome_Auto        = HelloChrome_133
-	HelloChrome_58          = ClientHelloID{helloChrome, "58", nil, nil}
-	HelloChrome_62          = ClientHelloID{helloChrome, "62", nil, nil}
-	HelloChrome_70          = ClientHelloID{helloChrome, "70", nil, nil}
-	HelloChrome_72          = ClientHelloID{helloChrome, "72", nil, nil}
-	HelloChrome_83          = ClientHelloID{helloChrome, "83", nil, nil}
-	HelloChrome_87          = ClientHelloID{helloChrome, "87", nil, nil}
-	HelloChrome_96          = ClientHelloID{helloChrome, "96", nil, nil}
-	HelloChrome_100         = ClientHelloID{helloChrome, "100", nil, nil}
-	HelloChrome_102         = ClientHelloID{helloChrome, "102", nil, nil}
-	HelloChrome_106_Shuffle = ClientHelloID{helloChrome, "106", nil, nil} // TLS Extension shuffler enabled starting from 106
+	// Chrome profiles (106+ have extension shuffling)
+	HelloChrome_Auto        = HelloChrome_142
+	HelloChrome_106_Shuffle = ClientHelloID{helloChrome, "106", nil, nil} // First version with extension shuffling
 
-	// Chrome w/ PSK: Chrome start sending this ClientHello after doing TLS 1.3 handshake with the same server.
-	// Beta: PSK extension added. However, uTLS doesn't ship with full PSK support.
-	// Use at your own discretion.
-	HelloChrome_100_PSK              = ClientHelloID{helloChrome, "100_PSK", nil, nil}
+	// Chrome w/ PSK (session resumption)
 	HelloChrome_112_PSK_Shuf         = ClientHelloID{helloChrome, "112_PSK", nil, nil}
 	HelloChrome_114_Padding_PSK_Shuf = ClientHelloID{helloChrome, "114_PSK", nil, nil}
 
-	// Chrome w/ Post-Quantum Key Agreement
-	// Beta: PQ extension added. However, uTLS doesn't ship with full PQ support. Use at your own discretion.
+	// Chrome w/ Post-Quantum Key Agreement (X25519Kyber768Draft00)
 	HelloChrome_115_PQ     = ClientHelloID{helloChrome, "115_PQ", nil, nil}
 	HelloChrome_115_PQ_PSK = ClientHelloID{helloChrome, "115_PQ_PSK", nil, nil}
 
-	// Chrome ECH
-	HelloChrome_120 = ClientHelloID{helloChrome, "120", nil, nil}
-	// Chrome w/ Post-Quantum Key Agreement and Encrypted ClientHello
+	// Chrome w/ ECH (Encrypted Client Hello)
+	HelloChrome_120    = ClientHelloID{helloChrome, "120", nil, nil}
 	HelloChrome_120_PQ = ClientHelloID{helloChrome, "120_PQ", nil, nil}
-	// Chrome w/ ML-KEM curve
+
+	// Chrome w/ X25519MLKEM768 (final NIST standard, replaces Kyber draft)
 	HelloChrome_131 = ClientHelloID{helloChrome, "131", nil, nil}
-	// Chrome w/ New ALPS codepoint
-	HelloChrome_133 = ClientHelloID{helloChrome, "133", nil, nil}
+	HelloChrome_133 = ClientHelloID{helloChrome, "133", nil, nil} // New ALPS codepoint (17613)
+	HelloChrome_142 = ClientHelloID{helloChrome, "142", nil, nil} // October 2025
 
-	HelloIOS_Auto = HelloIOS_14
-	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
-	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
-	HelloIOS_13   = ClientHelloID{helloIOS, "13", nil, nil}
-	HelloIOS_14   = ClientHelloID{helloIOS, "14", nil, nil}
+	// iOS (Safari-based, no extension shuffling)
+	HelloIOS_Auto = HelloIOS_26
+	HelloIOS_18   = ClientHelloID{helloIOS, "18", nil, nil}
+	HelloIOS_26   = ClientHelloID{helloIOS, "26", nil, nil} // November 2025, post-quantum X25519MLKEM768
 
-	HelloAndroid_11_OkHttp = ClientHelloID{helloAndroid, "11", nil, nil}
-
-	HelloEdge_Auto = HelloEdge_85 // HelloEdge_106 seems to be incompatible with this library
-	HelloEdge_85   = ClientHelloID{helloEdge, "85", nil, nil}
+	// Edge (Chromium-based, follows Chrome fingerprint)
+	HelloEdge_Auto = HelloEdge_142
 	HelloEdge_106  = ClientHelloID{helloEdge, "106", nil, nil}
+	HelloEdge_142  = ClientHelloID{helloEdge, "142", nil, nil}
 
-	HelloSafari_Auto = HelloSafari_16_0
-	HelloSafari_16_0 = ClientHelloID{helloSafari, "16.0", nil, nil}
-
-	Hello360_Auto = Hello360_7_5 // Hello360_11_0 seems to be incompatible with this library
-	Hello360_7_5  = ClientHelloID{hello360, "7.5", nil, nil}
-	Hello360_11_0 = ClientHelloID{hello360, "11.0", nil, nil}
-
-	HelloQQ_Auto = HelloQQ_11_1
-	HelloQQ_11_1 = ClientHelloID{helloQQ, "11.1", nil, nil}
+	// Safari (no extension shuffling, but modern TLS 1.3)
+	HelloSafari_Auto = HelloSafari_26
+	HelloSafari_18   = ClientHelloID{helloSafari, "18", nil, nil}   // macOS Sequoia / iOS 18
+	HelloSafari_26   = ClientHelloID{helloSafari, "26", nil, nil}   // November 2025, post-quantum X25519MLKEM768
 )
 
 type Weights struct {
@@ -732,39 +714,7 @@ func unGREASEUint16(v uint16) uint16 {
 	}
 }
 
-// utlsMacSHA384 returns a SHA-384 based MAC. These are only supported in TLS 1.2
-// so the given version is ignored.
-func utlsMacSHA384(key []byte) hash.Hash {
-	return hmac.New(sha512.New384, key)
-}
-
-var utlsSupportedCipherSuites []*cipherSuite
-
-func init() {
-	utlsSupportedCipherSuites = append(cipherSuites, []*cipherSuite{
-		{OLD_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, 32, 0, 12, ecdheRSAKA,
-			suiteECDHE | suiteTLS12, nil, nil, aeadChaCha20Poly1305},
-		{OLD_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, 32, 0, 12, ecdheECDSAKA,
-			suiteECDHE | suiteECSign | suiteTLS12, nil, nil, aeadChaCha20Poly1305},
-	}...)
-}
-
-// EnableWeakCiphers allows utls connections to continue in some cases, when weak cipher was chosen.
-// This provides better compatibility with servers on the web, but weakens security. Feel free
-// to use this option if you establish additional secure connection inside of utls connection.
-// This option does not change the shape of parrots (i.e. same ciphers will be offered either way).
-// Must be called before establishing any connections.
-func EnableWeakCiphers() {
-	utlsSupportedCipherSuites = append(cipherSuites, []*cipherSuite{
-		{DISABLED_TLS_RSA_WITH_AES_256_CBC_SHA256, 32, 32, 16, rsaKA,
-			suiteTLS12, cipherAES, macSHA256, nil},
-
-		{DISABLED_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384, 32, 48, 16, ecdheECDSAKA,
-			suiteECDHE | suiteECSign | suiteTLS12 | suiteSHA384, cipherAES, utlsMacSHA384, nil},
-		{DISABLED_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384, 32, 48, 16, ecdheRSAKA,
-			suiteECDHE | suiteTLS12 | suiteSHA384, cipherAES, utlsMacSHA384, nil},
-	}...)
-}
+var utlsSupportedCipherSuites = cipherSuites
 
 func mapSlice[T any, U any](slice []T, transform func(T) U) []U {
 	newSlice := make([]U, 0, len(slice))

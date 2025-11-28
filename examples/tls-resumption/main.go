@@ -173,7 +173,7 @@ func main() {
 	tls13Url := "www.microsoft.com:443"
 	tls12Url1 := "spocs.getpocket.com:443"
 	tls12Url2 := "marketplace.visualstudio.com:443"
-	runResumptionCheck(tls.HelloChrome_100, nil, noResumption, tls13Url, 3, false) // no-resumption + utls
+	runResumptionCheck(tls.HelloChrome_120, nil, noResumption, tls13Url, 3, false) // no-resumption + utls
 	func() {
 		defer func() {
 			if err := recover(); err == nil {
@@ -182,16 +182,16 @@ func main() {
 		}()
 
 		runResumptionCheck(tls.HelloCustom, func() *tls.ClientHelloSpec {
-			spec, _ := tls.UTLSIdToSpec(tls.HelloChrome_100)
+			spec, _ := tls.UTLSIdToSpec(tls.HelloChrome_120)
 			return &spec
 		}, noResumption, tls13Url, 3, false) // no-resumption + utls custom + no psk extension
 	}()
-	runResumptionCheck(tls.HelloChrome_100_PSK, nil, pskResumption, tls13Url, 1, false) // psk + utls
+	runResumptionCheck(tls.HelloChrome_112_PSK_Shuf, nil, pskResumption, tls13Url, 1, false) // psk + utls
 	runResumptionCheck(tls.HelloGolang, nil, pskResumption, tls13Url, 1, false)         // psk + crypto/tls
 
-	runResumptionCheck(tls.HelloChrome_100_PSK, nil, ticketResumption, tls12Url1, 10, false) // session ticket + utls
+	runResumptionCheck(tls.HelloChrome_112_PSK_Shuf, nil, ticketResumption, tls12Url1, 10, false) // session ticket + utls
 	runResumptionCheck(tls.HelloGolang, nil, ticketResumption, tls12Url1, 10, false)         // session ticket + crypto/tls
-	runResumptionCheck(tls.HelloChrome_100_PSK, nil, ticketResumption, tls12Url2, 10, false) // session ticket + utls
+	runResumptionCheck(tls.HelloChrome_112_PSK_Shuf, nil, ticketResumption, tls12Url2, 10, false) // session ticket + utls
 	runResumptionCheck(tls.HelloGolang, nil, ticketResumption, tls12Url2, 10, false)         // session ticket + crypto/tls
 
 }

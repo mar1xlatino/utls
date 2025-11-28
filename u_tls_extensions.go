@@ -369,6 +369,9 @@ func (e *SupportedCurvesExtension) Write(b []byte) (int, error) {
 		}
 		curves = append(curves, CurveID(unGREASEUint16(curve)))
 	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: supported_groups extension has trailing data")
+	}
 	e.Curves = curves
 	return fullLen, nil
 }
@@ -438,6 +441,9 @@ func (e *SupportedPointsExtension) Write(b []byte) (int, error) {
 	if !readUint8LengthPrefixed(&extData, &supportedPoints) ||
 		len(supportedPoints) == 0 {
 		return 0, errors.New("unable to read supported points extension data")
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: ec_point_formats extension has trailing data")
 	}
 	e.SupportedPoints = supportedPoints
 	return fullLen, nil
@@ -517,6 +523,9 @@ func (e *SignatureAlgorithmsExtension) Write(b []byte) (int, error) {
 		}
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: signature_algorithms extension has trailing data")
 	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil
@@ -665,6 +674,9 @@ func (e *SignatureAlgorithmsCertExtension) Write(b []byte) (int, error) {
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
 	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: signature_algorithms_cert extension has trailing data")
+	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil
 }
@@ -767,7 +779,9 @@ func (e *ALPNExtension) Write(b []byte) (int, error) {
 			return 0, errors.New("unable to read ALPN extension data")
 		}
 		alpnProtocols = append(alpnProtocols, string(proto))
-
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: ALPN extension has trailing data")
 	}
 	e.AlpnProtocols = alpnProtocols
 	return fullLen, nil
@@ -857,7 +871,9 @@ func (e *applicationSettingsExtension) Write(b []byte) ([]string, int, error) {
 			return nil, 0, errors.New("unable to read ALPN extension data")
 		}
 		alpnProtocols = append(alpnProtocols, string(proto))
-
+	}
+	if !extData.Empty() {
+		return nil, 0, errors.New("tls: ALPS extension has trailing data")
 	}
 	return alpnProtocols, fullLen, nil
 }
@@ -1470,6 +1486,9 @@ func (e *UtlsCompressCertExtension) Write(b []byte) (int, error) {
 			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d", alg)
 		}
 	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: compress_certificate extension has trailing data")
+	}
 
 	e.Algorithms = methods
 	return fullLen, nil
@@ -1571,6 +1590,9 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 			ks.Data = nil
 		}
 		keyShares = append(keyShares, ks)
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: key_share extension has trailing data")
 	}
 	e.KeyShares = keyShares
 	return fullLen, nil
@@ -1808,6 +1830,9 @@ func (e *PSKKeyExchangeModesExtension) Write(b []byte) (int, error) {
 	if !readUint8LengthPrefixed(&extData, &pskModes) {
 		return 0, errors.New("unable to read PSK extension data")
 	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: psk_key_exchange_modes extension has trailing data")
+	}
 	e.Modes = pskModes
 	return fullLen, nil
 }
@@ -1908,6 +1933,9 @@ func (e *SupportedVersionsExtension) Write(b []byte) (int, error) {
 			return 0, errors.New("unable to read supported versions extension data")
 		}
 		supportedVersions = append(supportedVersions, unGREASEUint16(vers))
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: supported_versions extension has trailing data")
 	}
 	e.Versions = supportedVersions
 	return fullLen, nil
@@ -2336,6 +2364,9 @@ func (e *FakeTokenBindingExtension) Write(b []byte) (int, error) {
 		!extData.ReadUint8LengthPrefixed(&keyParameters) {
 		return 0, errors.New("unable to read token binding extension data")
 	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: token_binding extension has trailing data")
+	}
 	e.KeyParameters = keyParameters
 	return fullLen, nil
 }
@@ -2425,6 +2456,9 @@ func (e *FakeDelegatedCredentialsExtension) Write(b []byte) (int, error) {
 		}
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
+	}
+	if !extData.Empty() {
+		return 0, errors.New("tls: delegated_credentials extension has trailing data")
 	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil

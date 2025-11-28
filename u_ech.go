@@ -280,6 +280,10 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	}
 	g.CandidatePayloadLens = []uint16{uint16(len(ignored) - cipherOverhead)}
 
+	if !extData.Empty() {
+		return fullLen, errors.New("tls: encrypted_client_hello extension has trailing data")
+	}
+
 	return fullLen, nil
 }
 

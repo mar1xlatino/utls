@@ -81,7 +81,7 @@ func checkOpenSSLVersion() error {
 	}
 
 	version := string(output)
-	if strings.HasPrefix(version, "OpenSSL 1.1.1") {
+	if strings.HasPrefix(version, "OpenSSL 1.1.1") || strings.HasPrefix(version, "OpenSSL 3.") {
 		return nil
 	}
 

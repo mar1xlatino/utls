@@ -37,16 +37,6 @@ type PubClientHandshakeState struct {
 
 // TLS 1.3 only
 type TLS13OnlyState struct {
-	// Deprecated: Use KeyShareKeys instead. KeyShareKeys will take precedence if both are set.
-	// Support may be removed in the future.
-	EcdheKey *ecdh.PrivateKey
-	// Deprecated: Use KeyShareKeys instead. This variable is no longer used.
-	// Will be removed in the future.
-	KeySharesParams *KeySharesParameters
-	// Deprecated: Use KeyShareKeys instead. This variable is no longer used.
-	// Will be removed in the future.
-	KEMKey *KemPrivateKey
-
 	KeyShareKeys  *KeySharePrivateKeys
 	Suite         *PubCipherSuiteTLS13
 	EarlySecret   []byte
@@ -68,19 +58,8 @@ func (chs *TLS13OnlyState) private13KeyShareKeys() *keySharePrivateKeys {
 	if chs.KeyShareKeys != nil {
 		return chs.KeyShareKeys.ToPrivate()
 	}
-
-	if chs.EcdheKey != nil {
-		return &keySharePrivateKeys{
-			ecdhe: chs.EcdheKey,
-		}
-	}
-
 	return nil
 }
-
-// func kyberGoToCircl(kyberKey *mlkem768.DecapsulationKey, ecdhKey *ecdh.PrivateKey) (kem.PrivateKey, error) {
-// 	return hybrid.Kyber768X25519().UnmarshalBinaryPrivateKey(append(ecdhKey.Bytes(), kyberKey.Bytes()...))
-// }
 
 func (chs *PubClientHandshakeState) toPrivate13() *clientHandshakeStateTLS13 {
 	if chs == nil {
@@ -181,10 +160,6 @@ func (chs12 *clientHandshakeState) toPublic12() *PubClientHandshakeState {
 		}
 	}
 }
-
-// type EcdheParameters interface {
-// 	ecdheParameters
-// }
 
 type CertificateRequestMsgTLS13 struct {
 	// Deprecated: crypto/tls no longer use this variable. This field won't be read or used by utls, but will still be populated.
@@ -859,39 +834,6 @@ func (TKS TicketKeys) ToPrivate() []ticketKey {
 	return tks
 }
 
-type kemPrivateKey struct {
-	secretKey any
-	curveID   CurveID
-}
-
-// Deprecated: Use KeySharePrivateKeys instead. This type is no longer used.
-// Will be removed in the future.
-type KemPrivateKey struct {
-	SecretKey any
-	CurveID   CurveID
-}
-
-func (kpk *KemPrivateKey) ToPrivate() *kemPrivateKey {
-	if kpk == nil {
-		return nil
-	} else {
-		return &kemPrivateKey{
-			secretKey: kpk.SecretKey,
-			curveID:   kpk.CurveID,
-		}
-	}
-}
-
-func (kpk *kemPrivateKey) ToPublic() *KemPrivateKey {
-	if kpk == nil {
-		return nil
-	} else {
-		return &KemPrivateKey{
-			SecretKey: kpk.secretKey,
-			CurveID:   kpk.curveID,
-		}
-	}
-}
 
 type KeySharePrivateKeys struct {
 	CurveID    CurveID

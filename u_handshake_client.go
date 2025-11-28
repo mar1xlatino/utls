@@ -94,6 +94,19 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		return nil, fmt.Errorf("unsupported algorithm (%d)", m.algorithm)
 	}
 
+	// RFC 8879: uncompressed_length is uint24, max 16MB. We use a reasonable limit to prevent DoS.
+	// Most certificate chains are under 100KB; 16MB is extremely generous.
+	const maxDecompressedCertSize = 1 << 24 // 16MB per RFC 8879
+	if m.uncompressedLength > maxDecompressedCertSize {
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("compressed certificate uncompressed length %d exceeds maximum %d",
+			m.uncompressedLength, maxDecompressedCertSize)
+	}
+	if m.uncompressedLength == 0 {
+		c.sendAlert(alertBadCertificate)
+		return nil, fmt.Errorf("compressed certificate has zero uncompressed length")
+	}
+
 	rawMsg := make([]byte, m.uncompressedLength+4) // +4 for message type and uint24 length field
 	rawMsg[0] = typeCertificate
 	rawMsg[1] = uint8(m.uncompressedLength >> 16)

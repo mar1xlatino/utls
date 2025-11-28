@@ -416,6 +416,10 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 	// identities
 	for identitiesLength > 0 {
+		// Check bounds BEFORE subtraction to prevent integer underflow
+		if identitiesLength < 2 {
+			return 0, errors.New("tls: invalid PSK extension: truncated identity length")
+		}
 		var identityLength uint16
 		if !s.ReadUint16(&identityLength) {
 			return 0, errors.New("tls: invalid PSK extension")
@@ -423,7 +427,7 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 		identitiesLength -= 2
 
 		if identityLength > identitiesLength {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, errors.New("tls: invalid PSK extension: identity length exceeds remaining data")
 		}
 
 		var identity []byte
@@ -433,6 +437,10 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 		identitiesLength -= identityLength // identity
 
+		// Check bounds BEFORE subtraction to prevent integer underflow
+		if identitiesLength < 4 {
+			return 0, errors.New("tls: invalid PSK extension: truncated obfuscated ticket age")
+		}
 		var obfuscatedTicketAge uint32
 		if !s.ReadUint32(&obfuscatedTicketAge) {
 			return 0, errors.New("tls: invalid PSK extension")
@@ -453,6 +461,10 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 	// binders
 	for bindersLength > 0 {
+		// Check bounds BEFORE subtraction to prevent integer underflow
+		if bindersLength < 1 {
+			return 0, errors.New("tls: invalid PSK extension: truncated binder length")
+		}
 		var binderLength uint8
 		if !s.ReadUint8(&binderLength) {
 			return 0, errors.New("tls: invalid PSK extension")
@@ -460,7 +472,7 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 		bindersLength -= 1
 
 		if uint16(binderLength) > bindersLength {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, errors.New("tls: invalid PSK extension: binder length exceeds remaining data")
 		}
 
 		var binder []byte
@@ -476,6 +488,11 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
 		return 0, errors.New("tls: invalid PSK extension: binder count must match identity count")
+	}
+
+	// Reject trailing data
+	if !s.Empty() {
+		return 0, errors.New("tls: invalid PSK extension: trailing data")
 	}
 
 	return fullLen, nil

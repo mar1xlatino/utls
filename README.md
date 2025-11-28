@@ -66,36 +66,45 @@ There are some caveats to this parroting:
 * We are forced to offer ciphersuites and tls extensions that are not supported by crypto/tls.
 This is not a problem, if you fully control the server and turn unsupported things off on server side.
 * Parroting could be imperfect, and there is no parroting beyond ClientHello.
-#### Compatibility risks of available parrots
 
-| Parrot        | Ciphers* | Signature* | Unsupported extensions | TLS Fingerprint ID              |
-| ------------- | -------- | ---------- | ---------------------- | --------------------------------------------- |
-| Chrome 62     | no       | no         | ChannelID              | [0a4a74aeebd1bb66](https://tlsfingerprint.io/id/0a4a74aeebd1bb66) |
-| Chrome 70     | no       | no         | ChannelID, Encrypted Certs | [bc4c7e42f4961cd7](https://tlsfingerprint.io/id/bc4c7e42f4961cd7) |
-| Chrome 72     | no       | no         | ChannelID, Encrypted Certs | [bbf04e5f1881f506](https://tlsfingerprint.io/id/bbf04e5f1881f506) |
-| Chrome 83     | no       | no         | ChannelID, Encrypted Certs | [9c673fd64a32c8dc](https://tlsfingerprint.io/id/9c673fd64a32c8dc) |
-| Firefox 56    | very low | no         | None                   | [c884bad7f40bee56](https://tlsfingerprint.io/id/c884bad7f40bee56) |
-| Firefox 65    | very low | no         | MaxRecordSize                   | [6bfedc5d5c740d58](https://tlsfingerprint.io/id/6bfedc5d5c740d58) |
-| iOS 11.1      | low** | no         | None                   | [71a81bafd58e1301](https://tlsfingerprint.io/id/71a81bafd58e1301) |
-| iOS 12.1      | low** | no         | None                   | [ec55e5b4136c7949](https://tlsfingerprint.io/id/ec55e5b4136c7949) |
+#### TLS Fingerprinting with JA4
 
-\* Denotes very rough guesstimate of likelihood that unsupported things will get echoed back by the server in the wild,
-*visibly breaking the connection*.  
-\*\* No risk, if `utls.EnableWeakCiphers()` is called prior to using it.  
+Modern browsers (Chrome 106+, Firefox 106+) randomize TLS extension order on every connection. Use JA4 for fingerprinting - it sorts extensions before hashing:
+```
+JA4: t13d1516h2_a09f3c656075_e42f34c56612
+     │  │ │  │
+     │  │ │  └─ ALPN (h2 = HTTP/2)
+     │  │ └──── 16 extensions
+     │  └────── 15 cipher suites
+     └───────── TLS 1.3 over TCP with domain SNI
+```
+
+#### Available Browser Profiles
+
+| Profile | Version | Post-Quantum | Extension Shuffling | Notes |
+|---------|---------|--------------|---------------------|-------|
+| `HelloChrome_Auto` | Chrome 142 | ✅ X25519MLKEM768 | ✅ Yes | Recommended for Chrome |
+| `HelloFirefox_Auto` | Firefox 145 | ⚠️ Coming | ✅ Yes | Recommended for Firefox |
+| `HelloSafari_Auto` | Safari 18 | ❌ No | ❌ No | Fixed extension order |
+| `HelloEdge_Auto` | Edge 142 | ✅ X25519MLKEM768 | ✅ Yes | Identical to Chrome |
+
+**Note**: Pre-Chrome 106 and pre-Firefox 106 legacy profiles have been removed as they lack extension shuffling and are easily detectable.
 
 #### Parrots FAQ
 > Does it really look like, say, Google Chrome with all the [GREASE](https://tools.ietf.org/html/draft-davidben-tls-grease-01) and stuff?
 
-It LGTM, but please open up Wireshark and check. If you see something — [say something](https://github.com/refraction-networking/utls/issues).
+Yes. Modern profiles include proper GREASE randomization, extension shuffling, and post-quantum key exchange (X25519MLKEM768). Verify with [browserleaks.com/tls](https://browserleaks.com/tls) or [tls.peet.ws](https://tls.peet.ws/).
 
 > Aren't there side channels? Everybody knows that the ~~bird is a word~~[parrot is dead](https://people.cs.umass.edu/~amir/papers/parrot.pdf)
 
 There sure are. If you found one that approaches practicality at line speed — [please tell us](https://github.com/refraction-networking/utls/issues).
 
-However, there is a difference between this sort of parroting and techniques like SkypeMorth.
-Namely, TLS is highly standardized protocol, therefore simply not that many subtle things in TLS protocol
-could be different and/or suddenly change in one of mimicked implementation(potentially undermining the mimicry).
-It is possible that we have a distinguisher right now, but amount of those potential distinguishers is limited.
+However, there is a difference between this sort of parroting and techniques like SkypeMorph.
+TLS is a highly standardized protocol, and modern browsers actively fight fingerprinting via extension shuffling.
+The main detection vectors now are:
+- **Cipher suite ORDER** (not shuffled, still fingerprintable)
+- **HTTP/2 fingerprinting** (not covered by utls)
+- **Behavioral analysis** (request patterns, timing)
 
 ### Custom Handshake
 It is possible to create custom handshake by

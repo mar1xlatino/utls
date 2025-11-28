@@ -171,14 +171,16 @@ var serverCommand = []string{"openssl", "s_server", "-no_ticket", "-num_tickets"
 // opensslInput for the stdin of the child process. It must be closed before
 // Waiting for child.
 func (test *clientTest) connFromCommand() (conn *recordingConn, child *exec.Cmd, stdin opensslInput, stdout *opensslOutputSink, err error) {
-	cert := testRSACertificate
+	// Use 2048-bit certificate for OpenSSL 3.x compatibility
+	cert := testRSA2048Certificate
 	if len(test.cert) > 0 {
 		cert = test.cert
 	}
 	certPath := tempFile(string(cert))
 	defer os.Remove(certPath)
 
-	var key any = testRSAPrivateKey
+	// Use 2048-bit key for OpenSSL 3.x compatibility
+	var key any = testRSA2048PrivateKey
 	if test.key != nil {
 		key = test.key
 	}
