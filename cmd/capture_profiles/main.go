@@ -28,51 +28,145 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-// CapturedProfile holds the raw data captured from a ClientHello
+// CapturedProfile holds TLS fingerprint data from a ClientHello
+// Focused on fingerprint-relevant data only, no bloat
 type CapturedProfile struct {
-	Timestamp        time.Time `json:"timestamp"`
-	UserAgent        string    `json:"user_agent"`
-	RemoteAddr       string    `json:"remote_addr"`
-	TLSVersion       uint16    `json:"tls_version"`
-	CipherSuites     []uint16  `json:"cipher_suites"`
-	Extensions       []uint16  `json:"extensions"`
-	SupportedGroups  []uint16  `json:"supported_groups"`
-	ECPointFormats   []uint8   `json:"ec_point_formats"` // For JA3
-	SignatureAlgos   []uint16  `json:"signature_algorithms"`
-	ALPNProtocols    []string  `json:"alpn_protocols"`
-	ServerName       string    `json:"server_name"`
-	SupportedVers    []uint16  `json:"supported_versions"`
-	KeyShareGroups   []uint16  `json:"key_share_groups"`
-	PSKModes         []uint8   `json:"psk_modes"`
-	CertCompressAlgs []uint16  `json:"cert_compression_algs"`
+	// Metadata
+	Timestamp  time.Time `json:"timestamp"`
+	UserAgent  string    `json:"user_agent"`
+	RemoteAddr string    `json:"remote_addr"`
 
-	// Raw bytes for verification
+	// ClientHello Core Fields
+	ClientVersion   uint16 `json:"client_version"`    // Legacy version (usually 0x0303)
+	SessionIDLength int    `json:"session_id_length"` // 0 or 32, content doesn't matter
+
+	// Cipher Suites (order matters for fingerprinting)
+	CipherSuites []uint16 `json:"cipher_suites"` // With GREASE
+
+	// Compression Methods
+	CompressionMethods []uint8 `json:"compression_methods"`
+
+	// Extensions (order matters!)
+	Extensions []uint16 `json:"extensions"` // With GREASE, original order
+
+	// GREASE Tracking (critical for accurate replay)
+	GREASE GREASEInfo `json:"grease"`
+
+	// Parsed Extension Data
+	ServerName      string   `json:"server_name"`
+	SupportedGroups []uint16 `json:"supported_groups"` // With GREASE
+	ECPointFormats  []uint8  `json:"ec_point_formats"`
+	SignatureAlgos  []uint16 `json:"signature_algorithms"`
+	ALPNProtocols   []string `json:"alpn_protocols"`
+	SupportedVers   []uint16 `json:"supported_versions"` // With GREASE
+	KeyShares       []KeyShareEntry `json:"key_shares"`
+	PSKModes        []uint8  `json:"psk_modes"`
+	CertCompressAlgs []uint16 `json:"cert_compression_algs"`
+
+	// Extension Flags (presence detection)
+	StatusRequest        bool `json:"status_request"`         // OCSP (0x0005)
+	SCTEnabled           bool `json:"sct_enabled"`            // SCT (0x0012)
+	ExtendedMasterSecret bool `json:"extended_master_secret"` // EMS (0x0017)
+	PostHandshakeAuth    bool `json:"post_handshake_auth"`    // PHA (0x0031)
+	DelegatedCredentials bool `json:"delegated_credentials"`  // (0x0022)
+	ApplicationSettings  bool `json:"application_settings"`   // ALPS (0x44cd)
+	ECHEnabled           bool `json:"ech_enabled"`            // ECH present
+
+	// Extension Values (when length/value matters)
+	PaddingLength       int    `json:"padding_length"`        // Padding ext length
+	RecordSizeLimit     uint16 `json:"record_size_limit"`     // (0x001c)
+	SessionTicketLength int    `json:"session_ticket_length"` // 0 = empty ticket
+
+	// Raw bytes (not in JSON, for forensics if needed)
 	RawClientHello []byte `json:"-"`
 
-	// Computed fingerprints
-	JA3  string `json:"ja3"`
-	JA4  string `json:"ja4"`
-	JA4r string `json:"ja4_raw"`
+	// Computed Fingerprints
+	JA3   string `json:"ja3"`
+	JA3r  string `json:"ja3_raw"`
+	JA4   string `json:"ja4"`
+	JA4r  string `json:"ja4_raw"`
+	JA4o  string `json:"ja4_original"`     // Original order
+	JA4ro string `json:"ja4_original_raw"`
+}
+
+// KeyShareEntry holds key share group and key length
+type KeyShareEntry struct {
+	Group     uint16 `json:"group"`
+	KeyLength int    `json:"key_length"`
+}
+
+// GREASEInfo tracks GREASE values and positions (critical for replay)
+type GREASEInfo struct {
+	// Actual GREASE values used
+	CipherSuite      uint16   `json:"cipher_suite,omitempty"`
+	Extensions       []uint16 `json:"extensions,omitempty"`
+	SupportedGroup   uint16   `json:"supported_group,omitempty"`
+	SupportedVersion uint16   `json:"supported_version,omitempty"`
+	KeyShare         uint16   `json:"key_share,omitempty"`
+
+	// Positions in lists (-1 = not present)
+	CipherSuitePos      int   `json:"cipher_suite_pos"`
+	ExtensionPos        []int `json:"extension_pos"`
+	SupportedGroupPos   int   `json:"supported_group_pos"`
+	SupportedVersionPos int   `json:"supported_version_pos"`
+	KeySharePos         int   `json:"key_share_pos"`
 }
 
 var (
-	captures   []CapturedProfile
-	capturesMu sync.Mutex
+	captures      []CapturedProfile
+	capturesMu    sync.Mutex
+	seenJA4       = make(map[string]bool) // Deduplicate by JA4
+	seenJA4Mu     sync.Mutex
+	profilesDir   string
+	autoSave      bool
+	deduplicateUA bool
 )
+
+// BrowserInfo contains parsed browser information
+type BrowserInfo struct {
+	Browser      string
+	Version      int
+	VersionFull  string
+	Platform     string
+	OS           string
+	OSVersion    string
+	Architecture string
+	Mobile       bool
+	Bot          bool
+}
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	// Command-line flags
+	port := flag.Int("port", 443, "Port to listen on")
+	flag.StringVar(&profilesDir, "dir", "profiles", "Directory to save profiles")
+	flag.BoolVar(&autoSave, "save", true, "Auto-save profiles to files")
+	flag.BoolVar(&deduplicateUA, "dedup", true, "Deduplicate captures by JA4 hash")
+	flag.Parse()
+
+	// Create profiles directory
+	if autoSave {
+		if err := os.MkdirAll(profilesDir, 0755); err != nil {
+			log.Fatalf("Failed to create profiles directory: %v", err)
+		}
+		log.Printf("Profiles will be saved to: %s/", profilesDir)
+	}
 
 	// Generate self-signed certificate
 	tlsCert, err := generateSelfSignedCert()
@@ -81,27 +175,29 @@ func main() {
 	}
 
 	log.Println("===========================================")
-	log.Println("TLS Fingerprint Capture Server")
+	log.Println("TLS Fingerprint Capture Server (Enhanced)")
 	log.Println("===========================================")
-	log.Println("Listening on https://0.0.0.0:443 (all interfaces)")
+	log.Printf("Listening on https://0.0.0.0:%d (all interfaces)\n", *port)
 	log.Println("")
 	log.Println("Access URLs:")
-	log.Println("  Local:    https://localhost")
-	log.Println("  External: https://<your-domain>")
+	log.Printf("  Local:    https://localhost:%d\n", *port)
+	log.Printf("  External: https://<your-domain>:%d\n", *port)
 	log.Println("")
-	log.Println("Instructions:")
-	log.Println("1. Open different browsers (Chrome, Firefox, Safari, Edge)")
-	log.Println("2. Navigate to the URL above")
-	log.Println("3. Accept the self-signed certificate warning")
-	log.Println("4. Check this console for captured profiles")
+	log.Println("Features:")
+	log.Printf("  Auto-save:     %v (--save)\n", autoSave)
+	log.Printf("  Deduplicate:   %v (--dedup)\n", deduplicateUA)
+	log.Printf("  Profiles dir:  %s (--dir)\n", profilesDir)
 	log.Println("")
-	log.Println("For Selenium automation, use:")
-	log.Println("  Chrome: --ignore-certificate-errors")
-	log.Println("  Firefox: acceptInsecureCerts capability")
+	log.Println("Supported browsers:")
+	log.Println("  Chrome, Firefox, Safari, Edge, Opera, Brave, Vivaldi")
+	log.Println("  Samsung Internet, UC Browser, Yandex, QQ Browser, etc.")
+	log.Println("")
+	log.Println("Supported platforms:")
+	log.Println("  Windows 10/11, macOS, Linux, Android, iOS, iPadOS, ChromeOS")
 	log.Println("===========================================")
 
 	// Create raw TCP listener to capture ClientHello
-	ln, err := net.Listen("tcp", ":443")
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
@@ -230,46 +326,54 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		return nil, fmt.Errorf("too short")
 	}
 
-	// Skip TLS record header (5 bytes) and handshake header (4 bytes)
-	data := raw[5+4:]
+	profile := &CapturedProfile{
+		GREASE: GREASEInfo{
+			CipherSuitePos:      -1,
+			SupportedGroupPos:   -1,
+			SupportedVersionPos: -1,
+			KeySharePos:         -1,
+		},
+	}
 
-	profile := &CapturedProfile{}
+	// Skip TLS record header (5 bytes) + handshake header (4 bytes)
+	data := raw[9:]
 
 	if len(data) < 2+32+1 {
 		return nil, fmt.Errorf("too short for version+random+session")
 	}
 
 	// Client version (2 bytes)
-	profile.TLSVersion = uint16(data[0])<<8 | uint16(data[1])
+	profile.ClientVersion = uint16(data[0])<<8 | uint16(data[1])
 	data = data[2:]
 
-	// Random (32 bytes)
+	// Skip random (32 bytes) - no fingerprint value
 	data = data[32:]
 
-	// Session ID
-	sessionLen := int(data[0])
-	if len(data) < 1+sessionLen {
-		return nil, fmt.Errorf("session ID length overflow: need %d, have %d", 1+sessionLen, len(data))
+	// Session ID - only length matters
+	profile.SessionIDLength = int(data[0])
+	if len(data) < 1+profile.SessionIDLength {
+		return nil, fmt.Errorf("session ID length overflow")
 	}
-	data = data[1+sessionLen:]
+	data = data[1+profile.SessionIDLength:]
 
 	// Cipher suites
 	if len(data) < 2 {
-		return nil, fmt.Errorf("too short for cipher suites length")
+		return nil, fmt.Errorf("too short for cipher suites")
 	}
 	cipherLen := int(data[0])<<8 | int(data[1])
 	data = data[2:]
 
-	if len(data) < cipherLen {
-		return nil, fmt.Errorf("too short for cipher suites")
-	}
-	if cipherLen%2 != 0 {
-		return nil, fmt.Errorf("odd cipher suites length: %d", cipherLen)
+	if len(data) < cipherLen || cipherLen%2 != 0 {
+		return nil, fmt.Errorf("invalid cipher suites")
 	}
 
 	for i := 0; i < cipherLen; i += 2 {
 		cs := uint16(data[i])<<8 | uint16(data[i+1])
 		profile.CipherSuites = append(profile.CipherSuites, cs)
+		if isGREASE(cs) && profile.GREASE.CipherSuite == 0 {
+			profile.GREASE.CipherSuite = cs
+			profile.GREASE.CipherSuitePos = len(profile.CipherSuites) - 1
+		}
 	}
 	data = data[cipherLen:]
 
@@ -279,13 +383,15 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 	}
 	compLen := int(data[0])
 	if len(data) < 1+compLen {
-		return nil, fmt.Errorf("compression methods length overflow: need %d, have %d", 1+compLen, len(data))
+		return nil, fmt.Errorf("compression overflow")
+	}
+	for i := 1; i <= compLen; i++ {
+		profile.CompressionMethods = append(profile.CompressionMethods, data[i])
 	}
 	data = data[1+compLen:]
 
 	// Extensions
 	if len(data) < 2 {
-		// No extensions
 		return profile, nil
 	}
 	extLen := int(data[0])<<8 | int(data[1])
@@ -296,6 +402,7 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 	}
 
 	extData := data[:extLen]
+	extIndex := 0
 	for len(extData) >= 4 {
 		extType := uint16(extData[0])<<8 | uint16(extData[1])
 		extDataLen := int(extData[2])<<8 | int(extData[3])
@@ -305,88 +412,118 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 			break
 		}
 
+		extPayload := extData[:extDataLen]
 		profile.Extensions = append(profile.Extensions, extType)
 
+		// Track GREASE
+		if isGREASE(extType) {
+			profile.GREASE.Extensions = append(profile.GREASE.Extensions, extType)
+			profile.GREASE.ExtensionPos = append(profile.GREASE.ExtensionPos, extIndex)
+		}
+
 		// Parse specific extensions
-		extPayload := extData[:extDataLen]
 		switch extType {
-		case 0x0000: // server_name (SNI)
-			// Format: list_length(2) + name_type(1) + name_length(2) + name
-			if len(extPayload) >= 5 {
-				// listLen := int(extPayload[0])<<8 | int(extPayload[1])
-				nameType := extPayload[2]
-				if nameType != 0 { // 0 = host_name, only valid type
-					break
-				}
+		case 0x0000: // SNI
+			if len(extPayload) >= 5 && extPayload[2] == 0 {
 				nameLen := int(extPayload[3])<<8 | int(extPayload[4])
 				if len(extPayload) >= 5+nameLen {
 					profile.ServerName = string(extPayload[5 : 5+nameLen])
 				}
 			}
+
+		case 0x0005: // status_request
+			profile.StatusRequest = true
+
 		case 0x000a: // supported_groups
 			if len(extPayload) >= 2 {
 				groupLen := int(extPayload[0])<<8 | int(extPayload[1])
+				groupIdx := 0
 				for i := 2; i < 2+groupLen && i+1 < len(extPayload); i += 2 {
 					g := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
 					profile.SupportedGroups = append(profile.SupportedGroups, g)
+					if isGREASE(g) && profile.GREASE.SupportedGroup == 0 {
+						profile.GREASE.SupportedGroup = g
+						profile.GREASE.SupportedGroupPos = groupIdx
+					}
+					groupIdx++
 				}
 			}
-		case 0x000b: // ec_point_formats (for JA3)
+
+		case 0x000b: // ec_point_formats
 			if len(extPayload) >= 1 {
 				formatLen := int(extPayload[0])
 				for i := 1; i < 1+formatLen && i < len(extPayload); i++ {
 					profile.ECPointFormats = append(profile.ECPointFormats, extPayload[i])
 				}
 			}
+
 		case 0x000d: // signature_algorithms
 			if len(extPayload) >= 2 {
 				sigLen := int(extPayload[0])<<8 | int(extPayload[1])
 				for i := 2; i < 2+sigLen && i+1 < len(extPayload); i += 2 {
-					s := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
-					profile.SignatureAlgos = append(profile.SignatureAlgos, s)
+					profile.SignatureAlgos = append(profile.SignatureAlgos, uint16(extPayload[i])<<8|uint16(extPayload[i+1]))
 				}
 			}
+
 		case 0x0010: // ALPN
 			if len(extPayload) >= 2 {
 				alpnLen := int(extPayload[0])<<8 | int(extPayload[1])
-				if len(extPayload) < 2+alpnLen {
-					break // Not enough data
-				}
-				alpnData := extPayload[2 : 2+alpnLen]
-				for len(alpnData) > 0 {
-					protoLen := int(alpnData[0])
-					if len(alpnData) < 1+protoLen {
-						break
+				if len(extPayload) >= 2+alpnLen {
+					alpnData := extPayload[2 : 2+alpnLen]
+					for len(alpnData) > 0 {
+						protoLen := int(alpnData[0])
+						if len(alpnData) < 1+protoLen {
+							break
+						}
+						profile.ALPNProtocols = append(profile.ALPNProtocols, string(alpnData[1:1+protoLen]))
+						alpnData = alpnData[1+protoLen:]
 					}
-					profile.ALPNProtocols = append(profile.ALPNProtocols, string(alpnData[1:1+protoLen]))
-					alpnData = alpnData[1+protoLen:]
 				}
 			}
+
+		case 0x0012: // SCT
+			profile.SCTEnabled = true
+
+		case 0x0015: // padding
+			profile.PaddingLength = extDataLen
+
+		case 0x0017: // extended_master_secret
+			profile.ExtendedMasterSecret = true
+
+		case 0x001b: // compress_certificate
+			if len(extPayload) >= 1 {
+				algLen := int(extPayload[0])
+				for i := 1; i < 1+algLen && i+1 < len(extPayload); i += 2 {
+					profile.CertCompressAlgs = append(profile.CertCompressAlgs, uint16(extPayload[i])<<8|uint16(extPayload[i+1]))
+				}
+			}
+
+		case 0x001c: // record_size_limit
+			if len(extPayload) >= 2 {
+				profile.RecordSizeLimit = uint16(extPayload[0])<<8 | uint16(extPayload[1])
+			}
+
+		case 0x0022: // delegated_credentials
+			profile.DelegatedCredentials = true
+
+		case 0x0023: // session_ticket
+			profile.SessionTicketLength = extDataLen
+
 		case 0x002b: // supported_versions
 			if len(extPayload) >= 1 {
 				versLen := int(extPayload[0])
+				versIdx := 0
 				for i := 1; i < 1+versLen && i+1 < len(extPayload); i += 2 {
 					v := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
 					profile.SupportedVers = append(profile.SupportedVers, v)
-				}
-			}
-		case 0x0033: // key_share
-			if len(extPayload) >= 2 {
-				ksLen := int(extPayload[0])<<8 | int(extPayload[1])
-				if len(extPayload) < 2+ksLen {
-					break // Not enough data
-				}
-				ksData := extPayload[2 : 2+ksLen]
-				for len(ksData) >= 4 {
-					group := uint16(ksData[0])<<8 | uint16(ksData[1])
-					keyLen := int(ksData[2])<<8 | int(ksData[3])
-					profile.KeyShareGroups = append(profile.KeyShareGroups, group)
-					if len(ksData) < 4+keyLen {
-						break
+					if isGREASE(v) && profile.GREASE.SupportedVersion == 0 {
+						profile.GREASE.SupportedVersion = v
+						profile.GREASE.SupportedVersionPos = versIdx
 					}
-					ksData = ksData[4+keyLen:]
+					versIdx++
 				}
 			}
+
 		case 0x002d: // psk_key_exchange_modes
 			if len(extPayload) >= 1 {
 				modeLen := int(extPayload[0])
@@ -394,78 +531,92 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 					profile.PSKModes = append(profile.PSKModes, extPayload[i])
 				}
 			}
-		case 0x001b: // compress_certificate
-			if len(extPayload) >= 1 {
-				algLen := int(extPayload[0])
-				for i := 1; i < 1+algLen && i+1 < len(extPayload); i += 2 {
-					a := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
-					profile.CertCompressAlgs = append(profile.CertCompressAlgs, a)
+
+		case 0x0031: // post_handshake_auth
+			profile.PostHandshakeAuth = true
+
+		case 0x0033: // key_share
+			if len(extPayload) >= 2 {
+				ksLen := int(extPayload[0])<<8 | int(extPayload[1])
+				if len(extPayload) >= 2+ksLen {
+					ksData := extPayload[2 : 2+ksLen]
+					ksIdx := 0
+					for len(ksData) >= 4 {
+						group := uint16(ksData[0])<<8 | uint16(ksData[1])
+						keyLen := int(ksData[2])<<8 | int(ksData[3])
+						profile.KeyShares = append(profile.KeyShares, KeyShareEntry{Group: group, KeyLength: keyLen})
+						if isGREASE(group) && profile.GREASE.KeyShare == 0 {
+							profile.GREASE.KeyShare = group
+							profile.GREASE.KeySharePos = ksIdx
+						}
+						if len(ksData) < 4+keyLen {
+							break
+						}
+						ksData = ksData[4+keyLen:]
+						ksIdx++
+					}
 				}
 			}
+
+		case 0x44cd: // ALPS
+			profile.ApplicationSettings = true
+
+		case 0xfe0d, 0xfe09, 0xfe0a, 0xfe08: // ECH variants
+			profile.ECHEnabled = true
 		}
 
 		extData = extData[extDataLen:]
+		extIndex++
 	}
 
-	// Calculate JA3
-	profile.JA3 = calculateJA3(profile)
-
-	// Calculate JA4
-	profile.JA4, profile.JA4r = calculateJA4(profile)
+	// Calculate fingerprints
+	profile.JA3, profile.JA3r = calculateJA3Full(profile)
+	profile.JA4, profile.JA4r, profile.JA4o, profile.JA4ro = calculateJA4Full(profile)
 
 	return profile, nil
 }
 
-func calculateJA3(p *CapturedProfile) string {
+// calculateJA3Full returns both JA3 hash and raw string
+func calculateJA3Full(p *CapturedProfile) (hash, raw string) {
 	// JA3 = SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats
-	// Fields separated by comma, values within field separated by dash
-	// Uses MD5 hash
-
 	// Filter out GREASE values
 	ciphers := filterGREASE(p.CipherSuites)
 	extensions := filterGREASE(p.Extensions)
 	groups := filterGREASE(p.SupportedGroups)
 
-	// EC Point Formats (extension 0x000b) - no GREASE in these
-	pointFormats := p.ECPointFormats
-
 	ja3String := fmt.Sprintf("%d,%s,%s,%s,%s",
-		p.TLSVersion,
+		p.ClientVersion,
 		joinUint16(ciphers, "-"),
 		joinUint16(extensions, "-"),
 		joinUint16(groups, "-"),
-		joinUint8(pointFormats, "-"),
+		joinUint8(p.ECPointFormats, "-"),
 	)
 
-	// JA3 uses MD5 hash
-	hash := md5.Sum([]byte(ja3String))
-	return hex.EncodeToString(hash[:])
+	h := md5.Sum([]byte(ja3String))
+	return hex.EncodeToString(h[:]), ja3String
 }
 
-func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
+// calculateJA4Full returns all JA4 variants: sorted (ja4, ja4r) and original order (ja4o, ja4ro)
+func calculateJA4Full(p *CapturedProfile) (ja4, ja4r, ja4o, ja4ro string) {
 	// JA4 = {a}_{b}_{c}
 	// a = protocol + version + SNI + cipher_count + ext_count + ALPN
 	// b = hash of sorted ciphers
-	// c = hash of sorted extensions (without SNI/ALPN)
+	// c = hash of sorted extensions (without SNI/ALPN) + signature algorithms
 
-	// Filter GREASE
 	ciphers := filterGREASE(p.CipherSuites)
 	extensions := filterGREASE(p.Extensions)
 
 	// Protocol (t=TCP, q=QUIC)
 	proto := "t"
 
-	// TLS Version - skip GREASE values to find real version
+	// TLS Version - use first non-GREASE from supported_versions
 	var tlsVer string
 	var realVersion uint16
-	for _, v := range p.SupportedVers {
-		if !isGREASE(v) {
-			realVersion = v
-			break
-		}
-	}
-	if realVersion == 0 {
-		realVersion = p.TLSVersion
+	supportedVersClean := filterGREASE(p.SupportedVers)
+	if len(supportedVersClean) > 0 {
+		realVersion = supportedVersClean[0]
+	} else {
+		realVersion = p.ClientVersion
 	}
 	switch realVersion {
 	case 0x0304:
@@ -477,7 +628,12 @@ func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
 	case 0x0301:
 		tlsVer = "10"
 	default:
-		tlsVer = "00"
+		// Handle draft TLS 1.3 versions (0x7f01 - 0x7f1c)
+		if realVersion >= 0x7f01 && realVersion <= 0x7f1c {
+			tlsVer = "13"
+		} else {
+			tlsVer = "00"
+		}
 	}
 
 	// SNI indicator
@@ -486,13 +642,13 @@ func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
 		sni = "d" // domain
 	}
 
-	// Cipher count (2 digits)
+	// Cipher count (2 digits, excluding GREASE)
 	cipherCount := len(ciphers)
 	if cipherCount > 99 {
 		cipherCount = 99
 	}
 
-	// Extension count (2 digits)
+	// Extension count (2 digits, excluding GREASE)
 	extCount := len(extensions)
 	if extCount > 99 {
 		extCount = 99
@@ -507,37 +663,80 @@ func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
 		}
 	}
 
-	// JA4_a
+	// JA4_a (same for all variants)
 	ja4a := fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVer, sni, cipherCount, extCount, alpn)
 
-	// JA4_b: sorted ciphers hash
-	sortedCiphers := make([]uint16, len(ciphers))
-	copy(sortedCiphers, ciphers)
-	sort.Slice(sortedCiphers, func(i, j int) bool { return sortedCiphers[i] < sortedCiphers[j] })
-	cipherStr := joinUint16Hex(sortedCiphers, ",")
-	cipherHash := sha256.Sum256([]byte(cipherStr))
-	ja4b := hex.EncodeToString(cipherHash[:])[:12]
-
-	// JA4_c: sorted extensions hash (without SNI 0x0000 and ALPN 0x0010)
+	// Filter extensions (remove SNI 0x0000 and ALPN 0x0010 for JA4_c)
 	filteredExts := make([]uint16, 0, len(extensions))
 	for _, e := range extensions {
 		if e != 0x0000 && e != 0x0010 {
 			filteredExts = append(filteredExts, e)
 		}
 	}
-	sort.Slice(filteredExts, func(i, j int) bool { return filteredExts[i] < filteredExts[j] })
-	extStr := joinUint16Hex(filteredExts, ",")
+
+	// Signature algorithms string (original order, for JA4_c)
+	sigAlgsStr := joinUint16Hex(p.SignatureAlgos, ",")
+
+	// === SORTED VARIANTS (JA4, JA4r) ===
+
+	// JA4_b: sorted ciphers hash
+	sortedCiphers := make([]uint16, len(ciphers))
+	copy(sortedCiphers, ciphers)
+	sort.Slice(sortedCiphers, func(i, j int) bool { return sortedCiphers[i] < sortedCiphers[j] })
+	sortedCipherStr := joinUint16Hex(sortedCiphers, ",")
+	cipherHash := sha256.Sum256([]byte(sortedCipherStr))
+	ja4b := hex.EncodeToString(cipherHash[:])[:12]
+
+	// JA4_c: sorted extensions hash + signature algorithms
+	sortedExts := make([]uint16, len(filteredExts))
+	copy(sortedExts, filteredExts)
+	sort.Slice(sortedExts, func(i, j int) bool { return sortedExts[i] < sortedExts[j] })
+	sortedExtStr := joinUint16Hex(sortedExts, ",")
+
+	ja4cInput := sortedExtStr
+	if sigAlgsStr != "" {
+		ja4cInput += "_" + sigAlgsStr
+	}
 	var ja4c string
-	if extStr == "" {
+	if ja4cInput == "" || ja4cInput == "_" {
 		ja4c = "000000000000"
 	} else {
-		extHash := sha256.Sum256([]byte(extStr))
+		extHash := sha256.Sum256([]byte(ja4cInput))
 		ja4c = hex.EncodeToString(extHash[:])[:12]
 	}
 
 	ja4 = fmt.Sprintf("%s_%s_%s", ja4a, ja4b, ja4c)
-	ja4r = fmt.Sprintf("%s_%s_%s", ja4a, cipherStr, extStr)
+	ja4r = fmt.Sprintf("%s_%s_%s", ja4a, sortedCipherStr, ja4cInput)
 
+	// === ORIGINAL ORDER VARIANTS (JA4o, JA4ro) ===
+
+	// JA4_b for original order: hash of ciphers in original order
+	origCipherStr := joinUint16Hex(ciphers, ",")
+	origCipherHash := sha256.Sum256([]byte(origCipherStr))
+	ja4bo := hex.EncodeToString(origCipherHash[:])[:12]
+
+	// JA4_c for original order: hash of extensions in original order
+	origExtStr := joinUint16Hex(filteredExts, ",")
+	ja4coInput := origExtStr
+	if sigAlgsStr != "" {
+		ja4coInput += "_" + sigAlgsStr
+	}
+	var ja4co string
+	if ja4coInput == "" || ja4coInput == "_" {
+		ja4co = "000000000000"
+	} else {
+		origExtHash := sha256.Sum256([]byte(ja4coInput))
+		ja4co = hex.EncodeToString(origExtHash[:])[:12]
+	}
+
+	ja4o = fmt.Sprintf("%s_%s_%s", ja4a, ja4bo, ja4co)
+	ja4ro = fmt.Sprintf("%s_%s_%s", ja4a, origCipherStr, ja4coInput)
+
+	return
+}
+
+func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
+	ja4, ja4r, _, _ = calculateJA4Full(p)
 	return
 }
 
@@ -631,33 +830,68 @@ func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
 }
 
 func outputProfile(profile *CapturedProfile) {
-	browser, version, platform := parseUserAgent(profile.UserAgent)
+	// Skip profiles without User-Agent when saving (pre-cert-accept handshakes)
+	if profile.UserAgent == "" && autoSave {
+		log.Printf("SKIPPED: No User-Agent (pre-accept handshake from %s)", profile.RemoteAddr)
+		return
+	}
 
-	// Recalculate JA4 with proper version detection
-	profile.JA4, profile.JA4r = calculateJA4(profile)
+	// Parse User-Agent for browser info
+	info := parseUserAgentFull(profile.UserAgent)
+	browser := info.Browser
+	version := fmt.Sprintf("%d", info.Version)
+	platform := info.Platform
+
+	// Check for duplicates
+	if deduplicateUA {
+		seenJA4Mu.Lock()
+		key := fmt.Sprintf("%s_%s_%s_%s", profile.JA4, browser, version, platform)
+		if seenJA4[key] {
+			seenJA4Mu.Unlock()
+			log.Printf("SKIPPED duplicate: %s %s on %s (JA4: %s...)", browser, version, platform, profile.JA4[:20])
+			return
+		}
+		seenJA4[key] = true
+		seenJA4Mu.Unlock()
+	}
 
 	fmt.Println("\n" + strings.Repeat("=", 80))
 	fmt.Printf("CAPTURED: %s %s on %s\n", browser, version, platform)
 	fmt.Printf("JA3: %s\n", profile.JA3)
 	fmt.Printf("JA4: %s\n", profile.JA4)
+	if info.Mobile {
+		fmt.Println("Mobile: Yes")
+	}
+	if profile.ECHEnabled {
+		fmt.Println("ECH: Yes")
+	}
 	fmt.Println(strings.Repeat("=", 80))
 
-	// JSON output (raw, includes GREASE)
-	fmt.Println("\n--- JSON (raw with GREASE) ---")
+	// JSON output
+	fmt.Println("\n--- JSON ---")
 	j, _ := json.MarshalIndent(profile, "", "  ")
 	fmt.Println(string(j))
 
-	// Filter GREASE for Go code output
-	filtered := filterGREASEFromProfile(profile)
+	// Filter GREASE for Go code
+	ciphersClean := filterGREASE(profile.CipherSuites)
+	extsClean := filterGREASE(profile.Extensions)
+	groupsClean := filterGREASE(profile.SupportedGroups)
+	versClean := filterGREASE(profile.SupportedVers)
+	keyShareGroupsClean := make([]uint16, 0)
+	for _, ks := range profile.KeyShares {
+		if !isGREASE(ks.Group) {
+			keyShareGroupsClean = append(keyShareGroupsClean, ks.Group)
+		}
+	}
 
 	// Go code output
 	id := fmt.Sprintf("%s_%s_%s", strings.ToLower(browser), version, strings.ToLower(platform))
 
-	fmt.Println("\n--- Go Code (for u_fingerprint_registry.go) ---")
-	fmt.Printf(`
+	goCode := fmt.Sprintf(`
 // %s captured from real %s %s on %s
 // JA3: %s
 // JA4: %s
+// JA4o: %s (original order)
 var %s = &FingerprintProfile{
     ID:          "%s",
     Browser:     "%s",
@@ -666,12 +900,11 @@ var %s = &FingerprintProfile{
     Description: "Captured from real %s %s",
 
     ClientHello: ClientHelloConfig{
-        TLSVersionMin: 0x%04x,
-        TLSVersionMax: 0x%04x,
+        LegacyVersion: 0x%04x,
 
         CipherSuites: %s,
 
-        Extensions: %s,
+        ExtensionOrder: %s,
 
         SupportedGroups: %s,
 
@@ -685,126 +918,529 @@ var %s = &FingerprintProfile{
 
         PSKModes: %s,
 
-        CertCompressionAlgs: %s,
+        CertCompressionAlgos: %s,
+
+        CompressionMethods: []uint8{0x00},
+
+        SessionIDLength: %d,
+    },
+
+    GREASE: GREASEConfig{
+        Enabled:            %v,
+        CipherSuites:       %v,
+        Extensions:         %v,
+        SupportedGroups:    %v,
+        SupportedVersions:  %v,
+        KeyShare:           %v,
+        ExtensionPositions: %s,
     },
 
     Expected: ExpectedFingerprints{
-        JA3: "%s",
-        JA4: "%s",
+        JA3:  "%s",
+        JA4:  "%s",
+        JA4o: "%s",
     },
 }
 `,
 		id, browser, version, platform,
 		profile.JA3,
 		profile.JA4,
+		profile.JA4o,
 		id,
 		id,
 		strings.ToLower(browser),
 		version,
 		strings.ToLower(platform),
 		browser, version,
-		filtered.TLSVersion,
-		getMaxVersion(filtered),
-		formatUint16Slice("        ", filtered.CipherSuites),
-		formatUint16Slice("        ", filtered.Extensions),
-		formatUint16Slice("        ", filtered.SupportedGroups),
-		formatUint16Slice("        ", filtered.SignatureAlgos),
-		formatStringSlice(filtered.ALPNProtocols),
-		formatUint16Slice("        ", filtered.SupportedVers),
-		formatUint16Slice("        ", filtered.KeyShareGroups),
-		formatUint8Slice(filtered.PSKModes),
-		formatUint16Slice("        ", filtered.CertCompressAlgs),
+		profile.ClientVersion,
+		formatUint16Slice("        ", ciphersClean),
+		formatUint16Slice("        ", extsClean),
+		formatUint16SliceCurveID("        ", groupsClean),
+		formatUint16SliceSigScheme("        ", profile.SignatureAlgos),
+		formatStringSlice(profile.ALPNProtocols),
+		formatUint16Slice("        ", versClean),
+		formatUint16SliceCurveID("        ", keyShareGroupsClean),
+		formatUint8Slice(profile.PSKModes),
+		formatUint16SliceCertComp("        ", profile.CertCompressAlgs),
+		profile.SessionIDLength,
+		profile.GREASE.CipherSuite != 0,
+		profile.GREASE.CipherSuite != 0,
+		len(profile.GREASE.Extensions) > 0,
+		profile.GREASE.SupportedGroup != 0,
+		profile.GREASE.SupportedVersion != 0,
+		profile.GREASE.KeyShare != 0,
+		formatIntSlice(profile.GREASE.ExtensionPos),
 		profile.JA3,
 		profile.JA4,
+		profile.JA4o,
 	)
 
+	fmt.Println("\n--- Go Code (for u_fingerprint_registry.go) ---")
+	fmt.Print(goCode)
 	fmt.Println(strings.Repeat("=", 80))
+
+	// Auto-save if enabled
+	if autoSave {
+		saveProfile(profile, info, goCode)
+	}
 }
 
-func getMaxVersion(p *CapturedProfile) uint16 {
-	// Skip GREASE values to find real max version
-	for _, v := range p.SupportedVers {
-		if !isGREASE(v) {
-			return v
+// saveProfile saves the captured profile to files
+func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
+	// Create filename from browser info
+	filename := fmt.Sprintf("%s_%d_%s",
+		strings.ToLower(info.Browser),
+		info.Version,
+		strings.ToLower(info.Platform))
+	filename = strings.ReplaceAll(filename, " ", "_")
+	filename = strings.ReplaceAll(filename, ".", "_")
+
+	// Save JSON
+	jsonPath := filepath.Join(profilesDir, filename+".json")
+	jsonData, _ := json.MarshalIndent(profile, "", "  ")
+	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
+		log.Printf("Failed to save JSON: %v", err)
+	} else {
+		log.Printf("Saved JSON: %s", jsonPath)
+	}
+
+	// Save Go code
+	goPath := filepath.Join(profilesDir, filename+".go")
+	if err := os.WriteFile(goPath, []byte(goCode), 0644); err != nil {
+		log.Printf("Failed to save Go code: %v", err)
+	} else {
+		log.Printf("Saved Go code: %s", goPath)
+	}
+}
+
+// formatUint16SliceCurveID formats as CurveID type
+func formatUint16SliceCurveID(indent string, values []uint16) string {
+	if len(values) == 0 {
+		return "[]CurveID{}"
+	}
+	var sb strings.Builder
+	sb.WriteString("[]CurveID{\n")
+	for i, v := range values {
+		if i%8 == 0 {
+			sb.WriteString(indent)
+		}
+		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		if (i+1)%8 == 0 {
+			sb.WriteString("\n")
 		}
 	}
-	return p.TLSVersion
-}
-
-func filterGREASEFromProfile(p *CapturedProfile) *CapturedProfile {
-	// Create a copy with GREASE filtered out for the profile definition
-	filtered := &CapturedProfile{
-		Timestamp:        p.Timestamp,
-		UserAgent:        p.UserAgent,
-		RemoteAddr:       p.RemoteAddr,
-		TLSVersion:       p.TLSVersion,
-		ServerName:       p.ServerName,
-		ALPNProtocols:    p.ALPNProtocols,
-		JA3:              p.JA3,
-		JA4:              p.JA4,
-		JA4r:             p.JA4r,
-		RawClientHello:   p.RawClientHello,
-		CipherSuites:     filterGREASE(p.CipherSuites),
-		Extensions:       filterGREASE(p.Extensions),
-		SupportedGroups:  filterGREASE(p.SupportedGroups),
-		ECPointFormats:   p.ECPointFormats, // No GREASE in EC point formats
-		SignatureAlgos:   p.SignatureAlgos, // No GREASE in sig algos
-		SupportedVers:    filterGREASE(p.SupportedVers),
-		KeyShareGroups:   filterGREASE(p.KeyShareGroups),
-		PSKModes:         p.PSKModes,
-		CertCompressAlgs: p.CertCompressAlgs,
+	if len(values)%8 != 0 {
+		sb.WriteString("\n")
 	}
-	return filtered
+	sb.WriteString(indent[:len(indent)-4] + "}")
+	return sb.String()
 }
 
+// formatUint16SliceSigScheme formats as SignatureScheme type
+func formatUint16SliceSigScheme(indent string, values []uint16) string {
+	if len(values) == 0 {
+		return "[]SignatureScheme{}"
+	}
+	var sb strings.Builder
+	sb.WriteString("[]SignatureScheme{\n")
+	for i, v := range values {
+		if i%8 == 0 {
+			sb.WriteString(indent)
+		}
+		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		if (i+1)%8 == 0 {
+			sb.WriteString("\n")
+		}
+	}
+	if len(values)%8 != 0 {
+		sb.WriteString("\n")
+	}
+	sb.WriteString(indent[:len(indent)-4] + "}")
+	return sb.String()
+}
+
+// formatUint16SliceCertComp formats as CertCompressionAlgo type
+func formatUint16SliceCertComp(indent string, values []uint16) string {
+	if len(values) == 0 {
+		return "[]CertCompressionAlgo{}"
+	}
+	var sb strings.Builder
+	sb.WriteString("[]CertCompressionAlgo{\n")
+	for i, v := range values {
+		if i%8 == 0 {
+			sb.WriteString(indent)
+		}
+		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		if (i+1)%8 == 0 {
+			sb.WriteString("\n")
+		}
+	}
+	if len(values)%8 != 0 {
+		sb.WriteString("\n")
+	}
+	sb.WriteString(indent[:len(indent)-4] + "}")
+	return sb.String()
+}
+
+// formatIntSlice formats an int slice
+func formatIntSlice(values []int) string {
+	if len(values) == 0 {
+		return "[]int{}"
+	}
+	strs := make([]string, len(values))
+	for i, v := range values {
+		strs[i] = fmt.Sprintf("%d", v)
+	}
+	return "[]int{" + strings.Join(strs, ", ") + "}"
+}
+
+// parseUserAgent extracts comprehensive browser information from User-Agent string
 func parseUserAgent(ua string) (browser, version, platform string) {
+	info := parseUserAgentFull(ua)
+	return info.Browser, fmt.Sprintf("%d", info.Version), info.Platform
+}
+
+// parseUserAgentFull performs comprehensive User-Agent parsing
+func parseUserAgentFull(ua string) BrowserInfo {
+	info := BrowserInfo{
+		Browser:  "Unknown",
+		Platform: "Unknown",
+		OS:       "Unknown",
+	}
+
+	if ua == "" {
+		return info
+	}
+
 	uaLower := strings.ToLower(ua)
 
-	// Detect browser
-	switch {
-	case strings.Contains(uaLower, "firefox/"):
-		browser = "Firefox"
-		version = extractVersionAfter(ua, "Firefox/")
-	case strings.Contains(uaLower, "edg/"):
-		browser = "Edge"
-		version = extractVersionAfter(ua, "Edg/")
-	case strings.Contains(uaLower, "opr/"):
-		browser = "Opera"
-		version = extractVersionAfter(ua, "OPR/")
-	case strings.Contains(uaLower, "chrome/"):
-		browser = "Chrome"
-		version = extractVersionAfter(ua, "Chrome/")
-	case strings.Contains(uaLower, "safari/") && !strings.Contains(uaLower, "chrome"):
-		browser = "Safari"
-		version = extractVersionAfter(ua, "Version/")
-	default:
-		browser = "Unknown"
-		version = "0"
+	// Detect if mobile
+	info.Mobile = strings.Contains(uaLower, "mobile") ||
+		strings.Contains(uaLower, "android") ||
+		strings.Contains(uaLower, "iphone") ||
+		strings.Contains(uaLower, "ipad")
+
+	// Detect if bot/crawler
+	info.Bot = strings.Contains(uaLower, "bot") ||
+		strings.Contains(uaLower, "crawler") ||
+		strings.Contains(uaLower, "spider") ||
+		strings.Contains(uaLower, "curl") ||
+		strings.Contains(uaLower, "wget")
+
+	// Detect platform/OS first
+	info.Platform, info.OS, info.OSVersion, info.Architecture = detectPlatform(ua, uaLower)
+
+	// Detect browser (order matters - check specific browsers before generic ones)
+	info.Browser, info.Version, info.VersionFull = detectBrowser(ua, uaLower)
+
+	return info
+}
+
+// detectPlatform extracts platform, OS, version and architecture
+func detectPlatform(ua, uaLower string) (platform, os, osVersion, arch string) {
+	platform = "Unknown"
+	os = "Unknown"
+	arch = ""
+
+	// Architecture detection
+	if strings.Contains(uaLower, "x86_64") || strings.Contains(uaLower, "x64") ||
+		strings.Contains(uaLower, "win64") || strings.Contains(uaLower, "amd64") {
+		arch = "x64"
+	} else if strings.Contains(uaLower, "arm64") || strings.Contains(uaLower, "aarch64") {
+		arch = "arm64"
+	} else if strings.Contains(uaLower, "i686") || strings.Contains(uaLower, "i386") ||
+		strings.Contains(uaLower, "x86") {
+		arch = "x86"
 	}
 
-	// Detect platform
-	switch {
-	case strings.Contains(uaLower, "windows nt 10"):
-		platform = "Windows_10"
-	case strings.Contains(uaLower, "windows nt 11") || strings.Contains(ua, "Windows NT 10.0; Win64"):
-		platform = "Windows_11"
-	case strings.Contains(uaLower, "windows"):
-		platform = "Windows"
-	case strings.Contains(uaLower, "mac os x"):
-		platform = "macOS"
-	case strings.Contains(uaLower, "linux"):
-		platform = "Linux"
-	case strings.Contains(uaLower, "android"):
-		platform = "Android"
-	case strings.Contains(uaLower, "iphone"):
+	// iOS/iPadOS detection (check before Mac since iPad may spoof Mac)
+	if strings.Contains(uaLower, "iphone") {
 		platform = "iOS"
-	case strings.Contains(uaLower, "ipad"):
-		platform = "iPadOS"
-	default:
-		platform = "Unknown"
+		os = "iOS"
+		if v := extractVersionPattern(ua, `iPhone OS (\d+)[_.](\d+)`); v != "" {
+			osVersion = strings.ReplaceAll(v, "_", ".")
+		}
+		return
+	}
+
+	if strings.Contains(uaLower, "ipad") {
+		// Check if iPad is in desktop mode (spoofing macOS)
+		if strings.Contains(uaLower, "macintosh") && strings.Contains(uaLower, "ipad") {
+			platform = "iPadOS"
+			os = "iPadOS"
+		} else {
+			platform = "iPadOS"
+			os = "iPadOS"
+		}
+		if v := extractVersionPattern(ua, `OS (\d+)[_.](\d+)`); v != "" {
+			osVersion = strings.ReplaceAll(v, "_", ".")
+		}
+		return
+	}
+
+	// Android detection
+	if strings.Contains(uaLower, "android") {
+		platform = "Android"
+		os = "Android"
+		if v := extractVersionPattern(ua, `Android (\d+)(?:\.(\d+))?`); v != "" {
+			osVersion = v
+		}
+		return
+	}
+
+	// Windows detection
+	if strings.Contains(uaLower, "windows") {
+		os = "Windows"
+		// Windows NT version mapping
+		if strings.Contains(ua, "Windows NT 10.0") {
+			// Windows 10 or 11 - hard to distinguish, but recent builds are likely 11
+			// Windows 11 build numbers start at 22000
+			if strings.Contains(ua, "Windows NT 10.0; Win64") {
+				platform = "Windows_11"
+				osVersion = "11"
+			} else {
+				platform = "Windows_10"
+				osVersion = "10"
+			}
+		} else if strings.Contains(ua, "Windows NT 6.3") {
+			platform = "Windows_8.1"
+			osVersion = "8.1"
+		} else if strings.Contains(ua, "Windows NT 6.2") {
+			platform = "Windows_8"
+			osVersion = "8"
+		} else if strings.Contains(ua, "Windows NT 6.1") {
+			platform = "Windows_7"
+			osVersion = "7"
+		} else {
+			platform = "Windows"
+		}
+		return
+	}
+
+	// macOS detection (check after iOS/iPadOS)
+	if strings.Contains(uaLower, "macintosh") || strings.Contains(uaLower, "mac os x") {
+		platform = "macOS"
+		os = "macOS"
+		if v := extractVersionPattern(ua, `Mac OS X (\d+)[_.](\d+)`); v != "" {
+			osVersion = strings.ReplaceAll(v, "_", ".")
+		}
+		return
+	}
+
+	// ChromeOS detection
+	if strings.Contains(uaLower, "cros") {
+		platform = "ChromeOS"
+		os = "ChromeOS"
+		return
+	}
+
+	// Linux detection (check after Android and ChromeOS)
+	if strings.Contains(uaLower, "linux") {
+		os = "Linux"
+		// Try to detect specific distros
+		switch {
+		case strings.Contains(uaLower, "ubuntu"):
+			platform = "Linux_Ubuntu"
+		case strings.Contains(uaLower, "fedora"):
+			platform = "Linux_Fedora"
+		case strings.Contains(uaLower, "debian"):
+			platform = "Linux_Debian"
+		case strings.Contains(uaLower, "arch"):
+			platform = "Linux_Arch"
+		default:
+			platform = "Linux"
+		}
+		return
+	}
+
+	// FreeBSD detection
+	if strings.Contains(uaLower, "freebsd") {
+		platform = "FreeBSD"
+		os = "FreeBSD"
+		return
 	}
 
 	return
+}
+
+// detectBrowser extracts browser name and version
+func detectBrowser(ua, uaLower string) (browser string, version int, versionFull string) {
+	browser = "Unknown"
+	version = 0
+	versionFull = "0"
+
+	// Check for specific browsers in order of specificity
+
+	// Brave (check before Chrome)
+	if strings.Contains(uaLower, "brave") {
+		browser = "Brave"
+		versionFull = extractVersionAfter(ua, "Brave/")
+		if versionFull == "0" {
+			// Brave often uses Chrome version
+			versionFull = extractVersionAfter(ua, "Chrome/")
+		}
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Vivaldi (check before Chrome)
+	if strings.Contains(uaLower, "vivaldi") {
+		browser = "Vivaldi"
+		versionFull = extractVersionAfter(ua, "Vivaldi/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Opera (check before Chrome - uses OPR/)
+	if strings.Contains(uaLower, "opr/") || strings.Contains(uaLower, "opera") {
+		browser = "Opera"
+		if strings.Contains(uaLower, "opr/") {
+			versionFull = extractVersionAfter(ua, "OPR/")
+		} else {
+			versionFull = extractVersionAfter(ua, "Opera/")
+		}
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Edge (check before Chrome)
+	if strings.Contains(uaLower, "edg/") || strings.Contains(uaLower, "edge/") {
+		browser = "Edge"
+		if strings.Contains(uaLower, "edg/") {
+			versionFull = extractVersionAfter(ua, "Edg/")
+		} else {
+			versionFull = extractVersionAfter(ua, "Edge/")
+		}
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Samsung Internet (check before Chrome)
+	if strings.Contains(uaLower, "samsungbrowser") {
+		browser = "Samsung_Internet"
+		versionFull = extractVersionAfter(ua, "SamsungBrowser/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// UC Browser (check before Chrome)
+	if strings.Contains(uaLower, "ucbrowser") {
+		browser = "UC_Browser"
+		versionFull = extractVersionAfter(ua, "UCBrowser/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Yandex Browser (check before Chrome)
+	if strings.Contains(uaLower, "yabrowser") {
+		browser = "Yandex"
+		versionFull = extractVersionAfter(ua, "YaBrowser/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// QQ Browser (check before Chrome)
+	if strings.Contains(uaLower, "qqbrowser") {
+		browser = "QQ_Browser"
+		versionFull = extractVersionAfter(ua, "QQBrowser/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Whale Browser (check before Chrome)
+	if strings.Contains(uaLower, "whale") {
+		browser = "Whale"
+		versionFull = extractVersionAfter(ua, "Whale/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Firefox (check for various Firefox variants)
+	if strings.Contains(uaLower, "firefox/") {
+		browser = "Firefox"
+		versionFull = extractVersionAfter(ua, "Firefox/")
+		version = extractMajorVersion(versionFull)
+		// Check for Firefox variants
+		if strings.Contains(uaLower, "focus") {
+			browser = "Firefox_Focus"
+		} else if strings.Contains(uaLower, "klar") {
+			browser = "Firefox_Klar"
+		}
+		return
+	}
+
+	// Safari (check before Chrome, but Safari doesn't have "Chrome" in UA)
+	if strings.Contains(uaLower, "safari/") && !strings.Contains(uaLower, "chrome") && !strings.Contains(uaLower, "chromium") {
+		browser = "Safari"
+		versionFull = extractVersionAfter(ua, "Version/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Chrome (check last among Chromium-based browsers)
+	if strings.Contains(uaLower, "chrome/") || strings.Contains(uaLower, "chromium/") {
+		if strings.Contains(uaLower, "chromium/") {
+			browser = "Chromium"
+			versionFull = extractVersionAfter(ua, "Chromium/")
+		} else {
+			browser = "Chrome"
+			versionFull = extractVersionAfter(ua, "Chrome/")
+		}
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// curl/wget/other command-line tools
+	if strings.Contains(uaLower, "curl") {
+		browser = "curl"
+		versionFull = extractVersionAfter(ua, "curl/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+	if strings.Contains(uaLower, "wget") {
+		browser = "wget"
+		versionFull = extractVersionAfter(ua, "Wget/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	return
+}
+
+// extractVersionPattern uses regex to extract version
+func extractVersionPattern(ua, pattern string) string {
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(ua)
+	if len(matches) >= 2 {
+		version := matches[1]
+		if len(matches) >= 3 && matches[2] != "" {
+			version += "." + matches[2]
+		}
+		return version
+	}
+	return ""
+}
+
+// extractMajorVersion extracts the major version number from a version string
+func extractMajorVersion(versionFull string) int {
+	if versionFull == "" || versionFull == "0" {
+		return 0
+	}
+	// Find first dot or end
+	var numStr strings.Builder
+	for _, c := range versionFull {
+		if c >= '0' && c <= '9' {
+			numStr.WriteRune(c)
+		} else {
+			break
+		}
+	}
+	if numStr.Len() == 0 {
+		return 0
+	}
+	var v int
+	fmt.Sscanf(numStr.String(), "%d", &v)
+	return v
 }
 
 func extractVersionAfter(s, prefix string) string {
