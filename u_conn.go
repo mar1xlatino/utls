@@ -58,6 +58,10 @@ type UConn struct {
 
 	// echCtx is the echContex returned by makeClientHello()
 	echCtx *echClientContext
+
+	// rawServerHello stores the raw ServerHello bytes for JA4S calculation.
+	// Captured during handshake when serverHello is received.
+	rawServerHello []byte
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
@@ -516,6 +520,57 @@ func (uconn *UConn) ApplyConfig() error {
 		}
 	}
 	return nil
+}
+
+// SetRecordPadding configures TLS 1.3 record padding for fingerprint control.
+// This method sets the padding configuration that will be applied in writeRecordLocked().
+// Use nil to disable padding, or DefaultRecordPaddingConfig() for Chrome-like behavior.
+//
+// Example:
+//
+//	uconn.SetRecordPadding(tls.DefaultRecordPaddingConfig())  // Chrome-like
+//	uconn.SetRecordPadding(nil)                               // Disable padding
+//	uconn.SetRecordPadding(&tls.RecordPaddingConfig{         // Custom
+//	    Enabled:      true,
+//	    Distribution: "exponential",
+//	    Lambda:       3.0,
+//	    MaxPadding:   128,
+//	})
+func (uconn *UConn) SetRecordPadding(cfg *RecordPaddingConfig) {
+	if uconn.config == nil {
+		return
+	}
+	uconn.config.RecordPadding = cfg
+}
+
+// SetRecordPaddingMode is a convenience method to enable padding with a specific mode.
+// Valid modes: "chrome" (default), "exponential", "uniform", "none".
+func (uconn *UConn) SetRecordPaddingMode(mode string) {
+	if uconn.config == nil {
+		return
+	}
+	switch mode {
+	case "none", "":
+		uconn.config.RecordPadding = nil
+	case "chrome":
+		uconn.config.RecordPadding = DefaultRecordPaddingConfig()
+	case "exponential":
+		uconn.config.RecordPadding = &RecordPaddingConfig{
+			Enabled:      true,
+			Distribution: "exponential",
+			Lambda:       3.0,
+			MaxPadding:   255,
+		}
+	case "uniform":
+		uconn.config.RecordPadding = &RecordPaddingConfig{
+			Enabled:      true,
+			Distribution: "uniform",
+			MaxPadding:   255,
+		}
+	default:
+		// Unknown mode, use Chrome as default
+		uconn.config.RecordPadding = DefaultRecordPaddingConfig()
+	}
 }
 
 func (uconn *UConn) extensionsList() []uint16 {

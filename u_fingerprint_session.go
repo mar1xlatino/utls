@@ -1,0 +1,615 @@
+// Copyright 2024 uTLS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package tls
+
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"sync"
+	"time"
+)
+
+// SessionFingerprintState holds all values that must remain consistent across
+// multiple connections to the same origin within a session.
+//
+// CRITICAL: Chrome randomizes GREASE values and shuffles extensions, but these
+// must stay CONSISTENT within a session. This struct freezes those values.
+type SessionFingerprintState struct {
+	// Identity
+	ID        string    // Unique session identifier
+	ProfileID string    // Base profile this session uses
+	Origin    string    // "example.com:443"
+	CreatedAt time.Time
+
+	// Frozen GREASE values
+	// Each GREASE position gets a random value that stays fixed for the session
+	FrozenGREASE FrozenGREASEValues
+
+	// Frozen ordering
+	// For browsers that shuffle (Chrome), the order is frozen for the session
+	FrozenExtensionOrder []uint16          // Extension types in frozen order
+	FrozenCipherOrder    []uint16          // Cipher suites in frozen order (if shuffled)
+	FrozenKeyShareGroups []CurveID         // Key share groups in frozen order
+	FrozenSigAlgOrder    []SignatureScheme // Signature algorithms in frozen order
+
+	// Derived fingerprints (computed once from frozen values)
+	ExpectedJA3  string
+	ExpectedJA4  string
+	ExpectedJA4o string
+
+	// Session state
+	frozen          bool      // Once frozen, no modifications allowed
+	connectionCount int       // Number of connections using this state
+	lastUsed        time.Time
+
+	// TLS session data (for resumption)
+	SessionTicket    []byte // TLS session ticket for resumption
+	PSKIdentity      []byte // PSK identity
+	ResumptionSecret []byte // TLS 1.3 resumption master secret
+
+	mu sync.RWMutex
+}
+
+// FrozenGREASEValues holds all GREASE values for a session.
+// These are selected randomly once and then used consistently.
+type FrozenGREASEValues struct {
+	CipherSuite      uint16 // GREASE value in cipher suite list
+	Extension1       uint16 // First GREASE extension
+	Extension2       uint16 // Second GREASE extension
+	SupportedGroup   uint16 // GREASE in supported_groups
+	SupportedVersion uint16 // GREASE in supported_versions
+	KeyShare         uint16 // GREASE key share group
+	SignatureAlgo    uint16 // GREASE in signature_algorithms
+	PSKMode          uint16 // GREASE in PSK modes (rare)
+}
+
+// greaseValues is the set of valid GREASE values per RFC 8701.
+var greaseValues = []uint16{
+	0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a,
+	0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+	0x8a8a, 0x9a9a, 0xaaaa, 0xbaba,
+	0xcaca, 0xdada, 0xeaea, 0xfafa,
+}
+
+// randomGREASE returns a random GREASE value.
+func randomGREASE() uint16 {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fallback to first GREASE value if rand fails
+		return greaseValues[0]
+	}
+	idx := binary.BigEndian.Uint16(b[:]) % uint16(len(greaseValues))
+	return greaseValues[idx]
+}
+
+// NewSessionFingerprintState creates a new session state from a profile.
+// Returns nil if profile is nil - callers must check the return value.
+func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *SessionFingerprintState {
+	if profile == nil {
+		return nil
+	}
+
+	now := time.Now()
+
+	state := &SessionFingerprintState{
+		ID:        generateSessionID(),
+		ProfileID: profile.ID,
+		Origin:    origin,
+		CreatedAt: now,
+		lastUsed:  now,
+	}
+
+	// Generate frozen GREASE values
+	if profile.ClientHello.GREASE.Enabled {
+		// Generate Extension1 and Extension2 with deduplication
+		// Real Chrome/BoringSSL never has duplicate GREASE extension values
+		// (see u_parrots.go lines 914-931 for the original deduplication logic)
+		ext1 := randomGREASE()
+		ext2 := randomGREASE()
+		// Regenerate ext2 if it collides with ext1 (6.25% probability)
+		for ext2 == ext1 {
+			ext2 = randomGREASE()
+		}
+
+		// Generate SupportedGroup GREASE
+		// CRITICAL: Chrome/BoringSSL uses ssl_grease_group for BOTH supported_groups
+		// and key_share extensions. They MUST be the same value!
+		supportedGroup := randomGREASE()
+
+		state.FrozenGREASE = FrozenGREASEValues{
+			CipherSuite:      randomGREASE(),
+			Extension1:       ext1,
+			Extension2:       ext2,
+			SupportedGroup:   supportedGroup,
+			SupportedVersion: randomGREASE(),
+			KeyShare:         supportedGroup, // MUST match SupportedGroup per Chrome behavior
+			SignatureAlgo:    randomGREASE(),
+			PSKMode:          randomGREASE(),
+		}
+	}
+
+	// Freeze extension order if shuffling is enabled
+	if profile.ClientHello.ShuffleExtensions {
+		if len(profile.ClientHello.Extensions) > 0 {
+			// Use Extensions if available (has both type and data)
+			state.FrozenExtensionOrder = shuffleExtensionOrder(profile.ClientHello.Extensions, profile.ClientHello.ShuffleSeed)
+		} else if len(profile.ClientHello.ExtensionOrder) > 0 {
+			// Fall back to ExtensionOrder for built-in profiles
+			state.FrozenExtensionOrder = shuffleExtensionOrderFromTypes(profile.ClientHello.ExtensionOrder, profile.ClientHello.ShuffleSeed)
+		}
+	}
+
+	// Copy key share groups order
+	if len(profile.ClientHello.KeyShareGroups) > 0 {
+		state.FrozenKeyShareGroups = make([]CurveID, len(profile.ClientHello.KeyShareGroups))
+		copy(state.FrozenKeyShareGroups, profile.ClientHello.KeyShareGroups)
+	}
+
+	// Copy signature algorithm order
+	if len(profile.ClientHello.SignatureAlgorithms) > 0 {
+		state.FrozenSigAlgOrder = make([]SignatureScheme, len(profile.ClientHello.SignatureAlgorithms))
+		copy(state.FrozenSigAlgOrder, profile.ClientHello.SignatureAlgorithms)
+	}
+
+	return state
+}
+
+// generateSessionID creates a unique session identifier.
+// Returns a hex-encoded string to avoid issues with null bytes and non-printable characters.
+func generateSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fallback to timestamp-based ID if rand fails
+		binary.BigEndian.PutUint64(b[:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(b[8:], uint64(time.Now().UnixNano()+1))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// shuffleExtensionOrder shuffles extension order like Chrome does.
+// Returns the extension types in shuffled order.
+func shuffleExtensionOrder(extensions []ExtensionEntry, seed int64) []uint16 {
+	types := make([]uint16, len(extensions))
+	for i, ext := range extensions {
+		types[i] = ext.Type
+	}
+
+	return shuffleExtensionOrderFromTypes(types, seed)
+}
+
+// shuffleExtensionOrderFromTypes shuffles a list of extension types.
+// This variant takes []uint16 directly for built-in profiles that use ExtensionOrder.
+func shuffleExtensionOrderFromTypes(types []uint16, seed int64) []uint16 {
+	// Make a copy to avoid mutating the input
+	result := make([]uint16, len(types))
+	copy(result, types)
+
+	// Chrome's shuffle excludes certain extensions that must be at fixed positions
+	// PSK extension must be last, GREASE extensions at specific positions
+	// This is a simplified shuffle - real Chrome behavior is more complex
+
+	// For now, use Fisher-Yates shuffle with seed
+	// In production, this should match Chrome's exact algorithm
+	if seed == 0 {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			// Fallback to time-based seed if rand fails
+			seed = time.Now().UnixNano()
+		} else {
+			seed = int64(binary.BigEndian.Uint64(b[:]))
+		}
+	}
+
+	// Create local PRNG for deterministic shuffle
+	prng := newPRNGFromSeed(seed)
+	prng.Shuffle(len(result), func(i, j int) {
+		result[i], result[j] = result[j], result[i]
+	})
+
+	return result
+}
+
+// newPRNGFromSeed creates a simple PRNG from a seed.
+// IMPORTANT: xorshift64 produces all zeros if state is 0, so we ensure non-zero.
+func newPRNGFromSeed(seed int64) *simplePRNG {
+	state := uint64(seed)
+	if state == 0 {
+		state = 1 // Ensure non-zero state for xorshift64
+	}
+	return &simplePRNG{state: state}
+}
+
+// simplePRNG is a minimal PRNG for shuffling.
+// Thread-safe: uses mutex to protect state field.
+type simplePRNG struct {
+	state uint64
+	mu    sync.Mutex
+}
+
+// Shuffle shuffles n elements using the provided swap function.
+// Thread-safe: acquires mutex before accessing state.
+func (p *simplePRNG) Shuffle(n int, swap func(i, j int)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := n - 1; i > 0; i-- {
+		j := int(p.nextUnsafe() % uint64(i+1))
+		swap(i, j)
+	}
+}
+
+// nextUnsafe advances the PRNG state and returns the next value.
+// MUST be called with mu held.
+func (p *simplePRNG) nextUnsafe() uint64 {
+	// Simple xorshift64
+	p.state ^= p.state << 13
+	p.state ^= p.state >> 7
+	p.state ^= p.state << 17
+	return p.state
+}
+
+// Freeze locks the session state, preventing further modifications.
+func (s *SessionFingerprintState) Freeze() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen = true
+}
+
+// IsFrozen returns whether the session state is frozen.
+func (s *SessionFingerprintState) IsFrozen() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.frozen
+}
+
+// Touch updates the last used timestamp.
+func (s *SessionFingerprintState) Touch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastUsed = time.Now()
+	s.connectionCount++
+}
+
+// ConnectionCount returns the number of connections using this state.
+func (s *SessionFingerprintState) ConnectionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.connectionCount
+}
+
+// LastUsed returns when this state was last used.
+func (s *SessionFingerprintState) LastUsed() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastUsed
+}
+
+// GetGREASEValue returns the frozen GREASE value for a given position.
+func (s *SessionFingerprintState) GetGREASEValue(position GREASEPosition) uint16 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	switch position {
+	case GREASECipherSuite:
+		return s.FrozenGREASE.CipherSuite
+	case GREASEExtension1:
+		return s.FrozenGREASE.Extension1
+	case GREASEExtension2:
+		return s.FrozenGREASE.Extension2
+	case GREASESupportedGroup:
+		return s.FrozenGREASE.SupportedGroup
+	case GREASESupportedVersion:
+		return s.FrozenGREASE.SupportedVersion
+	case GREASEKeyShare:
+		return s.FrozenGREASE.KeyShare
+	case GREASESignatureAlgo:
+		return s.FrozenGREASE.SignatureAlgo
+	case GREASEPSKMode:
+		return s.FrozenGREASE.PSKMode
+	default:
+		// Return a consistent value for unknown positions instead of random
+		// to maintain session consistency
+		return s.FrozenGREASE.Extension1
+	}
+}
+
+// GREASEPosition identifies where a GREASE value is used.
+type GREASEPosition int
+
+const (
+	GREASECipherSuite GREASEPosition = iota
+	GREASEExtension1
+	GREASEExtension2
+	GREASESupportedGroup
+	GREASESupportedVersion
+	GREASEKeyShare
+	GREASESignatureAlgo
+	GREASEPSKMode
+)
+
+// SetSessionTicket stores the session ticket for resumption.
+// Pass nil or empty slice to clear the ticket.
+// Returns ErrSessionFrozen if the session state has been frozen.
+func (s *SessionFingerprintState) SetSessionTicket(ticket []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.frozen {
+		return ErrSessionFrozen
+	}
+
+	// Zero previous ticket before overwriting for security
+	zeroSlice(s.SessionTicket)
+
+	// Treat nil/empty as clearing the ticket
+	if len(ticket) == 0 {
+		s.SessionTicket = nil
+		return nil
+	}
+
+	s.SessionTicket = make([]byte, len(ticket))
+	copy(s.SessionTicket, ticket)
+	return nil
+}
+
+// GetSessionTicket returns the stored session ticket.
+func (s *SessionFingerprintState) GetSessionTicket() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.SessionTicket == nil {
+		return nil
+	}
+
+	ticket := make([]byte, len(s.SessionTicket))
+	copy(ticket, s.SessionTicket)
+	return ticket
+}
+
+// SetResumptionSecret stores the TLS 1.3 resumption secret.
+// Pass nil or empty slice to clear the secret.
+// Returns ErrSessionFrozen if the session state has been frozen.
+func (s *SessionFingerprintState) SetResumptionSecret(secret []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.frozen {
+		return ErrSessionFrozen
+	}
+
+	// Zero previous secret before overwriting for security
+	zeroSlice(s.ResumptionSecret)
+
+	// Treat nil/empty as clearing the secret
+	if len(secret) == 0 {
+		s.ResumptionSecret = nil
+		return nil
+	}
+
+	s.ResumptionSecret = make([]byte, len(secret))
+	copy(s.ResumptionSecret, secret)
+	return nil
+}
+
+// GetResumptionSecret returns the stored resumption secret.
+func (s *SessionFingerprintState) GetResumptionSecret() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.ResumptionSecret == nil {
+		return nil
+	}
+
+	secret := make([]byte, len(s.ResumptionSecret))
+	copy(secret, s.ResumptionSecret)
+	return secret
+}
+
+// Clear zeros and clears all sensitive session data.
+func (s *SessionFingerprintState) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	zeroSlice(s.SessionTicket)
+	zeroSlice(s.PSKIdentity)
+	zeroSlice(s.ResumptionSecret)
+
+	s.SessionTicket = nil
+	s.PSKIdentity = nil
+	s.ResumptionSecret = nil
+}
+
+// SessionStateCache manages session states per origin.
+//
+// Lock ordering: When both SessionStateCache.mu and SessionFingerprintState.mu
+// need to be held, always acquire SessionStateCache.mu first. This is enforced
+// by the current implementation where SessionFingerprintState doesn't hold a
+// reference to its parent cache, making reverse-order acquisition impossible.
+type SessionStateCache struct {
+	cache   map[string]*SessionFingerprintState
+	mu      sync.RWMutex
+	maxSize int
+	maxAge  time.Duration
+}
+
+// NewSessionStateCache creates a new session state cache.
+func NewSessionStateCache(maxSize int, maxAge time.Duration) *SessionStateCache {
+	if maxSize <= 0 {
+		maxSize = 10000
+	}
+	if maxAge <= 0 {
+		maxAge = 24 * time.Hour
+	}
+
+	return &SessionStateCache{
+		cache:   make(map[string]*SessionFingerprintState),
+		maxSize: maxSize,
+		maxAge:  maxAge,
+	}
+}
+
+// GetOrCreate returns existing session state or creates a new one.
+func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfile) *SessionFingerprintState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check for existing state
+	if state, ok := c.cache[origin]; ok {
+		if time.Since(state.CreatedAt) < c.maxAge {
+			state.Touch()
+			return state
+		}
+		// Expired, remove it
+		state.Clear()
+		delete(c.cache, origin)
+	}
+
+	// Create new state
+	state := NewSessionFingerprintState(profile, origin)
+
+	// Don't cache nil state (happens when profile is nil)
+	if state == nil {
+		return nil
+	}
+
+	// Evict oldest if at capacity
+	if len(c.cache) >= c.maxSize {
+		c.evictOldest()
+	}
+
+	c.cache[origin] = state
+	return state
+}
+
+// Get returns session state for origin if it exists.
+func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if state, ok := c.cache[origin]; ok {
+		if time.Since(state.CreatedAt) < c.maxAge {
+			return state
+		}
+	}
+	return nil
+}
+
+// Set stores session state for origin.
+func (c *SessionStateCache) Set(origin string, state *SessionFingerprintState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Clear any existing state
+	if existing, ok := c.cache[origin]; ok {
+		existing.Clear()
+	}
+
+	// Evict oldest if at capacity
+	if len(c.cache) >= c.maxSize {
+		c.evictOldest()
+	}
+
+	c.cache[origin] = state
+}
+
+// Delete removes session state for origin.
+func (c *SessionStateCache) Delete(origin string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if state, ok := c.cache[origin]; ok {
+		state.Clear()
+		delete(c.cache, origin)
+	}
+}
+
+// Clear removes all session states.
+func (c *SessionStateCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, state := range c.cache {
+		state.Clear()
+	}
+	c.cache = make(map[string]*SessionFingerprintState)
+}
+
+// evictOldest removes the oldest session state.
+// Must be called with lock held.
+func (c *SessionStateCache) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, state := range c.cache {
+		if oldestKey == "" || state.LastUsed().Before(oldestTime) {
+			oldestKey = key
+			oldestTime = state.LastUsed()
+		}
+	}
+
+	if oldestKey != "" {
+		if state, ok := c.cache[oldestKey]; ok {
+			state.Clear()
+		}
+		delete(c.cache, oldestKey)
+	}
+}
+
+// Stats returns cache statistics.
+func (c *SessionStateCache) Stats() SessionCacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	stats := SessionCacheStats{
+		Size:    len(c.cache),
+		MaxSize: c.maxSize,
+		MaxAge:  c.maxAge,
+	}
+
+	for _, state := range c.cache {
+		stats.TotalConnections += state.ConnectionCount()
+		// Use GetSessionTicket() to avoid data race - it acquires proper lock
+		if state.GetSessionTicket() != nil {
+			stats.WithTickets++
+		}
+	}
+
+	return stats
+}
+
+// SessionCacheStats contains cache statistics.
+type SessionCacheStats struct {
+	Size             int
+	MaxSize          int
+	MaxAge           time.Duration
+	TotalConnections int
+	WithTickets      int
+}
+
+// Cleanup removes expired entries from the cache.
+func (c *SessionStateCache) Cleanup() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var removed int
+	now := time.Now()
+
+	for key, state := range c.cache {
+		if now.Sub(state.CreatedAt) >= c.maxAge {
+			state.Clear()
+			delete(c.cache, key)
+			removed++
+		}
+	}
+
+	return removed
+}
+
+// DefaultSessionCache is the global session state cache.
+var DefaultSessionCache = NewSessionStateCache(10000, 24*time.Hour)
+
+// ErrSessionFrozen is returned when attempting to modify a frozen session.
+var ErrSessionFrozen = errors.New("tls: session state is frozen")

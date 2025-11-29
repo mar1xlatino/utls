@@ -529,6 +529,12 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		return unexpectedMessageError(serverHello, msg)
 	}
 
+	// [uTLS] Capture raw ServerHello for JA4S calculation
+	if serverHello.original != nil {
+		c.rawServerHello = make([]byte, len(serverHello.original))
+		copy(c.rawServerHello, serverHello.original)
+	}
+
 	if err := c.pickTLSVersion(serverHello); err != nil {
 		return err
 	}

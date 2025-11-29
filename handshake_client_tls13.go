@@ -495,6 +495,12 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 	}
 	hs.serverHello = serverHello
 
+	// [uTLS] Capture raw ServerHello for JA4S calculation
+	if hs.uconn != nil && serverHello.original != nil {
+		hs.uconn.rawServerHello = make([]byte, len(serverHello.original))
+		copy(hs.uconn.rawServerHello, serverHello.original)
+	}
+
 	if err := hs.checkServerHelloOrHRR(); err != nil {
 		return err
 	}

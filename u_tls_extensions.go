@@ -1532,8 +1532,9 @@ func (e *KeyShareExtension) keySharesLen() int {
 func (e *KeyShareExtension) Read(b []byte) (int, error) {
 	// Validate all key shares before serialization (defense-in-depth)
 	for i, ks := range e.KeyShares {
-		// For Read, Data must be present and non-empty
-		if len(ks.Data) == 0 {
+		// For Read, Data must be present and non-empty for non-GREASE groups
+		// GREASE key shares can have any data including empty (RFC 8701)
+		if len(ks.Data) == 0 && !isGREASEUint16(uint16(ks.Group)) && ks.Group != GREASE_PLACEHOLDER {
 			return 0, fmt.Errorf("tls: key_share at index %d has empty key data", i)
 		}
 		// Validate group ID and key size
@@ -1645,7 +1646,7 @@ func isValidKeyShareGroup(group CurveID) bool {
 
 // validateKeyShare validates a single KeyShare entry.
 // Group ID is always validated. If Data is nil, size validation is skipped
-// (key will be auto-generated). For GREASE values, any non-empty data is accepted.
+// (key will be auto-generated). For GREASE values, any data is accepted (including empty).
 // For known curves, the data length must match the expected public key size.
 func validateKeyShare(ks KeyShare) error {
 	// Always validate group ID first - invalid groups must be rejected
@@ -1654,20 +1655,22 @@ func validateKeyShare(ks KeyShare) error {
 		return fmt.Errorf("tls: key_share has invalid group ID %d", ks.Group)
 	}
 
+	// For GREASE values, any data is valid including empty (RFC 8701)
+	// CRITICAL: Check GREASE BEFORE empty data check - GREASE key shares may have
+	// minimal data (single byte or empty) and this is valid per RFC 8701
+	if ks.Group == GREASE_PLACEHOLDER || isGREASEUint16(uint16(ks.Group)) {
+		return nil
+	}
+
 	// If Data is nil, key will be auto-generated - skip size validation
 	// but group validation above ensures only valid groups reach key generation
 	if ks.Data == nil {
 		return nil
 	}
 
-	// Empty key data is invalid per RFC 8446 Section 4.2.8
+	// Empty key data is invalid per RFC 8446 Section 4.2.8 (for non-GREASE groups)
 	if len(ks.Data) == 0 {
 		return fmt.Errorf("tls: key_share for group %d has empty key data", ks.Group)
-	}
-
-	// For GREASE values, any non-empty data is valid (RFC 8701)
-	if ks.Group == GREASE_PLACEHOLDER || isGREASEUint16(uint16(ks.Group)) {
-		return nil
 	}
 
 	// Validate key size for known curves
