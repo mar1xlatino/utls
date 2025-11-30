@@ -884,85 +884,103 @@ func outputProfile(profile *CapturedProfile) {
 		}
 	}
 
-	// Go code output
+	// Go code output - generate proper profiles package format
 	id := fmt.Sprintf("%s_%s_%s", strings.ToLower(browser), version, strings.ToLower(platform))
 
-	goCode := fmt.Sprintf(`
+	// CamelCase variable name for Go
+	varName := toCamelCase(browser) + version + toCamelCase(platform)
+
+	// Determine if Chrome-based (needs ShuffleExtensions)
+	isChromeBased := isChromiumBrowser(browser)
+	shuffleLine := ""
+	if isChromeBased {
+		shuffleLine = "\n\t\tShuffleExtensions: true,"
+	}
+
+	goCode := fmt.Sprintf(`// Copyright 2024 uTLS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package profiles
+
+import tls "github.com/refraction-networking/utls"
+
 // %s captured from real %s %s on %s
 // JA3: %s
 // JA4: %s
 // JA4o: %s (original order)
-var %s = &FingerprintProfile{
-    ID:          "%s",
-    Browser:     "%s",
-    Version:     %s,
-    Platform:    "%s",
-    Description: "Captured from real %s %s",
+var %s = &tls.FingerprintProfile{
+	ID:          "%s",
+	Browser:     "%s",
+	Version:     %s,
+	Platform:    "%s",
+	Description: "Captured from real %s %s",
 
-    ClientHello: ClientHelloConfig{
-        LegacyVersion: 0x%04x,
+	ClientHello: tls.ClientHelloConfig{
+		LegacyVersion: 0x%04x,
 
-        CipherSuites: %s,
+		CipherSuites: %s,
 
-        ExtensionOrder: %s,
+		ExtensionOrder: %s,
 
-        SupportedGroups: %s,
+		SupportedGroups: %s,
 
-        SignatureAlgorithms: %s,
+		SignatureAlgorithms: %s,
 
-        ALPNProtocols: %s,
+		ALPNProtocols: %s,
 
-        SupportedVersions: %s,
+		SupportedVersions: %s,
 
-        KeyShareGroups: %s,
+		KeyShareGroups: %s,
 
-        PSKModes: %s,
+		PSKModes: %s,
 
-        CertCompressionAlgos: %s,
+		CertCompressionAlgos: %s,
 
-        CompressionMethods: []uint8{0x00},
+		CompressionMethods: []uint8{0x00},
 
-        SessionIDLength: %d,
-    },
+		SessionIDLength: %d,%s
 
-    GREASE: GREASEConfig{
-        Enabled:            %v,
-        CipherSuites:       %v,
-        Extensions:         %v,
-        SupportedGroups:    %v,
-        SupportedVersions:  %v,
-        KeyShare:           %v,
-        ExtensionPositions: %s,
-    },
+		GREASE: tls.GREASEConfig{
+			Enabled:            %v,
+			CipherSuites:       %v,
+			Extensions:         %v,
+			SupportedGroups:    %v,
+			SupportedVersions:  %v,
+			KeyShare:           %v,
+			ExtensionPositions: %s,
+		},
+	},
 
-    Expected: ExpectedFingerprints{
-        JA3:  "%s",
-        JA4:  "%s",
-        JA4o: "%s",
-    },
+	Expected: tls.ExpectedFingerprints{
+		JA3:  "%s",
+		JA4:  "%s",
+		JA4o: "%s",
+	},
 }
 `,
-		id, browser, version, platform,
+		varName, browser, version, platform,
 		profile.JA3,
 		profile.JA4,
 		profile.JA4o,
-		id,
+		varName,
 		id,
 		strings.ToLower(browser),
 		version,
 		strings.ToLower(platform),
 		browser, version,
 		profile.ClientVersion,
-		formatUint16Slice("        ", ciphersClean),
-		formatUint16Slice("        ", extsClean),
-		formatUint16SliceCurveID("        ", groupsClean),
-		formatUint16SliceSigScheme("        ", profile.SignatureAlgos),
+		formatUint16Slice("\t\t", ciphersClean),
+		formatUint16Slice("\t\t", extsClean),
+		formatUint16SliceCurveID("\t\t", groupsClean),
+		formatUint16SliceSigScheme("\t\t", profile.SignatureAlgos),
 		formatStringSlice(profile.ALPNProtocols),
-		formatUint16Slice("        ", versClean),
-		formatUint16SliceCurveID("        ", keyShareGroupsClean),
+		formatUint16Slice("\t\t", versClean),
+		formatUint16SliceCurveID("\t\t", keyShareGroupsClean),
 		formatUint8Slice(profile.PSKModes),
-		formatUint16SliceCertComp("        ", profile.CertCompressAlgs),
+		formatUint16SliceCertComp("\t\t", profile.CertCompressAlgs),
 		profile.SessionIDLength,
+		shuffleLine,
 		profile.GREASE.CipherSuite != 0,
 		profile.GREASE.CipherSuite != 0,
 		len(profile.GREASE.Extensions) > 0,
@@ -987,16 +1005,13 @@ var %s = &FingerprintProfile{
 
 // saveProfile saves the captured profile to files
 func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
-	// Create filename from browser info
-	filename := fmt.Sprintf("%s_%d_%s",
-		strings.ToLower(info.Browser),
-		info.Version,
-		strings.ToLower(info.Platform))
-	filename = strings.ReplaceAll(filename, " ", "_")
-	filename = strings.ReplaceAll(filename, ".", "_")
+	// CamelCase filename to avoid Go GOOS build constraints
+	filename := toCamelCase(info.Browser) + fmt.Sprintf("%d", info.Version) + toCamelCase(info.Platform)
 
-	// Save JSON
-	jsonPath := filepath.Join(profilesDir, filename+".json")
+	// Save JSON (with original snake_case name for readability)
+	jsonName := fmt.Sprintf("%s_%d_%s", strings.ToLower(info.Browser), info.Version, strings.ToLower(info.Platform))
+	jsonName = strings.ReplaceAll(jsonName, " ", "_")
+	jsonPath := filepath.Join(profilesDir, jsonName+".json")
 	jsonData, _ := json.MarshalIndent(profile, "", "  ")
 	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
 		log.Printf("Failed to save JSON: %v", err)
@@ -1004,7 +1019,7 @@ func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
 		log.Printf("Saved JSON: %s", jsonPath)
 	}
 
-	// Save Go code
+	// Save Go code with CamelCase filename
 	goPath := filepath.Join(profilesDir, filename+".go")
 	if err := os.WriteFile(goPath, []byte(goCode), 0644); err != nil {
 		log.Printf("Failed to save Go code: %v", err)
@@ -1013,13 +1028,38 @@ func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
 	}
 }
 
-// formatUint16SliceCurveID formats as CurveID type
+// toCamelCase converts a string to CamelCase
+func toCamelCase(s string) string {
+	s = strings.ReplaceAll(s, "_", " ")
+	s = strings.ReplaceAll(s, "-", " ")
+	words := strings.Fields(s)
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+		}
+	}
+	return strings.Join(words, "")
+}
+
+// isChromiumBrowser returns true if browser is Chromium-based
+func isChromiumBrowser(browser string) bool {
+	b := strings.ToLower(browser)
+	chromiumBrowsers := []string{"chrome", "edge", "opera", "brave", "vivaldi", "samsung", "yandex", "uc", "whale", "qq"}
+	for _, cb := range chromiumBrowsers {
+		if strings.Contains(b, cb) {
+			return true
+		}
+	}
+	return false
+}
+
+// formatUint16SliceCurveID formats as tls.CurveID type
 func formatUint16SliceCurveID(indent string, values []uint16) string {
 	if len(values) == 0 {
-		return "[]CurveID{}"
+		return "[]tls.CurveID{}"
 	}
 	var sb strings.Builder
-	sb.WriteString("[]CurveID{\n")
+	sb.WriteString("[]tls.CurveID{\n")
 	for i, v := range values {
 		if i%8 == 0 {
 			sb.WriteString(indent)
@@ -1036,13 +1076,13 @@ func formatUint16SliceCurveID(indent string, values []uint16) string {
 	return sb.String()
 }
 
-// formatUint16SliceSigScheme formats as SignatureScheme type
+// formatUint16SliceSigScheme formats as tls.SignatureScheme type
 func formatUint16SliceSigScheme(indent string, values []uint16) string {
 	if len(values) == 0 {
-		return "[]SignatureScheme{}"
+		return "[]tls.SignatureScheme{}"
 	}
 	var sb strings.Builder
-	sb.WriteString("[]SignatureScheme{\n")
+	sb.WriteString("[]tls.SignatureScheme{\n")
 	for i, v := range values {
 		if i%8 == 0 {
 			sb.WriteString(indent)
@@ -1059,13 +1099,13 @@ func formatUint16SliceSigScheme(indent string, values []uint16) string {
 	return sb.String()
 }
 
-// formatUint16SliceCertComp formats as CertCompressionAlgo type
+// formatUint16SliceCertComp formats as tls.CertCompressionAlgo type
 func formatUint16SliceCertComp(indent string, values []uint16) string {
 	if len(values) == 0 {
-		return "[]CertCompressionAlgo{}"
+		return "[]tls.CertCompressionAlgo{}"
 	}
 	var sb strings.Builder
-	sb.WriteString("[]CertCompressionAlgo{\n")
+	sb.WriteString("[]tls.CertCompressionAlgo{\n")
 	for i, v := range values {
 		if i%8 == 0 {
 			sb.WriteString(indent)
@@ -1303,6 +1343,14 @@ func detectBrowser(ua, uaLower string) (browser string, version int, versionFull
 		return
 	}
 
+	// Edge iOS (check before regular Edge)
+	if strings.Contains(uaLower, "edgios/") {
+		browser = "Edge"
+		versionFull = extractVersionAfter(ua, "EdgiOS/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
 	// Edge (check before Chrome)
 	if strings.Contains(uaLower, "edg/") || strings.Contains(uaLower, "edge/") {
 		browser = "Edge"
@@ -1355,6 +1403,14 @@ func detectBrowser(ua, uaLower string) (browser string, version int, versionFull
 		return
 	}
 
+	// Firefox iOS (check before regular Firefox)
+	if strings.Contains(uaLower, "fxios/") {
+		browser = "Firefox"
+		versionFull = extractVersionAfter(ua, "FxiOS/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
 	// Firefox (check for various Firefox variants)
 	if strings.Contains(uaLower, "firefox/") {
 		browser = "Firefox"
@@ -1369,8 +1425,21 @@ func detectBrowser(ua, uaLower string) (browser string, version int, versionFull
 		return
 	}
 
-	// Safari (check before Chrome, but Safari doesn't have "Chrome" in UA)
-	if strings.Contains(uaLower, "safari/") && !strings.Contains(uaLower, "chrome") && !strings.Contains(uaLower, "chromium") {
+	// Chrome iOS (check before Safari and regular Chrome)
+	if strings.Contains(uaLower, "crios/") {
+		browser = "Chrome"
+		versionFull = extractVersionAfter(ua, "CriOS/")
+		version = extractMajorVersion(versionFull)
+		return
+	}
+
+	// Safari (real Safari, not iOS wrappers)
+	if strings.Contains(uaLower, "safari/") &&
+		!strings.Contains(uaLower, "chrome") &&
+		!strings.Contains(uaLower, "chromium") &&
+		!strings.Contains(uaLower, "fxios") &&
+		!strings.Contains(uaLower, "crios") &&
+		!strings.Contains(uaLower, "edgios") {
 		browser = "Safari"
 		versionFull = extractVersionAfter(ua, "Version/")
 		version = extractMajorVersion(versionFull)
