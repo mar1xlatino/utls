@@ -1048,6 +1048,7 @@ func TestBuild_ReturnsCompleteProfile(t *testing.T) {
 		WithID("build_test").
 		WithBrowser("chrome").
 		WithVersion(133).
+		WithPlatform("linux").
 		WithCipherSuites([]uint16{TLS_AES_128_GCM_SHA256})
 
 	profile, err := builder.Build()
@@ -1071,10 +1072,18 @@ func TestBuild_ReturnsClone(t *testing.T) {
 	builder := NewEmptyProfileBuilder().
 		WithID("clone_test").
 		WithBrowser("chrome").
+		WithVersion(133).
+		WithPlatform("linux").
 		WithCipherSuites([]uint16{TLS_AES_128_GCM_SHA256})
 
-	profile1, _ := builder.Build()
-	profile2, _ := builder.Build()
+	profile1, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+	profile2, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
 
 	// Modify profile1
 	profile1.ID = "modified"
@@ -1125,7 +1134,12 @@ func TestMustBuild_Success(t *testing.T) {
 	builder := NewEmptyProfileBuilder().
 		WithID("must_build_test").
 		WithBrowser("chrome").
-		WithCipherSuites([]uint16{TLS_AES_128_GCM_SHA256})
+		WithPlatform("linux").
+		WithVersion(100).
+		WithCipherSuites([]uint16{TLS_AES_128_GCM_SHA256}).
+		WithSupportedVersions([]uint16{VersionTLS13}).
+		WithSupportedGroups([]CurveID{X25519}).
+		WithSignatureAlgorithms([]SignatureScheme{ECDSAWithP256AndSHA256})
 
 	profile := builder.MustBuild()
 	if profile == nil {

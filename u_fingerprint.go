@@ -299,20 +299,34 @@ func buildJA4a(data *clientHelloData) string {
 	}
 
 	// ALPN: first and last char of first protocol, or "00"
-	// Per JA4 spec: if non-alphanumeric, use hex of first and last bytes
+	// Per JA4 spec: if alphanumeric, use the character directly.
+	// If non-alphanumeric, use first char of hex(first byte) or last char of hex(last byte).
 	alpn := "00"
 	if len(data.alpnFirst) >= 1 {
 		first := data.alpnFirst[0]
 		last := data.alpnFirst[len(data.alpnFirst)-1]
-		if isAlphanumeric(first) && isAlphanumeric(last) {
-			alpn = string(first) + string(last)
+
+		// Handle first character
+		var firstChar string
+		if isAlphanumeric(first) {
+			firstChar = string(first)
 		} else {
-			// Use hex representation for non-alphanumeric
-			// JA4 spec: first char of hex(first byte) + last char of hex(last byte)
+			// Use first character of hex representation
 			firstHex := fmt.Sprintf("%02x", first)
-			lastHex := fmt.Sprintf("%02x", last)
-			alpn = string(firstHex[0]) + string(lastHex[1])
+			firstChar = string(firstHex[0])
 		}
+
+		// Handle last character
+		var lastChar string
+		if isAlphanumeric(last) {
+			lastChar = string(last)
+		} else {
+			// Use last character of hex representation
+			lastHex := fmt.Sprintf("%02x", last)
+			lastChar = string(lastHex[1])
+		}
+
+		alpn = firstChar + lastChar
 	}
 
 	return fmt.Sprintf("%s%s%s%02d%02d%s", protocol, tlsVer, sni, cipherCount, extCount, alpn)
@@ -630,18 +644,32 @@ func CalculateJA4S(raw []byte) (*ServerHelloFingerprint, error) {
 	}
 
 	// ALPN indicator for JA4S
+	// Per JA4 spec: if alphanumeric, use the character directly.
+	// If non-alphanumeric, use first char of hex(first byte) or last char of hex(last byte).
 	alpn := "00"
 	if len(data.alpnProtocol) >= 1 {
 		first := data.alpnProtocol[0]
 		last := data.alpnProtocol[len(data.alpnProtocol)-1]
-		if isAlphanumeric(first) && isAlphanumeric(last) {
-			alpn = string(first) + string(last)
+
+		// Handle first character
+		var firstChar string
+		if isAlphanumeric(first) {
+			firstChar = string(first)
 		} else {
-			// JA4 spec: first char of hex(first byte) + last char of hex(last byte)
 			firstHex := fmt.Sprintf("%02x", first)
-			lastHex := fmt.Sprintf("%02x", last)
-			alpn = string(firstHex[0]) + string(lastHex[1])
+			firstChar = string(firstHex[0])
 		}
+
+		// Handle last character
+		var lastChar string
+		if isAlphanumeric(last) {
+			lastChar = string(last)
+		} else {
+			lastHex := fmt.Sprintf("%02x", last)
+			lastChar = string(lastHex[1])
+		}
+
+		alpn = firstChar + lastChar
 	}
 
 	ja4sA := fmt.Sprintf("%s%s%02d%s", protocol, tlsVer, extCount, alpn)
@@ -650,12 +678,9 @@ func CalculateJA4S(raw []byte) (*ServerHelloFingerprint, error) {
 	ja4sB := fmt.Sprintf("%04x", data.cipherSuite)
 
 	// Build JA4S_c: extensions hash
-	// Sort extensions, hash with SHA256, take first 12 chars
-	sortedExts := make([]uint16, len(data.extensions))
-	copy(sortedExts, data.extensions)
-	sort.Slice(sortedExts, func(i, j int) bool { return sortedExts[i] < sortedExts[j] })
-
-	extHex := joinUint16Hex(sortedExts, ",")
+	// JA4S preserves original extension order (unlike JA4 for ClientHello)
+	// The extension order in ServerHello is significant for fingerprinting
+	extHex := joinUint16Hex(data.extensions, ",")
 	var ja4sC string
 	if extHex == "" {
 		ja4sC = "000000000000"
@@ -776,8 +801,13 @@ func oidToHex(oid asn1.ObjectIdentifier) string {
 	return hex.EncodeToString(encoded)
 }
 
-// encodeVarInt encodes an integer using ASN.1 variable-length encoding.
+// encodeVarInt encodes a non-negative integer using ASN.1 variable-length encoding.
+// Returns nil for negative values (invalid input for OID encoding).
 func encodeVarInt(val int) []byte {
+	if val < 0 {
+		// Negative values are invalid for OID encoding
+		return nil
+	}
 	if val == 0 {
 		return []byte{0}
 	}

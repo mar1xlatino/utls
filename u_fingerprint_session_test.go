@@ -1220,13 +1220,341 @@ func TestSessionCacheStats_TotalConnections(t *testing.T) {
 
 	state := cache.GetOrCreate("example.com:443", profile)
 
-	// Touch multiple times
-	for i := 0; i < 10; i++ {
+	// GetOrCreate calls Touch() once for new states, so connectionCount starts at 1
+	// Touch 9 more times to get to 10 total
+	for i := 0; i < 9; i++ {
 		state.Touch()
 	}
 
 	stats := cache.Stats()
+	// 1 (from GetOrCreate) + 9 (from loop) = 10
 	if stats.TotalConnections != 10 {
 		t.Errorf("Expected TotalConnections 10, got %d", stats.TotalConnections)
+	}
+}
+
+// =============================================================================
+// TEST SUITE: Get() Expired Entry Cleanup
+// =============================================================================
+
+// TestSessionCache_Get_RemovesExpiredEntry verifies that Get() removes expired
+// entries from the cache instead of leaving them as memory leaks.
+func TestSessionCache_Get_RemovesExpiredEntry(t *testing.T) {
+	// Very short TTL for testing
+	cache := NewSessionStateCache(100, 10*time.Millisecond)
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+	}
+
+	// Create an entry
+	_ = cache.GetOrCreate("origin.com:443", profile)
+
+	// Verify it exists
+	stats := cache.Stats()
+	if stats.Size != 1 {
+		t.Fatalf("Expected 1 entry, got %d", stats.Size)
+	}
+
+	// Wait for expiration
+	time.Sleep(20 * time.Millisecond)
+
+	// Get() should return nil AND remove the expired entry
+	state := cache.Get("origin.com:443")
+	if state != nil {
+		t.Error("Get() should return nil for expired entry")
+	}
+
+	// The entry should be removed from cache
+	stats = cache.Stats()
+	if stats.Size != 0 {
+		t.Errorf("Get() should remove expired entry, but cache size is %d", stats.Size)
+	}
+}
+
+// TestSessionCache_Get_ConcurrentExpiredCleanup verifies thread-safe cleanup
+// of expired entries in Get().
+func TestSessionCache_Get_ConcurrentExpiredCleanup(t *testing.T) {
+	cache := NewSessionStateCache(100, 5*time.Millisecond)
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+	}
+
+	// Create some entries
+	for i := 0; i < 10; i++ {
+		cache.GetOrCreate("origin"+string(rune('A'+i))+".com:443", profile)
+	}
+
+	// Wait for expiration
+	time.Sleep(10 * time.Millisecond)
+
+	// Concurrent Get() calls should safely cleanup expired entries
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			origin := "origin" + string(rune('A'+id%10)) + ".com:443"
+			_ = cache.Get(origin) // Should return nil and cleanup
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All expired entries should be cleaned up
+	stats := cache.Stats()
+	if stats.Size != 0 {
+		t.Errorf("All expired entries should be cleaned up, but size is %d", stats.Size)
+	}
+}
+
+// =============================================================================
+// TEST SUITE: Frozen Value Getters
+// =============================================================================
+
+// TestGetFrozenExtensionOrder_ReturnsCopy verifies GetFrozenExtensionOrder
+// returns a copy that doesn't affect the original state when modified.
+func TestGetFrozenExtensionOrder_ReturnsCopy(t *testing.T) {
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+		ClientHello: ClientHelloConfig{
+			GREASE:            GREASEConfig{Enabled: true},
+			ShuffleExtensions: true,
+			Extensions: []ExtensionEntry{
+				{Type: 0x0001},
+				{Type: 0x0002},
+				{Type: 0x0003},
+			},
+		},
+	}
+
+	state := NewSessionFingerprintState(profile, "example.com:443")
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState returned nil")
+	}
+
+	// Get frozen order
+	copy1 := state.GetFrozenExtensionOrder()
+	if copy1 == nil {
+		t.Skip("No frozen extension order set")
+	}
+
+	// Store original first value
+	originalFirst := copy1[0]
+
+	// Modify the copy
+	copy1[0] = 0xFFFF
+
+	// Get another copy
+	copy2 := state.GetFrozenExtensionOrder()
+
+	// Original should be unchanged
+	if copy2[0] != originalFirst {
+		t.Errorf("Original frozen extension order was modified: expected 0x%04x, got 0x%04x",
+			originalFirst, copy2[0])
+	}
+}
+
+// TestGetFrozenKeyShareGroups_ReturnsCopy verifies the copy behavior.
+func TestGetFrozenKeyShareGroups_ReturnsCopy(t *testing.T) {
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+		ClientHello: ClientHelloConfig{
+			KeyShareGroups: []CurveID{X25519, CurveP256, CurveP384},
+		},
+	}
+
+	state := NewSessionFingerprintState(profile, "example.com:443")
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState returned nil")
+	}
+
+	// Get frozen groups
+	copy1 := state.GetFrozenKeyShareGroups()
+	if len(copy1) == 0 {
+		t.Fatal("Expected frozen key share groups to be set")
+	}
+
+	originalFirst := copy1[0]
+
+	// Modify the copy
+	copy1[0] = CurveP521
+
+	// Get another copy
+	copy2 := state.GetFrozenKeyShareGroups()
+
+	// Original should be unchanged
+	if copy2[0] != originalFirst {
+		t.Errorf("Original frozen key share groups was modified: expected %v, got %v",
+			originalFirst, copy2[0])
+	}
+}
+
+// TestGetFrozenSigAlgOrder_ReturnsCopy verifies the copy behavior.
+func TestGetFrozenSigAlgOrder_ReturnsCopy(t *testing.T) {
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+		ClientHello: ClientHelloConfig{
+			SignatureAlgorithms: []SignatureScheme{
+				ECDSAWithP256AndSHA256,
+				PSSWithSHA256,
+				PKCS1WithSHA256,
+			},
+		},
+	}
+
+	state := NewSessionFingerprintState(profile, "example.com:443")
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState returned nil")
+	}
+
+	// Get frozen order
+	copy1 := state.GetFrozenSigAlgOrder()
+	if len(copy1) == 0 {
+		t.Fatal("Expected frozen sig alg order to be set")
+	}
+
+	originalFirst := copy1[0]
+
+	// Modify the copy
+	copy1[0] = PSSWithSHA512
+
+	// Get another copy
+	copy2 := state.GetFrozenSigAlgOrder()
+
+	// Original should be unchanged
+	if copy2[0] != originalFirst {
+		t.Errorf("Original frozen sig alg order was modified: expected %v, got %v",
+			originalFirst, copy2[0])
+	}
+}
+
+// TestGetFrozenValues_NilReturnsNil verifies getters return nil for unset values.
+func TestGetFrozenValues_NilReturnsNil(t *testing.T) {
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+		// No KeyShareGroups, SignatureAlgorithms, or shuffle
+	}
+
+	state := NewSessionFingerprintState(profile, "example.com:443")
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState returned nil")
+	}
+
+	// All getters should return nil for unset values
+	if state.GetFrozenExtensionOrder() != nil {
+		t.Error("GetFrozenExtensionOrder should return nil when not set")
+	}
+
+	if state.GetFrozenCipherOrder() != nil {
+		t.Error("GetFrozenCipherOrder should return nil when not set")
+	}
+}
+
+// TestGetFrozenValues_ThreadSafe verifies concurrent access to getters.
+func TestGetFrozenValues_ThreadSafe(t *testing.T) {
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+		ClientHello: ClientHelloConfig{
+			GREASE:            GREASEConfig{Enabled: true},
+			ShuffleExtensions: true,
+			Extensions: []ExtensionEntry{
+				{Type: 0x0001},
+				{Type: 0x0002},
+			},
+			KeyShareGroups: []CurveID{X25519, CurveP256},
+			SignatureAlgorithms: []SignatureScheme{
+				ECDSAWithP256AndSHA256,
+			},
+		},
+	}
+
+	state := NewSessionFingerprintState(profile, "example.com:443")
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState returned nil")
+	}
+
+	var wg sync.WaitGroup
+	errors := int32(0)
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				// Call all getters concurrently
+				_ = state.GetFrozenExtensionOrder()
+				_ = state.GetFrozenCipherOrder()
+				_ = state.GetFrozenKeyShareGroups()
+				_ = state.GetFrozenSigAlgOrder()
+				_ = state.GetGREASEValue(GREASECipherSuite)
+				_ = state.IsFrozen()
+				_ = state.ConnectionCount()
+				_ = state.LastUsed()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if errors > 0 {
+		t.Errorf("Detected %d errors during concurrent getter access", errors)
+	}
+}
+
+// =============================================================================
+// TEST SUITE: evictOldest Race Condition Fix
+// =============================================================================
+
+// TestEvictOldest_LastUsedRaceCondition tests that evictOldest correctly
+// handles concurrent Touch() calls without reading inconsistent timestamps.
+func TestEvictOldest_LastUsedRaceCondition(t *testing.T) {
+	cache := NewSessionStateCache(5, time.Hour)
+	profile := &FingerprintProfile{
+		ID:      "test_profile",
+		Browser: "chrome",
+	}
+
+	// Fill cache to capacity
+	for i := 0; i < 5; i++ {
+		cache.GetOrCreate("origin"+string(rune('A'+i))+".com:443", profile)
+		time.Sleep(time.Millisecond) // Ensure different timestamps
+	}
+
+	var wg sync.WaitGroup
+
+	// Concurrently touch existing sessions while adding new ones
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			// Touch existing entries
+			for j := 0; j < 5; j++ {
+				origin := "origin" + string(rune('A'+j)) + ".com:443"
+				state := cache.Get(origin)
+				if state != nil {
+					state.Touch()
+				}
+			}
+
+			// Add new entries (triggers eviction)
+			newOrigin := "new" + string(rune('A'+id%26)) + ".com:443"
+			cache.GetOrCreate(newOrigin, profile)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Cache should not exceed max size
+	stats := cache.Stats()
+	if stats.Size > 5 {
+		t.Errorf("Cache size %d exceeds max 5", stats.Size)
 	}
 }

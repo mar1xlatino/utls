@@ -100,6 +100,7 @@ type RandomPaddingStrategy struct {
 }
 
 // Pad returns a random padding length.
+// Uses rejection sampling to eliminate modulo bias for uniform distribution.
 func (s *RandomPaddingStrategy) Pad(dataLen, maxSize int) int {
 	if s.MaxPad <= 0 {
 		return 0
@@ -114,18 +115,33 @@ func (s *RandomPaddingStrategy) Pad(dataLen, maxSize int) int {
 		return 0
 	}
 
-	// Cap maxPad to prevent uint16 overflow when adding 1
-	// uint16 max is 65535, so maxPad+1 must not exceed 65535
+	// Cap maxPad to prevent overflow issues
+	// RFC 8446 allows up to 255 bytes of padding, but we allow more for flexibility
 	if maxPad > 65534 {
 		maxPad = 65534
 	}
 
-	var b [2]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// Fallback to no padding on rand failure
-		return 0
+	// Use rejection sampling to eliminate modulo bias
+	// rangeSize is the number of valid values [0, maxPad] inclusive
+	rangeSize := uint32(maxPad + 1)
+	// max is the largest multiple of rangeSize that fits in uint32
+	// We use uint32 for 4 bytes of randomness (better than 2 bytes)
+	max := ^uint32(0) - (^uint32(0) % rangeSize)
+
+	for {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			// Fallback to no padding on rand failure
+			return 0
+		}
+		randVal := binary.BigEndian.Uint32(b[:])
+
+		// Accept only if below rejection threshold
+		if randVal < max {
+			return int(randVal % rangeSize)
+		}
+		// Otherwise loop and try again (expected iterations: ~1.0)
 	}
-	return int(binary.BigEndian.Uint16(b[:]) % uint16(maxPad+1))
 }
 
 // Name returns the strategy name.
@@ -298,9 +314,17 @@ func (c *RecordLayerController) CalculatePadding(dataLen int) int {
 }
 
 // FragmentData fragments data into multiple records based on config.
+// Fragments are capped at MaxRecordSize (or maxPlaintext if not set) to ensure
+// they fit within valid TLS record boundaries.
 func (c *RecordLayerController) FragmentData(data []byte) [][]byte {
 	if !c.config.AllowFragmentation || len(c.config.FragmentPattern) == 0 {
 		return [][]byte{data}
+	}
+
+	// Determine maximum fragment size - cap at maxPlaintext for TLS compliance
+	maxFragmentSize := c.config.MaxRecordSize
+	if maxFragmentSize <= 0 || maxFragmentSize > maxPlaintext {
+		maxFragmentSize = maxPlaintext
 	}
 
 	var fragments [][]byte
@@ -309,8 +333,15 @@ func (c *RecordLayerController) FragmentData(data []byte) [][]byte {
 
 	for len(remaining) > 0 {
 		size := c.config.FragmentPattern[patternIdx]
+
+		// Handle invalid or oversized pattern entries
 		if size <= 0 || size > len(remaining) {
 			size = len(remaining)
+		}
+
+		// Cap fragment size at maximum allowed to prevent TLS record overflow
+		if size > maxFragmentSize {
+			size = maxFragmentSize
 		}
 
 		fragment := make([]byte, size)
@@ -408,6 +439,11 @@ func (c *RecordTimingController) GetDelay() time.Duration {
 
 	// Calculate delay with jitter
 	delay := time.Duration(c.baseDelay.Load())
+
+	// Clamp negative base delay to 0 for safety
+	if delay < 0 {
+		delay = 0
+	}
 
 	jitter := c.jitter.Load()
 	if jitter > 0 {

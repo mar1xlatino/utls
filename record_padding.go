@@ -118,6 +118,12 @@ func (c *RecordPaddingConfig) generateChromeLikePadding(minPad, maxPad int) int 
 		lambda = 3.0
 	}
 
+	// Defensive check: if maxPad is 0 or range is empty, return minPad
+	// This prevents division by zero and handles edge cases gracefully
+	if maxPad <= 0 || minPad >= maxPad {
+		return minPad
+	}
+
 	// Read cryptographically secure random bytes
 	var u uint64
 	if err := binary.Read(rand.Reader, binary.LittleEndian, &u); err != nil {
@@ -138,6 +144,7 @@ func (c *RecordPaddingConfig) generateChromeLikePadding(minPad, maxPad int) int 
 	cdfAt1 := 1.0 - math.Exp(-lambda)
 
 	// For non-zero MinPadding, adjust the normalized range
+	// Note: maxNorm is guaranteed > 0 due to defensive check above
 	minNormalized := minNorm / maxNorm
 	cdfAtMin := 1.0 - math.Exp(-lambda*minNormalized)
 	cdfAtMaxNorm := cdfAt1
@@ -178,6 +185,11 @@ func (c *RecordPaddingConfig) generateExponentialPadding(minPad, maxPad int) int
 	lambda := c.Lambda
 	if lambda <= 0 {
 		lambda = 1.0
+	}
+
+	// Defensive check: if range is empty, return minPad
+	if minPad >= maxPad {
+		return minPad
 	}
 
 	// Read cryptographically secure random bytes

@@ -97,7 +97,8 @@ func calculateJA4FromRaw(raw []byte) (ja4Fingerprint, error) {
 		return result, fmt.Errorf("failed to read extensions")
 	}
 
-	var extensionIDs []uint16
+	var extensionIDs []uint16     // For JA4_c hash: excludes SNI and ALPN
+	var allExtensionCount int     // For JA4_a count: excludes only GREASE
 	var hasSNI bool
 	var alpnFirstChar string = "00" // Default: no ALPN
 
@@ -106,6 +107,11 @@ func calculateJA4FromRaw(raw []byte) (ja4Fingerprint, error) {
 		var extData cryptobyte.String
 		if !extensions.ReadUint16(&extType) || !extensions.ReadUint16LengthPrefixed(&extData) {
 			return result, fmt.Errorf("failed to read extension")
+		}
+
+		// Count all non-GREASE extensions for JA4_a
+		if !isGREASEUint16(extType) {
+			allExtensionCount++
 		}
 
 		// Check for SNI extension (type 0)
@@ -124,10 +130,23 @@ func calculateJA4FromRaw(raw []byte) (ja4Fingerprint, error) {
 					if alpnList.CopyBytes(firstAlpnBytes) {
 						firstAlpn := string(firstAlpnBytes)
 						// Extract first and last char for JA4 ALPN component
-						if len(firstAlpn) >= 2 {
-							alpnFirstChar = string(firstAlpn[0]) + string(firstAlpn[len(firstAlpn)-1])
-						} else if len(firstAlpn) == 1 {
-							alpnFirstChar = string(firstAlpn[0]) + string(firstAlpn[0])
+						// Per JA4 spec: if alphanumeric, use directly; else use hex
+						if len(firstAlpn) >= 1 {
+							first := firstAlpn[0]
+							last := firstAlpn[len(firstAlpn)-1]
+
+							var firstChar, lastChar string
+							if isAlphanumeric(first) {
+								firstChar = string(first)
+							} else {
+								firstChar = string(fmt.Sprintf("%02x", first)[0])
+							}
+							if isAlphanumeric(last) {
+								lastChar = string(last)
+							} else {
+								lastChar = string(fmt.Sprintf("%02x", last)[1])
+							}
+							alpnFirstChar = firstChar + lastChar
 						}
 					}
 				}
@@ -163,7 +182,7 @@ func calculateJA4FromRaw(raw []byte) (ja4Fingerprint, error) {
 	}
 
 	cipherCount := len(cipherSuites)
-	extCount := len(extensionIDs)
+	extCount := allExtensionCount // Use total non-GREASE extension count (includes SNI/ALPN)
 
 	// Clamp counts to 99 (2 digits)
 	if cipherCount > 99 {

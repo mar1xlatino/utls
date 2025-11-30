@@ -36,7 +36,7 @@ var Safari17Macos = &tls.FingerprintProfile{
 		},
 
 		SignatureAlgorithms: []tls.SignatureScheme{
-			0x0403, 0x0804, 0x0401, 0x0503, 0x0203, 0x0805, 0x0805, 0x0501,
+			0x0403, 0x0804, 0x0401, 0x0503, 0x0203, 0x0805, 0x0501,
 			0x0806, 0x0601, 0x0201,
 		},
 
@@ -61,7 +61,7 @@ var Safari17Macos = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, 14},
+			ExtensionPositions: []int{0, -1},
 		},
 	},
 

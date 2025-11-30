@@ -1432,7 +1432,7 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 	// - 16384-65535 = reserved for private/experimental use
 	for _, alg := range e.Algorithms {
 		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
-		isExperimentalRange := alg >= 16384 && alg <= 65535
+		isExperimentalRange := alg >= 16384
 		if !isStandardAlgorithm && !isExperimentalRange {
 			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1=zlib, 2=brotli, 3=zstd, or 16384-65535 for experimental)", alg)
 		}
@@ -1481,7 +1481,7 @@ func (e *UtlsCompressCertExtension) Write(b []byte) (int, error) {
 	}
 	for _, alg := range methods {
 		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
-		isExperimentalRange := alg >= 16384 && alg <= 65535
+		isExperimentalRange := alg >= 16384
 		if !isStandardAlgorithm && !isExperimentalRange {
 			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d", alg)
 		}

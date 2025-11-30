@@ -148,12 +148,6 @@ func (s *sessionController) finalCheck() error {
 	return nil
 }
 
-func initializationGuard[E Initializable, I func(E)](extension E, initializer I) {
-	uAssert(!extension.IsInitialized(), "tls: initialization failed: the extension is already initialized")
-	initializer(extension)
-	uAssert(extension.IsInitialized(), "tls: initialization failed: the extension is not initialized after initialization")
-}
-
 // errOnNil returns an error if any of the parameters is nil.
 func errOnNil(caller string, params ...any) error {
 	for i, p := range params {

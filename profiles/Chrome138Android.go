@@ -63,7 +63,7 @@ var Chrome138Android = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, 13},
+			ExtensionPositions: []int{0, -1},
 		},
 	},
 

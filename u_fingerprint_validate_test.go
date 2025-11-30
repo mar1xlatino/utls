@@ -1361,7 +1361,7 @@ func TestFilterGREASE_EmptyInput_ReturnsEmpty(t *testing.T) {
 // TestFilterGREASE_NilInput_ReturnsEmpty verifies nil input handling.
 func TestFilterGREASE_NilInput_ReturnsEmpty(t *testing.T) {
 	result := filterGREASE(nil)
-	if result != nil && len(result) != 0 {
+	if len(result) != 0 {
 		t.Errorf("Expected nil or empty slice for nil input, got %d values", len(result))
 	}
 }

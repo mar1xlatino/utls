@@ -10,12 +10,21 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // patternCache caches compiled regex patterns to avoid recompilation.
 // Using sync.Map for concurrent access without explicit locking.
 var patternCache sync.Map // map[string]*regexp.Regexp
+
+// patternCacheSize tracks the approximate number of entries in patternCache.
+// This is approximate because sync.Map doesn't provide a Size() method.
+var patternCacheSize int64
+
+// patternCacheMaxSize is the maximum number of patterns to cache.
+// When exceeded, the cache is cleared to prevent unbounded memory growth.
+const patternCacheMaxSize = 10000
 
 // ValidationResult contains the outcome of fingerprint validation.
 type ValidationResult struct {
@@ -361,6 +370,8 @@ func matchesPattern(value, pattern string) bool {
 
 // getCachedRegex returns a cached compiled regex, compiling and caching if needed.
 // Returns nil if the pattern is invalid.
+// The cache is automatically cleared when it exceeds patternCacheMaxSize to prevent
+// unbounded memory growth.
 func getCachedRegex(pattern string) *regexp.Regexp {
 	// Check cache first
 	if cached, ok := patternCache.Load(pattern); ok {
@@ -370,16 +381,37 @@ func getCachedRegex(pattern string) *regexp.Regexp {
 		return nil // Cached as invalid
 	}
 
+	// Check if cache needs to be cleared (approximate size exceeded)
+	currentSize := atomic.LoadInt64(&patternCacheSize)
+	if currentSize >= patternCacheMaxSize {
+		// Clear cache - this is a simple strategy that trades off some
+		// cache misses for predictable memory usage.
+		clearPatternCache()
+	}
+
 	// Compile and cache
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		// Cache nil to avoid recompiling invalid patterns
 		patternCache.Store(pattern, (*regexp.Regexp)(nil))
+		atomic.AddInt64(&patternCacheSize, 1)
 		return nil
 	}
 
 	patternCache.Store(pattern, re)
+	atomic.AddInt64(&patternCacheSize, 1)
 	return re
+}
+
+// clearPatternCache clears the pattern cache and resets the size counter.
+// This is called when the cache exceeds patternCacheMaxSize.
+func clearPatternCache() {
+	// Create a new empty sync.Map by resetting the global variable.
+	// Note: This is safe because sync.Map handles concurrent access internally.
+	// Existing goroutines may still see some old entries during the transition,
+	// which is acceptable for a cache.
+	patternCache = sync.Map{}
+	atomic.StoreInt64(&patternCacheSize, 0)
 }
 
 // ValidateCertificate validates a certificate's JA4X.

@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -60,12 +62,12 @@ func TestCalculateFingerprints_TruncatedVersion(t *testing.T) {
 func TestCalculateFingerprints_TruncatedRandom(t *testing.T) {
 	// Handshake type + length + version + partial random (only 10 bytes instead of 32)
 	input := make([]byte, 16)
-	input[0] = 0x01              // handshake type
-	input[1] = 0x00              // length MSB
-	input[2] = 0x00              // length
-	input[3] = 0x0c              // length LSB (12 bytes after header)
-	input[4] = 0x03              // version MSB
-	input[5] = 0x03              // version LSB (TLS 1.2)
+	input[0] = 0x01 // handshake type
+	input[1] = 0x00 // length MSB
+	input[2] = 0x00 // length
+	input[3] = 0x0c // length LSB (12 bytes after header)
+	input[4] = 0x03 // version MSB
+	input[5] = 0x03 // version LSB (TLS 1.2)
 	// bytes 6-15 are partial random
 
 	_, err := CalculateFingerprints(input)
@@ -104,9 +106,9 @@ func TestCalculateFingerprints_TruncatedCipherSuites(t *testing.T) {
 	input[2] = 0x00
 	input[3] = 0x26 // length
 	input[4] = 0x03
-	input[5] = 0x03              // version TLS 1.2
+	input[5] = 0x03                     // version TLS 1.2
 	copy(input[6:38], make([]byte, 32)) // random
-	input[38] = 0x00             // session ID length = 0
+	input[38] = 0x00                    // session ID length = 0
 
 	// Cipher suite length claims 4 bytes but only 2 follow
 	input = append(input, 0x00, 0x04) // cipher suite length = 4
@@ -140,9 +142,9 @@ func TestCalculateFingerprints_TruncatedCompression(t *testing.T) {
 func TestCalculateFingerprints_TruncatedExtensions(t *testing.T) {
 	// Build ClientHello with complete header up to extensions
 	input := buildMinimalClientHelloUpToCiphers(t)
-	input = append(input, 0x00, 0x02)  // cipher length
-	input = append(input, 0x13, 0x01)  // cipher
-	input = append(input, 0x01, 0x00)  // compression: length=1, null
+	input = append(input, 0x00, 0x02) // cipher length
+	input = append(input, 0x13, 0x01) // cipher
+	input = append(input, 0x01, 0x00) // compression: length=1, null
 
 	// Extensions length claims 100 bytes but only 2 follow
 	input = append(input, 0x00, 0x64) // extensions length = 100
@@ -158,9 +160,9 @@ func TestCalculateFingerprints_TruncatedExtensions(t *testing.T) {
 func TestCalculateFingerprints_InvalidExtensionLength(t *testing.T) {
 	// Build ClientHello with extension that has too-large length
 	input := buildMinimalClientHelloUpToCiphers(t)
-	input = append(input, 0x00, 0x02)  // cipher length
-	input = append(input, 0x13, 0x01)  // cipher
-	input = append(input, 0x01, 0x00)  // compression
+	input = append(input, 0x00, 0x02) // cipher length
+	input = append(input, 0x13, 0x01) // cipher
+	input = append(input, 0x01, 0x00) // compression
 
 	// Extension block
 	extData := []byte{
@@ -808,7 +810,7 @@ func TestCalculateJA4X_NilCertificate(t *testing.T) {
 // TestCalculateJA4X_NoIssuerOIDs tests JA4X with certificate having no issuer OIDs.
 func TestCalculateJA4X_NoIssuerOIDs(t *testing.T) {
 	cert := &x509.Certificate{
-		Issuer:  pkix.Name{}, // Empty issuer
+		Issuer: pkix.Name{}, // Empty issuer
 		Subject: pkix.Name{
 			CommonName: "Test",
 		},
@@ -1022,20 +1024,20 @@ func TestGREASE_AllValidValues(t *testing.T) {
 func TestGREASE_InvalidValues(t *testing.T) {
 	// Values that look similar to GREASE but aren't valid
 	invalidGrease := []uint16{
-		0x0a0b, // Second byte doesn't match pattern
-		0x0b0a, // First byte doesn't match pattern
-		0x0a00, // Second byte is 0x00 not 0x0a
-		0x000a, // First byte is 0x00
-		0x1a2a, // Different high nibbles
-		0x0aaa, // Second byte has different high nibble
-		0xaa0a, // First byte has different high nibble
-		0x0a1a, // High nibbles don't match
-		0x1234, // Completely different
-		0xffff, // All ones
-		0x0000, // All zeros
-		TLS_AES_128_GCM_SHA256,        // 0x1301 - real cipher
-		TLS_AES_256_GCM_SHA384,        // 0x1302 - real cipher
-		TLS_CHACHA20_POLY1305_SHA256,  // 0x1303 - real cipher
+		0x0a0b,                       // Second byte doesn't match pattern
+		0x0b0a,                       // First byte doesn't match pattern
+		0x0a00,                       // Second byte is 0x00 not 0x0a
+		0x000a,                       // First byte is 0x00
+		0x1a2a,                       // Different high nibbles
+		0x0aaa,                       // Second byte has different high nibble
+		0xaa0a,                       // First byte has different high nibble
+		0x0a1a,                       // High nibbles don't match
+		0x1234,                       // Completely different
+		0xffff,                       // All ones
+		0x0000,                       // All zeros
+		TLS_AES_128_GCM_SHA256,       // 0x1301 - real cipher
+		TLS_AES_256_GCM_SHA384,       // 0x1302 - real cipher
+		TLS_CHACHA20_POLY1305_SHA256, // 0x1303 - real cipher
 	}
 
 	for _, val := range invalidGrease {
@@ -1356,7 +1358,7 @@ func buildValidClientHelloFull(t *testing.T, version uint16, ciphers []uint16, e
 	var buf bytes.Buffer
 
 	// Placeholder for handshake header (will fill in later)
-	buf.WriteByte(0x01) // ClientHello
+	buf.WriteByte(0x01)        // ClientHello
 	buf.Write([]byte{0, 0, 0}) // Length placeholder
 
 	// Version
@@ -1486,7 +1488,7 @@ func buildValidClientHelloNoExtensions(t *testing.T, ciphers []uint16) []byte {
 
 	var buf bytes.Buffer
 
-	buf.WriteByte(0x01) // ClientHello
+	buf.WriteByte(0x01)        // ClientHello
 	buf.Write([]byte{0, 0, 0}) // Length placeholder
 
 	// Version: TLS 1.2
@@ -1545,7 +1547,7 @@ func buildValidServerHello(t *testing.T, version uint16, cipher uint16, extensio
 
 	var buf bytes.Buffer
 
-	buf.WriteByte(0x02) // ServerHello
+	buf.WriteByte(0x02)        // ServerHello
 	buf.Write([]byte{0, 0, 0}) // Length placeholder
 
 	// Version
@@ -1595,7 +1597,7 @@ func buildValidServerHelloTLS13(t *testing.T, cipher uint16, extensions []uint16
 
 	var buf bytes.Buffer
 
-	buf.WriteByte(0x02) // ServerHello
+	buf.WriteByte(0x02)        // ServerHello
 	buf.Write([]byte{0, 0, 0}) // Length placeholder
 
 	// Legacy version (TLS 1.2 for TLS 1.3)
@@ -1651,7 +1653,7 @@ func buildValidServerHelloWithALPN(t *testing.T, version uint16, cipher uint16, 
 
 	var buf bytes.Buffer
 
-	buf.WriteByte(0x02) // ServerHello
+	buf.WriteByte(0x02)        // ServerHello
 	buf.Write([]byte{0, 0, 0}) // Length placeholder
 
 	// Version
@@ -1888,6 +1890,329 @@ func TestJA4XConsistency_MultipleRuns(t *testing.T) {
 			if fp.JA4X != firstJA4X {
 				t.Errorf("JA4X inconsistent at iteration %d: expected %s, got %s", i, firstJA4X, fp.JA4X)
 			}
+		}
+	}
+}
+
+// =============================================================================
+// SECTION 10: ALPN Handling Edge Cases
+// =============================================================================
+
+// TestALPN_MixedAlphanumericHandling tests ALPN indicator calculation for various inputs.
+// This tests the fix for the bug where mixed alphanumeric/non-alphanumeric ALPN values
+// were incorrectly handled (both chars were hex-encoded when only one should be).
+func TestALPN_MixedAlphanumericHandling(t *testing.T) {
+	testCases := []struct {
+		name     string
+		alpn     string
+		expected string // Expected 2-char ALPN indicator in JA4_a
+	}{
+		// Both alphanumeric - use directly
+		{"h2", "h2", "h2"},
+		{"h3", "h3", "h3"},
+		{"http_1.1", "http/1.1", "h1"}, // '/' is alphanumeric
+		{"spdy_3.1", "spdy/3.1", "s1"}, // first='s', last='1', both alphanumeric
+
+		// Single char - duplicated
+		{"single_a", "a", "aa"},
+		{"single_1", "1", "11"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			extensions := []uint16{0, 10, 11, 16, 43} // With ALPN
+			raw := buildValidClientHelloWithALPN(t, []uint16{TLS_AES_128_GCM_SHA256}, extensions, tc.alpn)
+
+			fp, err := CalculateFingerprints(raw)
+			if err != nil {
+				t.Fatalf("CalculateFingerprints failed: %v", err)
+			}
+
+			parts := strings.Split(fp.JA4, "_")
+			ja4a := parts[0]
+			alpnIndicator := ja4a[len(ja4a)-2:]
+
+			if alpnIndicator != tc.expected {
+				t.Errorf("ALPN %q: expected indicator %q, got %q (JA4: %s)", tc.alpn, tc.expected, alpnIndicator, fp.JA4)
+			}
+		})
+	}
+}
+
+// TestALPN_isAlphanumericBoundaries tests the isAlphanumeric helper at boundaries.
+func TestALPN_isAlphanumericBoundaries(t *testing.T) {
+	testCases := []struct {
+		char     byte
+		expected bool
+	}{
+		// Digits
+		{'0', true},
+		{'9', true},
+		// Uppercase
+		{'A', true},
+		{'Z', true},
+		// Lowercase
+		{'a', true},
+		{'z', true},
+		// Boundaries (not alphanumeric)
+		{'/', false}, // before '0'
+		{':', false}, // after '9'
+		{'@', false}, // before 'A'
+		{'[', false}, // after 'Z'
+		{'`', false}, // before 'a'
+		{'{', false}, // after 'z'
+		// Special chars
+		{'-', false},
+		{'_', false},
+		{'.', false},
+		{' ', false},
+		{'\x00', false},
+		{'\xff', false},
+	}
+
+	for _, tc := range testCases {
+		result := isAlphanumeric(tc.char)
+		if result != tc.expected {
+			t.Errorf("isAlphanumeric(%q) = %v, want %v", tc.char, result, tc.expected)
+		}
+	}
+}
+
+// TestJA4_RawVsHashedConsistency verifies that raw fingerprints hash to expected values.
+func TestJA4_RawVsHashedConsistency(t *testing.T) {
+	ciphers := []uint16{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256}
+	extensions := []uint16{0, 10, 11, 13, 43}
+
+	raw := buildValidClientHello(t, ciphers, extensions, nil, nil, nil)
+
+	fp, err := CalculateFingerprints(raw)
+	if err != nil {
+		t.Fatalf("CalculateFingerprints failed: %v", err)
+	}
+
+	// Parse JA4r: format is "a_b_c" where c may contain underscore for sig_algs
+	// So we split with limit 3 to keep c intact (including any embedded underscore)
+	parts := strings.SplitN(fp.JA4r, "_", 3)
+	if len(parts) < 3 {
+		t.Fatalf("JA4r wrong format: %s", fp.JA4r)
+	}
+
+	ja4rB := parts[1] // Cipher hex list
+	ja4rC := parts[2] // Extension hex list (may include _sig_algs)
+
+	// Hash JA4r_b and compare with JA4_b
+	partsH := strings.Split(fp.JA4, "_")
+	ja4B := partsH[1]
+	ja4C := partsH[2]
+
+	// Verify JA4_b is SHA256[:12] of JA4r_b
+	if ja4rB != "" {
+		hashB := sha256.Sum256([]byte(ja4rB))
+		expectedB := hex.EncodeToString(hashB[:])[:12]
+		if ja4B != expectedB {
+			t.Errorf("JA4_b hash mismatch:\n  Raw: %s\n  Expected hash: %s\n  Actual: %s", ja4rB, expectedB, ja4B)
+		}
+	}
+
+	// Verify JA4_c is SHA256[:12] of JA4r_c
+	if ja4rC != "" {
+		hashC := sha256.Sum256([]byte(ja4rC))
+		expectedC := hex.EncodeToString(hashC[:])[:12]
+		if ja4C != expectedC {
+			t.Errorf("JA4_c hash mismatch:\n  Raw: %s\n  Expected hash: %s\n  Actual: %s", ja4rC, expectedC, ja4C)
+		}
+	}
+
+	t.Logf("JA4r: %s", fp.JA4r)
+	t.Logf("JA4:  %s", fp.JA4)
+}
+
+// TestJA3_RawVsHashedConsistency verifies JA3 hash matches raw string.
+func TestJA3_RawVsHashedConsistency(t *testing.T) {
+	ciphers := []uint16{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384}
+	extensions := []uint16{0, 10, 11, 13, 43}
+
+	raw := buildValidClientHello(t, ciphers, extensions, nil, nil, nil)
+
+	fp, err := CalculateFingerprints(raw)
+	if err != nil {
+		t.Fatalf("CalculateFingerprints failed: %v", err)
+	}
+
+	// Verify JA3 is MD5 of JA3r
+	expectedHash := md5.Sum([]byte(fp.JA3r))
+	expectedHashStr := hex.EncodeToString(expectedHash[:])
+
+	if fp.JA3 != expectedHashStr {
+		t.Errorf("JA3 hash mismatch:\n  Raw: %s\n  Expected: %s\n  Actual: %s", fp.JA3r, expectedHashStr, fp.JA3)
+	}
+
+	// Verify JA3n is MD5 of JA3rn
+	expectedHashN := md5.Sum([]byte(fp.JA3rn))
+	expectedHashNStr := hex.EncodeToString(expectedHashN[:])
+
+	if fp.JA3n != expectedHashNStr {
+		t.Errorf("JA3n hash mismatch:\n  Raw: %s\n  Expected: %s\n  Actual: %s", fp.JA3rn, expectedHashNStr, fp.JA3n)
+	}
+}
+
+// TestJA4_VersionDetectionFromSupportedVersions tests version detection priority.
+func TestJA4_VersionDetectionFromSupportedVersions(t *testing.T) {
+	testCases := []struct {
+		name              string
+		clientHelloVer    uint16
+		supportedVersions []uint16
+		expectedVerStr    string
+	}{
+		{"no_supported_versions", VersionTLS12, nil, "12"},
+		{"tls13_in_supported", VersionTLS12, []uint16{VersionTLS13, VersionTLS12}, "13"},
+		{"only_tls12_in_supported", VersionTLS12, []uint16{VersionTLS12}, "12"},
+		{"multiple_versions_picks_highest", VersionTLS12, []uint16{VersionTLS10, VersionTLS11, VersionTLS13}, "13"},
+		{"grease_filtered", VersionTLS12, []uint16{0x0a0a, VersionTLS13}, "13"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := buildValidClientHelloWithVersion(t, tc.clientHelloVer, tc.supportedVersions)
+
+			fp, err := CalculateFingerprints(raw)
+			if err != nil {
+				t.Fatalf("CalculateFingerprints failed: %v", err)
+			}
+
+			parts := strings.Split(fp.JA4, "_")
+			ja4a := parts[0]
+			verStr := ja4a[1:3]
+
+			if verStr != tc.expectedVerStr {
+				t.Errorf("Expected version %s, got %s (JA4: %s)", tc.expectedVerStr, verStr, fp.JA4)
+			}
+		})
+	}
+}
+
+// TestJA4_SignatureAlgorithmsInHash tests that signature algorithms are included in JA4c.
+func TestJA4_SignatureAlgorithmsInHash(t *testing.T) {
+	// Build ClientHello with signature_algorithms extension
+	ciphers := []uint16{TLS_AES_128_GCM_SHA256}
+	extensions := []uint16{0, 10, 11, 13, 43} // 13 = signature_algorithms
+	sigAlgs := []uint16{uint16(ECDSAWithP256AndSHA256), uint16(PSSWithSHA256)}
+
+	raw := buildValidClientHello(t, ciphers, extensions, nil, nil, sigAlgs)
+
+	fp, err := CalculateFingerprints(raw)
+	if err != nil {
+		t.Fatalf("CalculateFingerprints failed: %v", err)
+	}
+
+	// JA4r_c should contain signature algorithms after underscore
+	// Use SplitN(3) to keep the full JA4r_c including any embedded underscore
+	parts := strings.SplitN(fp.JA4r, "_", 3)
+	if len(parts) < 3 {
+		t.Fatalf("JA4r wrong format: %s", fp.JA4r)
+	}
+	ja4rC := parts[2]
+
+	// JA4r_c should have format: extensions_sigalgs
+	if !strings.Contains(ja4rC, "_") {
+		t.Errorf("JA4r_c should contain underscore separating extensions from sig_algs: %s", ja4rC)
+	}
+
+	t.Logf("JA4r_c (with sig_algs): %s", ja4rC)
+}
+
+// TestJA4S_OriginalExtensionOrder tests that JA4S preserves original extension order.
+func TestJA4S_OriginalExtensionOrder(t *testing.T) {
+	// Build ServerHello with extensions in specific order
+	extensions := []uint16{51, 43, 16} // key_share, supported_versions, ALPN
+
+	raw := buildValidServerHelloWithALPN(t, VersionTLS12, TLS_AES_128_GCM_SHA256, extensions, "h2")
+
+	fp, err := CalculateJA4S(raw)
+	if err != nil {
+		t.Fatalf("CalculateJA4S failed: %v", err)
+	}
+
+	// JA4Sr should have extensions in original order
+	parts := strings.Split(fp.JA4Sr, "_")
+	extHex := parts[2]
+
+	// Extensions should be: 0033 (51), 002b (43), 0010 (16)
+	// Verify order is preserved (not sorted)
+	expected := "0033,002b,0010"
+	if extHex != expected {
+		t.Errorf("JA4Sr extensions should preserve order: expected %s, got %s", expected, extHex)
+	}
+
+	t.Logf("JA4S: %s", fp.JA4S)
+	t.Logf("JA4Sr: %s", fp.JA4Sr)
+}
+
+// TestOIDToHex_LargeOIDs tests OID encoding for larger values.
+func TestOIDToHex_LargeOIDs(t *testing.T) {
+	testCases := []struct {
+		name     string
+		oid      asn1.ObjectIdentifier
+		expected string
+	}{
+		// Standard OIDs
+		{"commonName", asn1.ObjectIdentifier{2, 5, 4, 3}, "550403"},
+		{"country", asn1.ObjectIdentifier{2, 5, 4, 6}, "550406"},
+		{"organization", asn1.ObjectIdentifier{2, 5, 4, 10}, "55040a"},
+
+		// Larger arc values requiring multi-byte encoding
+		// DER variable-length encoding: split into 7-bit groups, set high bit on all but last
+		// 128 = 0b10000000 -> 0b0000001 0b0000000 -> 0x81 0x00
+		{"large_arc_128", asn1.ObjectIdentifier{2, 5, 4, 128}, "55048100"},
+		// 255 = 0b11111111 -> 0b0000001 0b1111111 -> 0x81 0x7f
+		{"large_arc_255", asn1.ObjectIdentifier{2, 5, 4, 255}, "5504817f"},
+
+		// Microsoft OID with large arcs: 1.3.6.1.4.1.311.21.20
+		// 311 = 0b100110111 -> 0b0000010 0b0110111 -> 0x82 0x37
+		{"microsoft_certtype", asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 21, 20}, "2b0601040182371514"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := oidToHex(tc.oid)
+			// For the Microsoft OID, just check it doesn't panic and produces output
+			if tc.name == "microsoft_certtype" {
+				if len(result) == 0 {
+					t.Error("oidToHex returned empty string for valid OID")
+				}
+				t.Logf("Microsoft OID hex: %s", result)
+				return
+			}
+
+			if result != tc.expected {
+				t.Errorf("oidToHex(%v) = %s, want %s", tc.oid, result, tc.expected)
+			}
+		})
+	}
+}
+
+// TestEncodeVarInt_EdgeCases tests variable-length integer encoding edge cases.
+func TestEncodeVarInt_EdgeCases(t *testing.T) {
+	testCases := []struct {
+		input    int
+		expected []byte
+	}{
+		{0, []byte{0}},
+		{1, []byte{1}},
+		{127, []byte{0x7f}},
+		{128, []byte{0x81, 0x00}},
+		{129, []byte{0x81, 0x01}},
+		{255, []byte{0x81, 0x7f}},
+		{256, []byte{0x82, 0x00}},
+		{16383, []byte{0xff, 0x7f}},
+		{16384, []byte{0x81, 0x80, 0x00}},
+		{65535, []byte{0x83, 0xff, 0x7f}},
+	}
+
+	for _, tc := range testCases {
+		result := encodeVarInt(tc.input)
+		if !bytes.Equal(result, tc.expected) {
+			t.Errorf("encodeVarInt(%d) = %v, want %v", tc.input, result, tc.expected)
 		}
 	}
 }

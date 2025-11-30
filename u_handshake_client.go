@@ -113,17 +113,18 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 	rawMsg[2] = uint8(m.uncompressedLength >> 8)
 	rawMsg[3] = uint8(m.uncompressedLength)
 
-	n, err := decompressed.Read(rawMsg[4:])
-	if err != nil && !errors.Is(err, io.EOF) {
+	// Use io.ReadFull to ensure we read the exact number of bytes.
+	// A single Read() call is not guaranteed to return all data at once.
+	n, err := io.ReadFull(decompressed, rawMsg[4:])
+	if err != nil {
 		c.sendAlert(alertBadCertificate)
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			// If, after decompression, the specified length does not match the actual length,
+			// the party receiving the invalid message MUST abort the connection with the
+			// "bad_certificate" alert. https://datatracker.ietf.org/doc/html/rfc8879#section-4
+			return nil, fmt.Errorf("decompressed len (%d) does not match specified len (%d)", n, m.uncompressedLength)
+		}
 		return nil, err
-	}
-	if n < len(rawMsg)-4 {
-		// If, after decompression, the specified length does not match the actual length, the party
-		// receiving the invalid message MUST abort the connection with the "bad_certificate" alert.
-		// https://datatracker.ietf.org/doc/html/rfc8879#section-4
-		c.sendAlert(alertBadCertificate)
-		return nil, fmt.Errorf("decompressed len (%d) does not match specified len (%d)", n, m.uncompressedLength)
 	}
 	certMsg := new(certificateMsgTLS13)
 	if !certMsg.unmarshal(rawMsg) {

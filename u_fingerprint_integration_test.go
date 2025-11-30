@@ -1410,8 +1410,11 @@ func TestFingerprintController_ThreadSafety_ConcurrentAccess(t *testing.T) {
 
 // TestApplyProfile_HooksCalledInOrder verifies that hooks are called in the
 // correct order during ApplyProfile.
-// Note: The implementation calls OnSessionStateRestored for new sessions (connectionCount==0)
-// and OnSessionStateCreated only when connectionCount==1 (first reuse from cache).
+//
+// Hook call flow:
+// 1. OnProfileSelected - called after profile is loaded and validated
+// 2. For NEW sessions: OnSessionStateCreated (connectionCount==1 after Touch())
+// 3. For EXISTING sessions: OnSessionStateRestored (connectionCount>1 after Touch())
 func TestApplyProfile_HooksCalledInOrder(t *testing.T) {
 	// Use unique origin to avoid session cache conflicts
 	uniqueOrigin := fmt.Sprintf("test-hooks-%d.com", time.Now().UnixNano())
@@ -1455,10 +1458,10 @@ func TestApplyProfile_HooksCalledInOrder(t *testing.T) {
 		t.Errorf("first hook should be profile_selected, got %s", callOrder[0])
 	}
 
-	// New session has connectionCount=0, so OnSessionStateRestored is called
-	// (OnSessionStateCreated is called when connectionCount==1, i.e., first reuse)
-	if len(callOrder) >= 2 && callOrder[1] != "session_restored" {
-		t.Errorf("second hook should be session_restored (new session), got %s", callOrder[1])
+	// New session: GetOrCreate calls Touch() which increments connectionCount from 0 to 1.
+	// ApplyFingerprintProfile checks connectionCount() == 1, so OnSessionStateCreated is called.
+	if len(callOrder) >= 2 && callOrder[1] != "session_created" {
+		t.Errorf("second hook should be session_created (first connection), got %s", callOrder[1])
 	}
 }
 

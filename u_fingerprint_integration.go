@@ -332,15 +332,31 @@ func (fc *FingerprintController) applyFrozenGREASE(uconn *UConn) {
 	}
 
 	// Fix GREASE extensions themselves
-	greaseExtIdx := 0
+	// Extensions built from GREASE markers already have correct Value set.
+	// Extensions built from raw GREASE types (0x?a?a) need Value assigned here.
+	// We track seen values to handle the edge case of mixed marker/raw GREASE.
+	ext1Used := false
+	ext2Used := false
 	for _, ext := range uconn.Extensions {
 		if ge, ok := ext.(*UtlsGREASEExtension); ok {
-			if greaseExtIdx == 0 {
-				ge.Value = grease.Extension1
+			if ge.Value == 0 {
+				// No value set yet (built from raw GREASE type) - assign based on order
+				if !ext1Used {
+					ge.Value = grease.Extension1
+					ext1Used = true
+				} else if !ext2Used {
+					ge.Value = grease.Extension2
+					ge.Body = []byte{0} // Second GREASE extension has body
+					ext2Used = true
+				}
 			} else {
-				ge.Value = grease.Extension2
+				// Value already set (from marker) - mark as used
+				if ge.Value == grease.Extension1 {
+					ext1Used = true
+				} else if ge.Value == grease.Extension2 {
+					ext2Used = true
+				}
 			}
-			greaseExtIdx++
 		}
 	}
 }
@@ -401,13 +417,222 @@ func (fc *FingerprintController) buildClientHelloSpec() (*ClientHelloSpec, error
 func (fc *FingerprintController) buildExtensions() ([]TLSExtension, error) {
 	ch := &fc.profile.ClientHello
 
-	// If profile has explicit extensions, use those
+	// Priority:
+	// 1. If profile has explicit Extensions (with data), use those
+	// 2. If profile has ExtensionOrder (types only), build extensions in that order
+	// 3. Otherwise, generate default extensions
+
 	if len(ch.Extensions) > 0 {
 		return fc.buildExtensionsFromProfile()
 	}
 
-	// Otherwise, generate default extensions based on profile configuration
+	if len(ch.ExtensionOrder) > 0 {
+		return fc.buildExtensionsFromOrder()
+	}
+
+	// Fallback to default extension set
 	return fc.generateDefaultExtensions()
+}
+
+// buildExtensionsFromOrder builds extensions from ExtensionOrder (types only).
+// This is used when profile specifies extension ORDER but not explicit extension data.
+// Extension data is generated from profile fields (SupportedGroups, ALPNProtocols, etc.)
+func (fc *FingerprintController) buildExtensionsFromOrder() ([]TLSExtension, error) {
+	ch := &fc.profile.ClientHello
+	var extensions []TLSExtension
+
+	// Use frozen extension order if available (for shuffle consistency)
+	// Otherwise use the profile's ExtensionOrder directly
+	var extOrder []uint16
+	if len(fc.sessionState.FrozenExtensionOrder) > 0 {
+		extOrder = fc.sessionState.FrozenExtensionOrder
+	} else {
+		extOrder = ch.ExtensionOrder
+	}
+
+	// Validate: empty extension order is likely a configuration error
+	if len(extOrder) == 0 {
+		return nil, errors.New("tls: ExtensionOrder is empty - profile must specify extension order or use Extensions field")
+	}
+
+	// Track seen extension types to detect duplicates (except GREASE which can appear multiple times)
+	seenExtensions := make(map[uint16]bool)
+
+	// Build each extension in order
+	for i, extType := range extOrder {
+		// Allow multiple GREASE extensions and GREASE markers, but not duplicates of other types
+		if !isGREASEUint16(extType) && !IsGreaseExtMarker(extType) {
+			if seenExtensions[extType] {
+				return nil, fmt.Errorf("tls: duplicate extension type %d (0x%04x) at position %d", extType, extType, i)
+			}
+			seenExtensions[extType] = true
+		}
+
+		tlsExt, err := fc.buildExtensionByType(extType)
+		if err != nil {
+			return nil, fmt.Errorf("tls: failed to build extension %d (0x%04x): %w", extType, extType, err)
+		}
+		if tlsExt != nil {
+			extensions = append(extensions, tlsExt)
+		}
+	}
+
+	return extensions, nil
+}
+
+// buildExtensionByType builds a TLS extension by its type ID.
+// Uses profile configuration fields to populate extension data.
+//
+// GREASE handling: This function handles both raw GREASE types (0x?a?a) and
+// GREASE markers (GreaseExtMarker1, GreaseExtMarker2). Markers are used when
+// extensions have been shuffled to preserve which GREASE was originally first.
+func (fc *FingerprintController) buildExtensionByType(extType uint16) (TLSExtension, error) {
+	ch := &fc.profile.ClientHello
+
+	// Check for GREASE markers first (used after shuffle to preserve original order)
+	// The marker tells us which frozen GREASE value to use
+	if extType == GreaseExtMarker1 {
+		return &UtlsGREASEExtension{
+			Value: fc.sessionState.FrozenGREASE.Extension1,
+		}, nil
+	}
+	if extType == GreaseExtMarker2 {
+		return &UtlsGREASEExtension{
+			Value: fc.sessionState.FrozenGREASE.Extension2,
+			Body:  []byte{0}, // Second GREASE extension has body per Chrome behavior
+		}, nil
+	}
+
+	// Check for raw GREASE types (for profiles that don't use shuffle)
+	if isGREASEUint16(extType) {
+		return &UtlsGREASEExtension{}, nil
+	}
+
+	switch extType {
+	case extensionServerName: // 0
+		return &SNIExtension{}, nil
+
+	case extensionStatusRequest: // 5
+		return &StatusRequestExtension{}, nil
+
+	case extensionSupportedCurves: // 10
+		if len(ch.SupportedGroups) > 0 {
+			groups := make([]CurveID, len(ch.SupportedGroups))
+			copy(groups, ch.SupportedGroups)
+			return &SupportedCurvesExtension{Curves: groups}, nil
+		}
+		return &SupportedCurvesExtension{Curves: []CurveID{X25519, CurveP256, CurveP384}}, nil
+
+	case extensionSupportedPoints: // 11
+		return &SupportedPointsExtension{SupportedPoints: []uint8{0}}, nil
+
+	case extensionSignatureAlgorithms: // 13
+		if len(ch.SignatureAlgorithms) > 0 {
+			algs := make([]SignatureScheme, len(ch.SignatureAlgorithms))
+			copy(algs, ch.SignatureAlgorithms)
+			return &SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: algs}, nil
+		}
+		return nil, nil
+
+	case extensionALPN: // 16
+		if len(ch.ALPNProtocols) > 0 {
+			return &ALPNExtension{AlpnProtocols: ch.ALPNProtocols}, nil
+		}
+		return nil, nil
+
+	case extensionSCT: // 18
+		return &SCTExtension{}, nil
+
+	case extensionExtendedMasterSecret: // 23
+		return &ExtendedMasterSecretExtension{}, nil
+
+	case extensionSessionTicket: // 35
+		return &SessionTicketExtension{}, nil
+
+	case extensionSupportedVersions: // 43
+		if len(ch.SupportedVersions) > 0 {
+			versions := make([]uint16, len(ch.SupportedVersions))
+			copy(versions, ch.SupportedVersions)
+			return &SupportedVersionsExtension{Versions: versions}, nil
+		}
+		return nil, nil
+
+	case extensionPSKModes: // 45
+		if len(ch.PSKModes) > 0 {
+			modes := make([]uint8, len(ch.PSKModes))
+			copy(modes, ch.PSKModes)
+			return &PSKKeyExchangeModesExtension{Modes: modes}, nil
+		}
+		return &PSKKeyExchangeModesExtension{Modes: []uint8{pskModeDHE}}, nil
+
+	case extensionKeyShare: // 51
+		// Use KeyShareGroups from profile, find first non-GREASE
+		var keyShareGroup CurveID = X25519 // default
+		if len(ch.KeyShareGroups) > 0 {
+			for _, g := range ch.KeyShareGroups {
+				if !isGREASEUint16(uint16(g)) {
+					keyShareGroup = g
+					break
+				}
+			}
+		}
+		return &KeyShareExtension{KeyShares: []KeyShare{{Group: keyShareGroup}}}, nil
+
+	case extensionRenegotiationInfo: // 65281 (0xff01)
+		return &RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient}, nil
+
+	case utlsExtensionCompressCertificate: // 27 (0x001b)
+		if len(ch.CertCompressionAlgos) > 0 {
+			algos := make([]CertCompressionAlgo, len(ch.CertCompressionAlgos))
+			copy(algos, ch.CertCompressionAlgos)
+			return &UtlsCompressCertExtension{Algorithms: algos}, nil
+		}
+		return &UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}}, nil
+
+	case utlsExtensionApplicationSettings: // 17513 (0x4469)
+		if len(ch.ALPNProtocols) > 0 {
+			return &ApplicationSettingsExtension{SupportedProtocols: ch.ALPNProtocols}, nil
+		}
+		return nil, nil
+
+	case utlsExtensionApplicationSettingsNew: // 17613 (0x44cd) - Chrome 140+ uses this
+		if len(ch.ALPNProtocols) > 0 {
+			return &ApplicationSettingsExtensionNew{SupportedProtocols: ch.ALPNProtocols}, nil
+		}
+		return nil, nil
+
+	case fakeExtensionDelegatedCredentials: // 34 (0x0022) - Firefox
+		return &FakeDelegatedCredentialsExtension{
+			SupportedSignatureAlgorithms: ch.SignatureAlgorithms,
+		}, nil
+
+	case fakeRecordSizeLimit: // 28 (0x001c) - Firefox
+		limit := ch.RecordSizeLimit
+		if limit == 0 {
+			limit = 16385 // Default Firefox record size limit
+		}
+		return &FakeRecordSizeLimitExtension{Limit: limit}, nil
+
+	case extensionPreSharedKey: // 41 (0x0029) - Firefox for session resumption
+		// PSK extension is only added during session resumption when there's actual PSK data.
+		// Without session data, return nil to omit it from the handshake.
+		// The extension type in ExtensionOrder indicates Firefox supports PSK, but it's not
+		// included in the ClientHello unless there's a session to resume.
+		return nil, nil
+
+	case utlsExtensionPadding: // 21
+		return &UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle}, nil
+
+	case utlsExtensionECH: // 65037 (0xfe0d) - Encrypted Client Hello
+		// ECH GREASE extension - uses default cipher suite
+		return &GREASEEncryptedClientHelloExtension{
+			CandidatePayloadLens: []uint16{128, 160, 192, 224},
+		}, nil
+
+	default:
+		// Unknown extension type - skip it
+		return nil, nil
+	}
 }
 
 // buildExtensionsFromProfile builds extensions from explicit profile configuration.
@@ -630,6 +855,25 @@ func (fc *FingerprintController) buildExtension(entry ExtensionEntry) (TLSExtens
 
 	case utlsExtensionApplicationSettings:
 		return &ApplicationSettingsExtension{SupportedProtocols: ch.ALPNProtocols}, nil
+
+	case utlsExtensionApplicationSettingsNew: // 17613 (0x44cd) - Chrome 140+
+		return &ApplicationSettingsExtensionNew{SupportedProtocols: ch.ALPNProtocols}, nil
+
+	case fakeExtensionDelegatedCredentials: // 34 (0x0022) - Firefox
+		return &FakeDelegatedCredentialsExtension{
+			SupportedSignatureAlgorithms: ch.SignatureAlgorithms,
+		}, nil
+
+	case fakeRecordSizeLimit: // 28 (0x001c) - Firefox
+		limit := ch.RecordSizeLimit
+		if limit == 0 {
+			limit = 16385 // Default Firefox record size limit
+		}
+		return &FakeRecordSizeLimitExtension{Limit: limit}, nil
+
+	case extensionPreSharedKey: // 41 (0x0029) - Firefox session resumption
+		// PSK extension requires session data - omit when no session to resume
+		return nil, nil
 
 	case extensionRenegotiationInfo:
 		return &RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient}, nil

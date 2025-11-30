@@ -405,11 +405,13 @@ func (sfc *ServerFingerprintController) SelectALPN(clientProtocols []string) str
 	return SelectALPN(sfc.profile, clientProtocols)
 }
 
-// Profile returns the current server profile.
+// Profile returns a clone of the current server profile.
+// The returned profile is safe to read without synchronization.
+// Modifications to the returned profile do not affect the controller.
 func (sfc *ServerFingerprintController) Profile() *ServerProfile {
 	sfc.mu.RLock()
 	defer sfc.mu.RUnlock()
-	return sfc.profile
+	return sfc.profile.Clone()
 }
 
 // Hooks returns the hook chain for adding custom hooks.

@@ -221,13 +221,22 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 	}
 	h = h[4:] // strip four byte prefix
 
-	var paddingLen int
+	// Compute padding to hide server name length and align to 32-byte boundary.
+	// The padding consists of two parts:
+	// 1. Name padding: makes encoded size consistent regardless of actual server name length
+	// 2. Alignment padding: rounds up to nearest 32-byte boundary
+	var namePadding int
 	if inner.serverName != "" {
-		paddingLen = max(0, maxNameLength-len(inner.serverName))
+		namePadding = max(0, maxNameLength-len(inner.serverName))
 	} else {
-		paddingLen = maxNameLength + 9
+		namePadding = maxNameLength + 9
 	}
-	paddingLen = 31 - ((len(h) + paddingLen - 1) % 32)
+	// Calculate alignment padding: how many bytes to add to reach next 32-byte boundary
+	// after accounting for name padding
+	baseLen := len(h) + namePadding
+	alignPadding := (32 - (baseLen % 32)) % 32
+	// Total padding is the sum of name padding and alignment padding
+	paddingLen := namePadding + alignPadding
 
 	return append(h, make([]byte, paddingLen)...), nil
 }
@@ -389,7 +398,10 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 		return nil, errInvalidECHExt
 	}
 
-	if len(inner.supportedVersions) != 1 || (len(inner.supportedVersions) >= 1 && inner.supportedVersions[0] != VersionTLS13) {
+	// Inner ClientHello MUST offer exactly one version, and it MUST be TLS 1.3.
+	// The second condition is simplified: if len != 1, we fail; otherwise len == 1,
+	// so we can safely check supportedVersions[0] without the redundant length check.
+	if len(inner.supportedVersions) != 1 || inner.supportedVersions[0] != VersionTLS13 {
 		return nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
 	}
 
@@ -581,11 +593,20 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 
 	for _, echKey := range c.config.EncryptedClientHelloKeys {
 		skip, config, err := parseECHConfig(echKey.Config)
-		if err != nil || skip {
+		if err != nil {
 			c.sendAlert(alertInternalError)
 			return nil, nil, fmt.Errorf("tls: invalid EncryptedClientHelloKeys Config: %s", err)
 		}
 		if skip {
+			// Config version is not supported (not extensionEncryptedClientHello),
+			// skip to next config without error
+			continue
+		}
+		// Optimization: skip configs that don't match the client's configID.
+		// This avoids unnecessary cryptographic operations.
+		// Note: configID is only 1 byte, so we still do trial decryption
+		// for matching configs in case of misconfiguration.
+		if config.ConfigID != configID {
 			continue
 		}
 		echPriv, err := hpke.ParseHPKEPrivateKey(config.KemID, echKey.PrivateKey)
@@ -594,7 +615,9 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 			return nil, nil, fmt.Errorf("tls: invalid EncryptedClientHelloKeys PrivateKey: %s", err)
 		}
 		info := append([]byte("tls ech\x00"), echKey.Config...)
-		hpkeContext, err := hpke.SetupReceipient(hpke.DHKEM_X25519_HKDF_SHA256, echCiphersuite.KDFID, echCiphersuite.AEADID, echPriv, info, encap)
+		// Use config.KemID instead of hardcoded DHKEM_X25519_HKDF_SHA256
+		// to support configs with different KEM algorithms
+		hpkeContext, err := hpke.SetupReceipient(config.KemID, echCiphersuite.KDFID, echCiphersuite.AEADID, echPriv, info, encap)
 		if err != nil {
 			// attempt next trial decryption
 			continue

@@ -17,8 +17,6 @@ import (
 	"net"
 	"slices"
 	"strconv"
-
-	"golang.org/x/crypto/cryptobyte"
 )
 
 type ClientHelloBuildStatus int
@@ -573,15 +571,30 @@ func (uconn *UConn) SetRecordPaddingMode(mode string) {
 	}
 }
 
+// extensionsList returns the list of extension type IDs from the current Extensions.
+// This is used for ECH outer extensions compression.
 func (uconn *UConn) extensionsList() []uint16 {
-
-	outerExts := []uint16{}
+	outerExts := make([]uint16, 0, len(uconn.Extensions))
 	for _, ext := range uconn.Extensions {
-		buffer := cryptobyte.String(make([]byte, 2000))
-		ext.Read(buffer)
-		var extension uint16
-		buffer.ReadUint16(&extension)
-		outerExts = append(outerExts, extension)
+		// Allocate buffer for extension data
+		extLen := ext.Len()
+		if extLen < 2 {
+			// Extension too short to contain type ID, skip
+			continue
+		}
+		buffer := make([]byte, extLen)
+		n, err := ext.Read(buffer)
+		if err != nil && err != io.EOF {
+			// Skip extensions that fail to serialize
+			continue
+		}
+		if n < 2 {
+			// Not enough data read to extract extension type
+			continue
+		}
+		// Parse extension type from first 2 bytes (big-endian)
+		extType := uint16(buffer[0])<<8 | uint16(buffer[1])
+		outerExts = append(outerExts, extType)
 	}
 	return outerExts
 }
@@ -662,7 +675,9 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
-		uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
+		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			return fmt.Errorf("tls: failed to compute ECH extension: %w", err)
+		}
 
 		uconn.echCtx = ech
 		return nil

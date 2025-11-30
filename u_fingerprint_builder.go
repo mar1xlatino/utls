@@ -101,6 +101,7 @@ func (b *ProfileBuilder) AddCipherSuite(cipher uint16) *ProfileBuilder {
 }
 
 // AddCipherSuiteAt inserts a cipher suite at a specific position.
+// Negative positions count from the end (-1 = after last element).
 func (b *ProfileBuilder) AddCipherSuiteAt(cipher uint16, position int) *ProfileBuilder {
 	ciphers := b.profile.ClientHello.CipherSuites
 	if position < 0 {
@@ -111,18 +112,26 @@ func (b *ProfileBuilder) AddCipherSuiteAt(cipher uint16, position int) *ProfileB
 		return b
 	}
 
-	// Insert at position
-	ciphers = append(ciphers[:position], append([]uint16{cipher}, ciphers[position:]...)...)
-	b.profile.ClientHello.CipherSuites = ciphers
+	// Create a new slice to avoid corrupting the original backing array
+	// when there's extra capacity (Go append optimization can cause issues)
+	newCiphers := make([]uint16, len(ciphers)+1)
+	copy(newCiphers[:position], ciphers[:position])
+	newCiphers[position] = cipher
+	copy(newCiphers[position+1:], ciphers[position:])
+	b.profile.ClientHello.CipherSuites = newCiphers
 	return b
 }
 
-// RemoveCipherSuite removes a cipher suite.
+// RemoveCipherSuite removes the first occurrence of a cipher suite.
 func (b *ProfileBuilder) RemoveCipherSuite(cipher uint16) *ProfileBuilder {
 	ciphers := b.profile.ClientHello.CipherSuites
 	for i, c := range ciphers {
 		if c == cipher {
-			b.profile.ClientHello.CipherSuites = append(ciphers[:i], ciphers[i+1:]...)
+			// Create new slice to avoid corrupting the original backing array
+			newCiphers := make([]uint16, len(ciphers)-1)
+			copy(newCiphers[:i], ciphers[:i])
+			copy(newCiphers[i:], ciphers[i+1:])
+			b.profile.ClientHello.CipherSuites = newCiphers
 			return b
 		}
 	}
@@ -164,6 +173,7 @@ func (b *ProfileBuilder) AddExtension(ext uint16) *ProfileBuilder {
 }
 
 // AddExtensionAt inserts an extension at a specific position.
+// Negative positions count from the end (-1 = after last element).
 func (b *ProfileBuilder) AddExtensionAt(ext uint16, position int) *ProfileBuilder {
 	exts := b.profile.ClientHello.Extensions
 	if position < 0 {
@@ -174,18 +184,27 @@ func (b *ProfileBuilder) AddExtensionAt(ext uint16, position int) *ProfileBuilde
 		return b
 	}
 
+	// Create a new slice to avoid corrupting the original backing array
+	// when there's extra capacity (Go append optimization can cause issues)
 	entry := ExtensionEntry{Type: ext}
-	exts = append(exts[:position], append([]ExtensionEntry{entry}, exts[position:]...)...)
-	b.profile.ClientHello.Extensions = exts
+	newExts := make([]ExtensionEntry, len(exts)+1)
+	copy(newExts[:position], exts[:position])
+	newExts[position] = entry
+	copy(newExts[position+1:], exts[position:])
+	b.profile.ClientHello.Extensions = newExts
 	return b
 }
 
-// RemoveExtension removes an extension.
+// RemoveExtension removes the first occurrence of an extension.
 func (b *ProfileBuilder) RemoveExtension(ext uint16) *ProfileBuilder {
 	exts := b.profile.ClientHello.Extensions
 	for i, e := range exts {
 		if e.Type == ext {
-			b.profile.ClientHello.Extensions = append(exts[:i], exts[i+1:]...)
+			// Create new slice to avoid corrupting the original backing array
+			newExts := make([]ExtensionEntry, len(exts)-1)
+			copy(newExts[:i], exts[:i])
+			copy(newExts[i:], exts[i+1:])
+			b.profile.ClientHello.Extensions = newExts
 			return b
 		}
 	}
@@ -487,6 +506,9 @@ func (b *ProfileBuilder) Clone() *ProfileBuilder {
 }
 
 // Profile returns the current profile (without building/validating).
+// WARNING: This returns the internal profile directly, not a clone.
+// Modifications to the returned profile will affect the builder's state.
+// Use Build() or Clone().Profile() if you need an independent copy.
 func (b *ProfileBuilder) Profile() *FingerprintProfile {
 	return b.profile
 }

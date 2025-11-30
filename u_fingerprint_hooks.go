@@ -204,14 +204,22 @@ type HookChain struct {
 }
 
 // NewHookChain creates a new hook chain.
+// Nil hooks in the input are filtered out for consistency with Add().
 func NewHookChain(hooks ...*FingerprintHooks) *HookChain {
-	return &HookChain{hooks: hooks}
+	// Filter nil hooks to be consistent with Add() behavior
+	filtered := make([]*FingerprintHooks, 0, len(hooks))
+	for _, h := range hooks {
+		if h != nil {
+			filtered = append(filtered, h)
+		}
+	}
+	return &HookChain{hooks: filtered}
 }
 
 // Add adds a hook to the chain.
-// Nil hooks are ignored.
+// Nil hooks are ignored. Safe to call on nil receiver.
 func (c *HookChain) Add(hook *FingerprintHooks) {
-	if hook == nil {
+	if c == nil || hook == nil {
 		return
 	}
 	c.mu.Lock()
@@ -221,15 +229,21 @@ func (c *HookChain) Add(hook *FingerprintHooks) {
 
 // Remove removes a hook from the chain by pointer comparison.
 // Returns true if the hook was found and removed.
+// Order is preserved to maintain correct hook execution sequence.
+// Safe to call on nil receiver.
 func (c *HookChain) Remove(hook *FingerprintHooks) bool {
-	if hook == nil {
+	if c == nil || hook == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, h := range c.hooks {
 		if h == hook {
-			c.hooks = append(c.hooks[:i], c.hooks[i+1:]...)
+			// Preserve order: shift elements left instead of swap
+			// Clear the last element for garbage collection
+			copy(c.hooks[i:], c.hooks[i+1:])
+			c.hooks[len(c.hooks)-1] = nil // Clear reference for GC
+			c.hooks = c.hooks[:len(c.hooks)-1]
 			return true
 		}
 	}
@@ -237,21 +251,37 @@ func (c *HookChain) Remove(hook *FingerprintHooks) bool {
 }
 
 // Clear removes all hooks from the chain.
+// Safe to call on nil receiver.
 func (c *HookChain) Clear() {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Clear all references for garbage collection
+	for i := range c.hooks {
+		c.hooks[i] = nil
+	}
 	c.hooks = nil
 }
 
 // Len returns the number of hooks in the chain.
+// Safe to call on nil receiver (returns 0).
 func (c *HookChain) Len() int {
+	if c == nil {
+		return 0
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.hooks)
 }
 
 // getHooks returns a snapshot of hooks for safe iteration.
+// Safe to call on nil receiver (returns nil).
 func (c *HookChain) getHooks() []*FingerprintHooks {
+	if c == nil {
+		return nil
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	result := make([]*FingerprintHooks, len(c.hooks))

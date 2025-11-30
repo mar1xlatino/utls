@@ -61,7 +61,7 @@ var Yandex25Android = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, 17},
+			ExtensionPositions: []int{0, -1},
 		},
 	},
 

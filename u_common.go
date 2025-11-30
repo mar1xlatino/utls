@@ -724,14 +724,6 @@ func mapSlice[T any, U any](slice []T, transform func(T) U) []U {
 	return newSlice
 }
 
-func panicOnNil(caller string, params ...any) {
-	for i, p := range params {
-		if p == nil {
-			panic(fmt.Sprintf("tls: %s failed: the [%d] parameter is nil", caller, i))
-		}
-	}
-}
-
 func anyTrue[T any](slice []T, predicate func(i int, t *T) bool) bool {
 	for i := 0; i < len(slice); i++ {
 		if predicate(i, &slice[i]) {
@@ -748,12 +740,6 @@ func allTrue[T any](slice []T, predicate func(i int, t *T) bool) bool {
 		}
 	}
 	return true
-}
-
-func uAssert(condition bool, msg string) {
-	if !condition {
-		panic(msg)
-	}
 }
 
 func sliceEq[T comparable](sliceA []T, sliceB []T) bool {

@@ -7,7 +7,7 @@ package tls
 import (
 	"bytes"
 	"encoding/hex"
-	"io/ioutil"
+	"io"
 	"net"
 	"reflect"
 	"testing"
@@ -89,11 +89,11 @@ func checkUTLSExtensionsEquality(t *testing.T, expected, actual TLSExtension) {
 		t.Errorf("extension types length not equal\nexpected: %#v\ngot: %#v", expected, actual)
 	}
 
-	actualBytes, err := ioutil.ReadAll(actual)
+	actualBytes, err := io.ReadAll(actual)
 	if err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
-	expectedBytes, err := ioutil.ReadAll(expected)
+	expectedBytes, err := io.ReadAll(expected)
 	if err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}

@@ -542,9 +542,12 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader, paddingLen i
 			if paddingLen > 0 {
 				// Clamp padding to not exceed record limits
 				paddingLen = ClampPaddingToRecordLimit(len(payload), paddingLen)
-				// Append padding zeros (make() initializes to zeros)
-				padding := make([]byte, paddingLen)
-				record = append(record, padding...)
+				// Only allocate and append if clamping didn't reduce to zero
+				if paddingLen > 0 {
+					// Append padding zeros (make() initializes to zeros)
+					padding := make([]byte, paddingLen)
+					record = append(record, padding...)
+				}
 			}
 
 			n := len(payload) + 1 + paddingLen + c.Overhead()

@@ -11,6 +11,24 @@ import (
 	"testing"
 )
 
+// validTestProfile returns a FingerprintProfile with all required fields set.
+// This is used by tests that need a valid profile but are testing other functionality.
+func validTestProfile(id, browser string, version int) *FingerprintProfile {
+	return &FingerprintProfile{
+		ID:       id,
+		Browser:  browser,
+		Platform: "linux",
+		Version:  version,
+		ClientHello: ClientHelloConfig{
+			CipherSuites:        []uint16{TLS_AES_128_GCM_SHA256},
+			SupportedVersions:   []uint16{VersionTLS13},
+			SupportedGroups:     []CurveID{X25519},
+			SignatureAlgorithms: []SignatureScheme{ECDSAWithP256AndSHA256},
+			CompressionMethods:  []uint8{0},
+		},
+	}
+}
+
 // =============================================================================
 // NewProfileRegistry Tests
 // =============================================================================
@@ -34,14 +52,7 @@ func TestNewProfileRegistry_HasInitializedMap(t *testing.T) {
 	registry := NewProfileRegistry()
 
 	// Should be able to register without nil map panic
-	profile := &FingerprintProfile{
-		ID:      "test",
-		Browser: "test",
-		ClientHello: ClientHelloConfig{
-			CipherSuites:       []uint16{TLS_AES_128_GCM_SHA256},
-			CompressionMethods: []uint8{0},
-		},
-	}
+	profile := validTestProfile("test", "chrome", 100)
 
 	err := registry.Register(profile)
 	if err != nil {
@@ -56,14 +67,7 @@ func TestNewProfileRegistry_HasInitializedMap(t *testing.T) {
 // TestRegister_StoresProfile verifies that Register stores a profile.
 func TestRegister_StoresProfile(t *testing.T) {
 	registry := NewProfileRegistry()
-	profile := &FingerprintProfile{
-		ID:      "test_profile",
-		Browser: "chrome",
-		ClientHello: ClientHelloConfig{
-			CipherSuites:       []uint16{TLS_AES_128_GCM_SHA256},
-			CompressionMethods: []uint8{0},
-		},
-	}
+	profile := validTestProfile("test_profile", "chrome", 100)
 
 	err := registry.Register(profile)
 	if err != nil {

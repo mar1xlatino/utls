@@ -792,7 +792,6 @@ type TicketKey struct {
 }
 
 type TicketKeys []TicketKey
-type ticketKeys []ticketKey
 
 func TicketKeyFromBytes(b [32]byte) TicketKey {
 	// [uTLS]
@@ -816,14 +815,6 @@ func (TK TicketKey) ToPrivate() ticketKey {
 		hmacKey: TK.HmacKey,
 		created: TK.Created,
 	}
-}
-
-func (tks ticketKeys) ToPublic() []TicketKey {
-	var TKS []TicketKey
-	for _, ks := range tks {
-		TKS = append(TKS, ks.ToPublic())
-	}
-	return TKS
 }
 
 func (TKS TicketKeys) ToPrivate() []ticketKey {

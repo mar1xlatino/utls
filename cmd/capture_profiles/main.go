@@ -735,11 +735,6 @@ func calculateJA4Full(p *CapturedProfile) (ja4, ja4r, ja4o, ja4ro string) {
 	return
 }
 
-func calculateJA4(p *CapturedProfile) (ja4, ja4r string) {
-	ja4, ja4r, _, _ = calculateJA4Full(p)
-	return
-}
-
 func filterGREASE(values []uint16) []uint16 {
 	result := make([]uint16, 0, len(values))
 	for _, v := range values {
@@ -1132,12 +1127,6 @@ func formatIntSlice(values []int) string {
 		strs[i] = fmt.Sprintf("%d", v)
 	}
 	return "[]int{" + strings.Join(strs, ", ") + "}"
-}
-
-// parseUserAgent extracts comprehensive browser information from User-Agent string
-func parseUserAgent(ua string) (browser, version, platform string) {
-	info := parseUserAgentFull(ua)
-	return info.Browser, fmt.Sprintf("%d", info.Version), info.Platform
 }
 
 // parseUserAgentFull performs comprehensive User-Agent parsing

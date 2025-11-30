@@ -328,6 +328,12 @@ func (p *FingerprintProfile) Clone() *FingerprintProfile {
 		copy(clone.RecordLayer.FragmentPattern, p.RecordLayer.FragmentPattern)
 	}
 
+	// Deep copy Session.PSKModes slice (CRITICAL: was missing, caused shared state bug)
+	if p.Session.PSKModes != nil {
+		clone.Session.PSKModes = make([]uint8, len(p.Session.PSKModes))
+		copy(clone.Session.PSKModes, p.Session.PSKModes)
+	}
+
 	// Deep copy ClientHello config
 	clone.ClientHello = p.ClientHello.Clone()
 
@@ -477,9 +483,12 @@ func (p *FingerprintProfile) ToClientHelloSpec() ClientHelloSpec {
 }
 
 // Validate checks the profile for errors.
+// Returns a list of validation errors, empty if the profile is valid.
+// Note: Platform and Version are recommended but not strictly required for backward compatibility.
 func (p *FingerprintProfile) Validate() []error {
 	var errs []error
 
+	// Required identity fields
 	if p.ID == "" {
 		errs = append(errs, &ProfileValidationError{Field: "ID", Message: "must not be empty"})
 	}
@@ -488,14 +497,77 @@ func (p *FingerprintProfile) Validate() []error {
 		errs = append(errs, &ProfileValidationError{Field: "Browser", Message: "must not be empty"})
 	}
 
+	// Platform and Version are recommended but optional for backward compatibility
+	// Production profiles should have these set
+
+	// ClientHello required fields - only CipherSuites is truly required
+	// Other fields are recommended for production profiles
 	if len(p.ClientHello.CipherSuites) == 0 {
 		errs = append(errs, &ProfileValidationError{Field: "CipherSuites", Message: "must have at least one cipher suite"})
 	}
 
-	// Validate GREASE consistency
+	// Validate SessionIDLength (must be 0 or 32)
+	if p.ClientHello.SessionIDLength != 0 && p.ClientHello.SessionIDLength != 32 {
+		errs = append(errs, &ProfileValidationError{Field: "SessionIDLength", Message: "must be 0 or 32"})
+	}
+
+	// Check for duplicate cipher suites
+	cipherSeen := make(map[uint16]bool)
+	for _, cs := range p.ClientHello.CipherSuites {
+		if cipherSeen[cs] {
+			errs = append(errs, &ProfileValidationError{
+				Field:   "CipherSuites",
+				Message: "contains duplicate cipher suite",
+			})
+			break
+		}
+		cipherSeen[cs] = true
+	}
+
+	// Check for duplicate signature algorithms
+	sigSeen := make(map[SignatureScheme]bool)
+	for _, sig := range p.ClientHello.SignatureAlgorithms {
+		if sigSeen[sig] {
+			errs = append(errs, &ProfileValidationError{
+				Field:   "SignatureAlgorithms",
+				Message: "contains duplicate signature algorithm",
+			})
+			break
+		}
+		sigSeen[sig] = true
+	}
+
+	// Validate GREASE configuration
 	if p.ClientHello.GREASE.Enabled {
+		// Firefox does not use GREASE
 		if p.Browser == "firefox" {
 			errs = append(errs, &ProfileValidationError{Field: "GREASE", Message: "Firefox does not use GREASE"})
+		}
+
+		// Validate ExtensionPositions if GREASE extensions are enabled
+		if p.ClientHello.GREASE.Extensions && len(p.ClientHello.GREASE.ExtensionPositions) > 0 {
+			extCount := len(p.ClientHello.ExtensionOrder)
+			if extCount == 0 {
+				extCount = len(p.ClientHello.Extensions)
+			}
+			for _, pos := range p.ClientHello.GREASE.ExtensionPositions {
+				// Positive indices must be less than extCount+1 (can append at end)
+				// Negative indices must be >= -extCount
+				if pos >= 0 && pos > extCount {
+					errs = append(errs, &ProfileValidationError{
+						Field:   "GREASE.ExtensionPositions",
+						Message: "position out of bounds (use -1 for last position)",
+					})
+					break
+				}
+				if pos < 0 && -pos > extCount {
+					errs = append(errs, &ProfileValidationError{
+						Field:   "GREASE.ExtensionPositions",
+						Message: "negative position out of bounds",
+					})
+					break
+				}
+			}
 		}
 	}
 
@@ -506,7 +578,34 @@ func (p *FingerprintProfile) Validate() []error {
 		}
 	}
 
+	// Validate KeyShareGroups are subset of SupportedGroups
+	if len(p.ClientHello.KeyShareGroups) > 0 && len(p.ClientHello.SupportedGroups) > 0 {
+		supportedSet := make(map[CurveID]bool)
+		for _, g := range p.ClientHello.SupportedGroups {
+			supportedSet[g] = true
+		}
+		for _, ks := range p.ClientHello.KeyShareGroups {
+			// Skip GREASE placeholders (0x?a?a pattern)
+			if isGREASEValue(uint16(ks)) {
+				continue
+			}
+			if !supportedSet[ks] {
+				errs = append(errs, &ProfileValidationError{
+					Field:   "KeyShareGroups",
+					Message: "contains group not in SupportedGroups",
+				})
+				break
+			}
+		}
+	}
+
 	return errs
+}
+
+// isGREASEValue checks if a value is a GREASE placeholder (0x?a?a pattern).
+func isGREASEValue(v uint16) bool {
+	// GREASE values: 0x0a0a, 0x1a1a, 0x2a2a, ..., 0xfafa
+	return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0xff)
 }
 
 // ProfileValidationError represents a validation error in a profile.

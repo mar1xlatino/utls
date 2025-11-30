@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +68,32 @@ type FrozenGREASEValues struct {
 	PSKMode          uint16 // GREASE in PSK modes (rare)
 }
 
+// GreaseExtMarker1 and GreaseExtMarker2 are special marker values used in
+// FrozenExtensionOrder to distinguish the first and second GREASE extensions
+// after shuffle. This solves the bug where applyFrozenGREASE would assign
+// Extension1 to whichever GREASE extension appeared first in the shuffled
+// order, rather than the one that was originally first.
+//
+// These values must not conflict with any valid TLS extension type.
+// 0xFFFF and 0xFFFE are safe because:
+// 1. They are not valid GREASE values (GREASE uses 0x?a?a pattern)
+// 2. They are not assigned extension types (max assigned is ~65280)
+const (
+	GreaseExtMarker1 uint16 = 0xFFFF // Marker for first GREASE extension
+	GreaseExtMarker2 uint16 = 0xFFFE // Marker for second GREASE extension
+)
+
+// IsGreaseExtMarker returns true if the value is a GREASE extension marker.
+func IsGreaseExtMarker(v uint16) bool {
+	return v == GreaseExtMarker1 || v == GreaseExtMarker2
+}
+
+// maxGREASEDeduplicationAttempts limits the number of attempts to generate
+// unique GREASE values for Extension1 and Extension2. With 16 possible GREASE
+// values and 6.25% collision probability, 100 attempts is more than sufficient.
+// In practice, this loop almost never runs more than once or twice.
+const maxGREASEDeduplicationAttempts = 100
+
 // greaseValues is the set of valid GREASE values per RFC 8701.
 var greaseValues = []uint16{
 	0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a,
@@ -110,9 +137,20 @@ func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *Ses
 		// (see u_parrots.go lines 914-931 for the original deduplication logic)
 		ext1 := randomGREASE()
 		ext2 := randomGREASE()
-		// Regenerate ext2 if it collides with ext1 (6.25% probability)
-		for ext2 == ext1 {
+		// Regenerate ext2 if it collides with ext1 (6.25% probability per attempt)
+		// Use bounded loop to prevent infinite loop with pathological PRNG
+		for attempts := 0; ext2 == ext1 && attempts < maxGREASEDeduplicationAttempts; attempts++ {
 			ext2 = randomGREASE()
+		}
+		// If still colliding after max attempts (should never happen with proper PRNG),
+		// force a different value by picking the next GREASE value in sequence
+		if ext2 == ext1 {
+			for i, v := range greaseValues {
+				if v == ext1 {
+					ext2 = greaseValues[(i+1)%len(greaseValues)]
+					break
+				}
+			}
 		}
 
 		// Generate SupportedGroup GREASE
@@ -158,14 +196,21 @@ func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *Ses
 	return state
 }
 
+// sessionIDCounter is an atomic counter used as fallback entropy when rand.Read fails.
+// This ensures unique session IDs even in concurrent fallback scenarios.
+var sessionIDCounter uint64
+
 // generateSessionID creates a unique session identifier.
 // Returns a hex-encoded string to avoid issues with null bytes and non-printable characters.
 func generateSessionID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Fallback to timestamp-based ID if rand fails
+		// Fallback to timestamp + atomic counter if rand fails.
+		// Using atomic counter ensures uniqueness even in concurrent calls
+		// within the same nanosecond.
+		counter := atomic.AddUint64(&sessionIDCounter, 1)
 		binary.BigEndian.PutUint64(b[:8], uint64(time.Now().UnixNano()))
-		binary.BigEndian.PutUint64(b[8:], uint64(time.Now().UnixNano()+1))
+		binary.BigEndian.PutUint64(b[8:], counter)
 	}
 	return hex.EncodeToString(b[:])
 }
@@ -183,10 +228,31 @@ func shuffleExtensionOrder(extensions []ExtensionEntry, seed int64) []uint16 {
 
 // shuffleExtensionOrderFromTypes shuffles a list of extension types.
 // This variant takes []uint16 directly for built-in profiles that use ExtensionOrder.
+//
+// IMPORTANT: GREASE extension types are replaced with GreaseExtMarker1 and
+// GreaseExtMarker2 to preserve which GREASE extension was first/second in the
+// original order. After shuffling, applyFrozenGREASE uses these markers to
+// assign the correct frozen GREASE values.
 func shuffleExtensionOrderFromTypes(types []uint16, seed int64) []uint16 {
 	// Make a copy to avoid mutating the input
 	result := make([]uint16, len(types))
-	copy(result, types)
+
+	// Replace GREASE types with markers to track original positions
+	// This ensures correct GREASE value assignment after shuffle
+	greaseCount := 0
+	for i, extType := range types {
+		if isGREASEUint16(extType) {
+			// First GREASE becomes Marker1, second becomes Marker2
+			if greaseCount == 0 {
+				result[i] = GreaseExtMarker1
+			} else {
+				result[i] = GreaseExtMarker2
+			}
+			greaseCount++
+		} else {
+			result[i] = extType
+		}
+	}
 
 	// Chrome's shuffle excludes certain extensions that must be at fixed positions
 	// PSK extension must be last, GREASE extensions at specific positions
@@ -314,6 +380,70 @@ func (s *SessionFingerprintState) GetGREASEValue(position GREASEPosition) uint16
 		// to maintain session consistency
 		return s.FrozenGREASE.Extension1
 	}
+}
+
+// GetFrozenExtensionOrder returns a copy of the frozen extension order.
+// Returns nil if no frozen order is set.
+// The returned slice is safe to modify without affecting session state.
+func (s *SessionFingerprintState) GetFrozenExtensionOrder() []uint16 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.FrozenExtensionOrder == nil {
+		return nil
+	}
+
+	result := make([]uint16, len(s.FrozenExtensionOrder))
+	copy(result, s.FrozenExtensionOrder)
+	return result
+}
+
+// GetFrozenCipherOrder returns a copy of the frozen cipher order.
+// Returns nil if no frozen order is set.
+// The returned slice is safe to modify without affecting session state.
+func (s *SessionFingerprintState) GetFrozenCipherOrder() []uint16 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.FrozenCipherOrder == nil {
+		return nil
+	}
+
+	result := make([]uint16, len(s.FrozenCipherOrder))
+	copy(result, s.FrozenCipherOrder)
+	return result
+}
+
+// GetFrozenKeyShareGroups returns a copy of the frozen key share groups.
+// Returns nil if no frozen groups are set.
+// The returned slice is safe to modify without affecting session state.
+func (s *SessionFingerprintState) GetFrozenKeyShareGroups() []CurveID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.FrozenKeyShareGroups == nil {
+		return nil
+	}
+
+	result := make([]CurveID, len(s.FrozenKeyShareGroups))
+	copy(result, s.FrozenKeyShareGroups)
+	return result
+}
+
+// GetFrozenSigAlgOrder returns a copy of the frozen signature algorithm order.
+// Returns nil if no frozen order is set.
+// The returned slice is safe to modify without affecting session state.
+func (s *SessionFingerprintState) GetFrozenSigAlgOrder() []SignatureScheme {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.FrozenSigAlgOrder == nil {
+		return nil
+	}
+
+	result := make([]SignatureScheme, len(s.FrozenSigAlgOrder))
+	copy(result, s.FrozenSigAlgOrder)
+	return result
 }
 
 // GREASEPosition identifies where a GREASE value is used.
@@ -452,6 +582,9 @@ func NewSessionStateCache(maxSize int, maxAge time.Duration) *SessionStateCache 
 }
 
 // GetOrCreate returns existing session state or creates a new one.
+// Touch() is called on the returned state to track connection count:
+// - connectionCount == 1: First connection (new session)
+// - connectionCount > 1: Subsequent connections (reused session)
 func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfile) *SessionFingerprintState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -475,6 +608,12 @@ func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfi
 		return nil
 	}
 
+	// Touch the new state so connectionCount becomes 1
+	// This allows ApplyFingerprintProfile to distinguish:
+	// - connectionCount == 1: new session -> OnSessionStateCreated
+	// - connectionCount > 1: reused session -> OnSessionStateRestored
+	state.Touch()
+
 	// Evict oldest if at capacity
 	if len(c.cache) >= c.maxSize {
 		c.evictOldest()
@@ -485,14 +624,32 @@ func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfi
 }
 
 // Get returns session state for origin if it exists.
+// Returns nil if the entry doesn't exist or is expired.
+// Expired entries are lazily removed on the next write operation.
 func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	state, ok := c.cache[origin]
+	if !ok {
+		c.mu.RUnlock()
+		return nil
+	}
 
-	if state, ok := c.cache[origin]; ok {
-		if time.Since(state.CreatedAt) < c.maxAge {
-			return state
-		}
+	// Check if entry is still valid
+	if time.Since(state.CreatedAt) < c.maxAge {
+		c.mu.RUnlock()
+		return state
+	}
+
+	// Entry is expired - upgrade to write lock and remove it
+	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Re-check under write lock (another goroutine may have modified)
+	state, ok = c.cache[origin]
+	if ok && time.Since(state.CreatedAt) >= c.maxAge {
+		state.Clear()
+		delete(c.cache, origin)
 	}
 	return nil
 }
@@ -544,9 +701,13 @@ func (c *SessionStateCache) evictOldest() {
 	var oldestTime time.Time
 
 	for key, state := range c.cache {
-		if oldestKey == "" || state.LastUsed().Before(oldestTime) {
+		// Read LastUsed() once to avoid race condition where Touch() is called
+		// between the comparison and assignment. Although we hold c.mu, state.mu
+		// is released between calls to LastUsed(), allowing concurrent Touch().
+		stateLastUsed := state.LastUsed()
+		if oldestKey == "" || stateLastUsed.Before(oldestTime) {
 			oldestKey = key
-			oldestTime = state.LastUsed()
+			oldestTime = stateLastUsed
 		}
 	}
 

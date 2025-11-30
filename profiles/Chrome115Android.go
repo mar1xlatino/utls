@@ -61,7 +61,7 @@ var Chrome115Android = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, 16},
+			ExtensionPositions: []int{0, -1},
 		},
 	},
 

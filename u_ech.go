@@ -53,6 +53,7 @@ type GREASEEncryptedClientHelloExtension struct {
 	payload               []byte   // payload should be calculated ONCE and stored here, HRR will reuse this
 
 	initOnce sync.Once
+	initErr  error // stores initialization error to return on subsequent calls
 
 	UnimplementedECHExtension
 }
@@ -62,8 +63,8 @@ type GREASEECHExtension = GREASEEncryptedClientHelloExtension // alias
 // init initializes the GREASEEncryptedClientHelloExtension with random values if they are not set.
 //
 // Based on cloudflare/go's echGenerateGreaseExt()
+// Note: The error is stored in g.initErr so subsequent calls return the same error.
 func (g *GREASEEncryptedClientHelloExtension) init() error {
-	var initErr error
 	g.initOnce.Do(func() {
 		// Set the config_id field to a random byte.
 		//
@@ -74,7 +75,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			var b []byte = make([]byte, 1)
 			_, err := rand.Read(b[:])
 			if err != nil {
-				initErr = fmt.Errorf("error generating random byte for config_id: %w", err)
+				g.initErr = fmt.Errorf("error generating random byte for config_id: %w", err)
 				return
 			}
 			g.configId = b[0]
@@ -82,7 +83,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// randomly pick one from the list
 			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateConfigIds))))
 			if err != nil {
-				initErr = fmt.Errorf("error generating random index for config_id: %w", err)
+				g.initErr = fmt.Errorf("error generating random index for config_id: %w", err)
 				return
 			}
 			g.configId = g.CandidateConfigIds[rndIndex.Int64()]
@@ -98,14 +99,13 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// randomly pick one from the list
 			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateCipherSuites))))
 			if err != nil {
-				initErr = fmt.Errorf("error generating random index for cipher_suite: %w", err)
+				g.initErr = fmt.Errorf("error generating random index for cipher_suite: %w", err)
 				return
 			}
 			g.cipherSuite = HPKESymmetricCipherSuite{
 				g.CandidateCipherSuites[rndIndex.Int64()].KdfId,
 				g.CandidateCipherSuites[rndIndex.Int64()].AeadId,
 			}
-			// aead = hpke.AEAD(g.cipherSuite.AeadId)
 		}
 
 		if len(g.EncapsulatedKey) == 0 {
@@ -113,7 +113,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 
 			echPK, err := hpke.ParseHPKEPublicKey(uint16(kem), dummyX25519PublicKey)
 			if err != nil {
-				initErr = fmt.Errorf("tls: grease ech: failed to parse dummy public key: %w", err)
+				g.initErr = fmt.Errorf("tls: grease ech: failed to parse dummy public key: %w", err)
 				return
 			}
 			suite := echCipher{
@@ -122,7 +122,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			}
 			g.EncapsulatedKey, _, err = hpke.SetupSender(kem, suite.KDFID, suite.AEADID, echPK, []byte{})
 			if err != nil {
-				initErr = fmt.Errorf("tls: grease ech: failed to setup encapsulated key: %w", err)
+				g.initErr = fmt.Errorf("tls: grease ech: failed to setup encapsulated key: %w", err)
 				return
 			}
 		}
@@ -135,15 +135,15 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// randomly pick one from the list
 			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidatePayloadLens))))
 			if err != nil {
-				initErr = fmt.Errorf("error generating random index for payload length: %w", err)
+				g.initErr = fmt.Errorf("error generating random index for payload length: %w", err)
 				return
 			}
 
-			initErr = g.randomizePayload(g.CandidatePayloadLens[rndIndex.Int64()])
+			g.initErr = g.randomizePayload(g.CandidatePayloadLens[rndIndex.Int64()])
 		}
 	})
 
-	return initErr
+	return g.initErr
 }
 
 func (g *GREASEEncryptedClientHelloExtension) randomizePayload(encodedHelloInnerLen uint16) error {
@@ -168,21 +168,32 @@ func (g *GREASEEncryptedClientHelloExtension) writeToUConn(uconn *UConn) error {
 }
 
 // Len implements TLSExtension.
+// Note: If init() fails, this returns a minimal length. Callers should use Read()
+// which will properly return the error.
 func (g *GREASEEncryptedClientHelloExtension) Len() int {
-	g.init()
+	if err := g.init(); err != nil {
+		// Return minimal header length on error; Read() will return the actual error
+		return 4 // extension type (2) + length (2)
+	}
 	return 2 + 2 + 1 /* ClientHello Type */ + 4 /* CipherSuite */ + 1 /* Config ID */ + 2 + len(g.EncapsulatedKey) + 2 + len(g.payload)
 }
 
 // Read implements TLSExtension.
 func (g *GREASEEncryptedClientHelloExtension) Read(b []byte) (int, error) {
-	if len(b) < g.Len() {
+	// Check for initialization errors first
+	if err := g.init(); err != nil {
+		return 0, fmt.Errorf("tls: grease ech initialization failed: %w", err)
+	}
+
+	extLen := 2 + 2 + 1 + 4 + 1 + 2 + len(g.EncapsulatedKey) + 2 + len(g.payload)
+	if len(b) < extLen {
 		return 0, io.ErrShortBuffer
 	}
 
 	b[0] = byte(utlsExtensionECH >> 8)
 	b[1] = byte(utlsExtensionECH & 0xFF)
-	b[2] = byte((g.Len() - 4) >> 8)
-	b[3] = byte((g.Len() - 4) & 0xFF)
+	b[2] = byte((extLen - 4) >> 8)
+	b[3] = byte((extLen - 4) & 0xFF)
 	b[4] = OuterClientHello
 	b[5] = byte(g.cipherSuite.KdfId >> 8)
 	b[6] = byte(g.cipherSuite.KdfId & 0xFF)
@@ -196,7 +207,7 @@ func (g *GREASEEncryptedClientHelloExtension) Read(b []byte) (int, error) {
 	b[12+len(g.EncapsulatedKey)+1] = byte(len(g.payload) & 0xFF)
 	copy(b[12+len(g.EncapsulatedKey)+2:], g.payload)
 
-	return g.Len(), io.EOF
+	return extLen, io.EOF
 }
 
 // MarshalClientHello implements EncryptedClientHelloExtension.

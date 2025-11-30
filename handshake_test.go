@@ -494,7 +494,9 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 		}
 		if spec != nil {
 			ucli := UClient(c, clientConfig, HelloCustom)
-			if err = ucli.ApplyPreset(spec); err != nil {
+			if applyErr := ucli.ApplyPreset(spec); applyErr != nil {
+				errChan <- fmt.Errorf("client: ApplyPreset: %v", applyErr)
+				c.Close()
 				return
 			}
 			cli = ucli
@@ -502,9 +504,9 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 			cli = Client(c, clientConfig)
 		}
 		// [uTLS SECTION END]
-		err := cli.Handshake()
-		if err != nil {
-			errChan <- fmt.Errorf("client: %v", err)
+		hsErr := cli.Handshake()
+		if hsErr != nil {
+			errChan <- fmt.Errorf("client: %v", hsErr)
 			c.Close()
 			return
 		}

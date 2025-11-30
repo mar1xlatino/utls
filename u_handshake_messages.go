@@ -56,7 +56,6 @@ func (m *utlsCompressedCertificateMsg) unmarshal(data []byte) bool {
 type utlsEncryptedExtensionsMsgExtraFields struct {
 	applicationSettings          []byte
 	applicationSettingsCodepoint uint16
-	customExtension              []byte
 }
 
 func (m *encryptedExtensionsMsg) utlsUnmarshal(extension uint16, extData cryptobyte.String) bool {

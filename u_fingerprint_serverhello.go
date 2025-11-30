@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 )
 
 // ServerHelloBuilder constructs ServerHello messages with controlled JA4S fingerprint.
@@ -304,11 +305,6 @@ func isValidKeyShareGroupForServer(group CurveID) bool {
 	return false
 }
 
-// computeServerHelloFingerprint computes fingerprint from a ServerHello message.
-func computeServerHelloFingerprint(hello *serverHelloMsg) *ServerHelloFingerprint {
-	return computeServerHelloFingerprintWithOrder(hello, nil)
-}
-
 // computeServerHelloFingerprintWithOrder computes fingerprint with explicit extension order.
 func computeServerHelloFingerprintWithOrder(hello *serverHelloMsg, extOrder []uint16) *ServerHelloFingerprint {
 	fp := &ServerHelloFingerprint{}
@@ -368,20 +364,28 @@ func computeServerHelloFingerprintWithOrder(hello *serverHelloMsg, extOrder []ui
 	}
 
 	extCount := len(extensions)
-
-	// ALPN indicator
-	alpnChar := "00"
-	if hello.alpnProtocol == "h2" {
-		alpnChar = "h2"
-	} else if hello.alpnProtocol == "http/1.1" {
-		alpnChar = "h1"
-	} else if hello.alpnProtocol != "" {
-		alpnChar = "99" // other
+	if extCount > 99 {
+		extCount = 99
 	}
 
-	// Build JA4S_a: t{version}d{extcount}{alpn}
-	// Note: 'd' indicates TCP transport (vs 'q' for QUIC)
-	ja4sA := "t" + versionStr + "d" + string('0'+byte(extCount%10)) + alpnChar
+	// ALPN indicator: first and last character of protocol per JA4 spec
+	alpnChar := "00"
+	if len(hello.alpnProtocol) >= 1 {
+		first := hello.alpnProtocol[0]
+		last := hello.alpnProtocol[len(hello.alpnProtocol)-1]
+		if isAlphanumericByte(first) && isAlphanumericByte(last) {
+			alpnChar = string(first) + string(last)
+		} else {
+			// Non-alphanumeric: use hex per JA4 spec
+			firstHex := formatHexByte(first)
+			lastHex := formatHexByte(last)
+			alpnChar = string(firstHex[0]) + string(lastHex[1])
+		}
+	}
+
+	// Build JA4S_a: t{version}{extcount}{alpn}
+	// Format: protocol (t=TCP) + version (2 chars) + extension count (2 digits) + ALPN (2 chars)
+	ja4sA := fmt.Sprintf("t%s%02d%s", versionStr, extCount, alpnChar)
 
 	// JA4S_b: cipher suite in hex (4 chars)
 	ja4sB := formatCipherSuite(hello.cipherSuite)
@@ -437,6 +441,17 @@ func formatCipherSuite(suite uint16) string {
 		hex[(suite>>4)&0xf],
 		hex[suite&0xf],
 	})
+}
+
+// isAlphanumericByte returns true if byte is 0-9, A-Z, or a-z.
+func isAlphanumericByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// formatHexByte formats a byte as a 2-character hex string.
+func formatHexByte(b byte) string {
+	const hexChars = "0123456789abcdef"
+	return string([]byte{hexChars[b>>4], hexChars[b&0xf]})
 }
 
 // ServerHelloBuilderFromProfile creates a builder initialized from a profile ID.

@@ -740,18 +740,34 @@ func (p *ServerProfile) Clone() *ServerProfile {
 		copy(clone.ServerHello.SupportedVersions, p.ServerHello.SupportedVersions)
 	}
 
-	// Deep copy Certificate fields
+	// Deep copy Certificate fields including nested OID slices
 	if p.Certificate.Issuer.Fields != nil {
 		clone.Certificate.Issuer.Fields = make([]RDNField, len(p.Certificate.Issuer.Fields))
-		copy(clone.Certificate.Issuer.Fields, p.Certificate.Issuer.Fields)
+		for i, field := range p.Certificate.Issuer.Fields {
+			clone.Certificate.Issuer.Fields[i] = RDNField{
+				OID:   append([]int(nil), field.OID...), // Deep copy OID slice
+				Value: field.Value,
+			}
+		}
 	}
 	if p.Certificate.Subject.Fields != nil {
 		clone.Certificate.Subject.Fields = make([]RDNField, len(p.Certificate.Subject.Fields))
-		copy(clone.Certificate.Subject.Fields, p.Certificate.Subject.Fields)
+		for i, field := range p.Certificate.Subject.Fields {
+			clone.Certificate.Subject.Fields[i] = RDNField{
+				OID:   append([]int(nil), field.OID...), // Deep copy OID slice
+				Value: field.Value,
+			}
+		}
 	}
 	if p.Certificate.Extensions.Extensions != nil {
 		clone.Certificate.Extensions.Extensions = make([]CertExtensionDef, len(p.Certificate.Extensions.Extensions))
-		copy(clone.Certificate.Extensions.Extensions, p.Certificate.Extensions.Extensions)
+		for i, ext := range p.Certificate.Extensions.Extensions {
+			clone.Certificate.Extensions.Extensions[i] = CertExtensionDef{
+				OID:      append([]int(nil), ext.OID...), // Deep copy OID slice
+				Critical: ext.Critical,
+				Value:    ext.Value, // Note: Value is interface{}, deep copy depends on type
+			}
+		}
 	}
 
 	return &clone
