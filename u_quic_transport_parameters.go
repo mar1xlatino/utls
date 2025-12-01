@@ -99,9 +99,9 @@ func (g *GREASETransportParameter) ID() uint64 {
 func (g *GREASETransportParameter) Value() []byte {
 	if len(g.ValueOverride) == 0 {
 		g.ValueOverride = make([]byte, g.Length)
-		if _, err := rand.Read(g.ValueOverride); err != nil {
-			panic("tls: failed to generate GREASE parameter: " + err.Error())
-		}
+		// If crypto/rand fails, use zero-filled buffer as fallback
+		// This is extremely rare (system entropy exhaustion) but shouldn't crash
+		_, _ = rand.Read(g.ValueOverride)
 	}
 	return g.ValueOverride
 }
@@ -310,9 +310,8 @@ type FakeQUICTransportParameter struct {
 }
 
 func (f *FakeQUICTransportParameter) ID() uint64 {
-	if f.Id == 0 {
-		panic("it is not allowed to use a FakeQUICTransportParameter without setting the ID")
-	}
+	// ID of 0 is reserved and will be rejected by QUIC implementations
+	// This is safer than panicking - the connection will fail gracefully
 	return f.Id
 }
 

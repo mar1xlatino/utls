@@ -40,15 +40,6 @@ func (r *ProfileRegistry) Get(id string) (*FingerprintProfile, error) {
 	return profile.Clone(), nil
 }
 
-// MustGet retrieves a profile, panics if not found.
-func (r *ProfileRegistry) MustGet(id string) *FingerprintProfile {
-	profile, err := r.Get(id)
-	if err != nil {
-		panic(err)
-	}
-	return profile
-}
-
 // Register adds a new profile to the registry.
 func (r *ProfileRegistry) Register(profile *FingerprintProfile) error {
 	if profile == nil {

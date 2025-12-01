@@ -151,7 +151,11 @@ func (g *GREASEEncryptedClientHelloExtension) randomizePayload(encodedHelloInner
 		return errors.New("tls: grease ech: regenerating payload is forbidden")
 	}
 
-	g.payload = make([]byte, cipherLen(g.cipherSuite.AeadId, int(encodedHelloInnerLen)))
+	payloadLen := cipherLen(g.cipherSuite.AeadId, int(encodedHelloInnerLen))
+	if payloadLen < 0 {
+		return errors.New("tls: grease ech: invalid AEAD identifier")
+	}
+	g.payload = make([]byte, payloadLen)
 	_, err := rand.Read(g.payload)
 	if err != nil {
 		return fmt.Errorf("tls: generating grease ech payload: %w", err)
@@ -280,6 +284,9 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	// and must not exceed reasonable bounds to prevent memory exhaustion.
 	const maxPayloadLen = 16384 // 16KB is sufficient for any realistic ECH payload
 	cipherOverhead := cipherLen(g.cipherSuite.AeadId, 0)
+	if cipherOverhead < 0 {
+		return fullLen, errors.New("tls: invalid AEAD identifier")
+	}
 	if len(ignored) == 0 {
 		return fullLen, errors.New("tls: empty ECH payload")
 	}
@@ -326,7 +333,7 @@ func (*UnimplementedECHExtension) MarshalClientHello(*UConn) error {
 // mustEmbedUnimplementedECHExtension is a noop function but is required to
 // ensure forward compatibility.
 func (*UnimplementedECHExtension) mustEmbedUnimplementedECHExtension() {
-	panic("mustEmbedUnimplementedECHExtension() is not implemented")
+	// No-op: exists only for interface embedding and forward compatibility
 }
 
 // BoringGREASEECH returns a GREASE scheme BoringSSL uses by default.

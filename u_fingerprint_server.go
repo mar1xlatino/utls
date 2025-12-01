@@ -707,9 +707,10 @@ func SelectALPN(profile *ServerProfile, clientProtocols []string) string {
 }
 
 // Clone creates a deep copy of the server profile.
+// Returns empty profile if receiver is nil (never returns nil).
 func (p *ServerProfile) Clone() *ServerProfile {
 	if p == nil {
-		return nil
+		return &ServerProfile{}
 	}
 
 	clone := *p

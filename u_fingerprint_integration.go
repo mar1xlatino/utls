@@ -204,7 +204,7 @@ func (fc *FingerprintController) getOrigin(uconn *UConn) string {
 // which does NOT include GREASE. We must prepend our frozen GREASE value if the profile
 // specifies GREASE should be in supported_versions.
 func (fc *FingerprintController) applyFrozenGREASE(uconn *UConn) {
-	if fc.sessionState == nil || !fc.profile.ClientHello.GREASE.Enabled {
+	if fc.sessionState == nil || fc.profile == nil || !fc.profile.ClientHello.GREASE.Enabled {
 		return
 	}
 
@@ -438,13 +438,16 @@ func (fc *FingerprintController) buildExtensions() ([]TLSExtension, error) {
 // This is used when profile specifies extension ORDER but not explicit extension data.
 // Extension data is generated from profile fields (SupportedGroups, ALPNProtocols, etc.)
 func (fc *FingerprintController) buildExtensionsFromOrder() ([]TLSExtension, error) {
+	if fc.profile == nil {
+		return nil, errors.New("tls: profile not set")
+	}
 	ch := &fc.profile.ClientHello
 	var extensions []TLSExtension
 
 	// Use frozen extension order if available (for shuffle consistency)
 	// Otherwise use the profile's ExtensionOrder directly
 	var extOrder []uint16
-	if len(fc.sessionState.FrozenExtensionOrder) > 0 {
+	if fc.sessionState != nil && len(fc.sessionState.FrozenExtensionOrder) > 0 {
 		extOrder = fc.sessionState.FrozenExtensionOrder
 	} else {
 		extOrder = ch.ExtensionOrder
@@ -966,8 +969,9 @@ func (fc *FingerprintController) Validator() *FingerprintValidator {
 }
 
 // AddHook adds a fingerprint hook to the controller.
-func (fc *FingerprintController) AddHook(hook *FingerprintHooks) {
-	fc.hooks.Add(hook)
+// Returns error if hook chain is at capacity.
+func (fc *FingerprintController) AddHook(hook *FingerprintHooks) error {
+	return fc.hooks.Add(hook)
 }
 
 // ValidateClientHello validates a ClientHello against the expected fingerprint.

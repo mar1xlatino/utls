@@ -15,11 +15,21 @@ import (
 // =============================================================================
 
 // TestNewSessionFingerprintState_NilProfile verifies that passing nil profile
-// returns nil without panic. This is critical for defensive programming.
+// returns a valid state with empty profile ID (never returns nil).
+// This prevents nil pointer dereferences in callers.
 func TestNewSessionFingerprintState_NilProfile(t *testing.T) {
 	state := NewSessionFingerprintState(nil, "example.com:443")
-	if state != nil {
-		t.Errorf("NewSessionFingerprintState(nil, origin) should return nil, got %+v", state)
+	if state == nil {
+		t.Fatal("NewSessionFingerprintState(nil, origin) should return valid state, got nil")
+	}
+	if state.ProfileID != "" {
+		t.Errorf("ProfileID should be empty for nil profile, got %q", state.ProfileID)
+	}
+	if state.Origin != "example.com:443" {
+		t.Errorf("Origin should be set, got %q", state.Origin)
+	}
+	if state.ID == "" {
+		t.Error("ID should be generated even for nil profile")
 	}
 }
 

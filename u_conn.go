@@ -60,6 +60,9 @@ type UConn struct {
 	// rawServerHello stores the raw ServerHello bytes for JA4S calculation.
 	// Captured during handshake when serverHello is received.
 	rawServerHello []byte
+
+	// earlyData tracks 0-RTT early data state for this connection.
+	earlyData *EarlyDataState
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
@@ -422,7 +425,8 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")
 	}
 	if c.handshakeErr != nil && c.isHandshakeComplete.Load() {
-		panic("tls: internal error: handshake returned an error but is marked successful")
+		// Internal inconsistency - reset completion flag and preserve the error
+		c.isHandshakeComplete.Store(false)
 	}
 
 	if c.quic != nil {
@@ -569,6 +573,157 @@ func (uconn *UConn) SetRecordPaddingMode(mode string) {
 		// Unknown mode, use Chrome as default
 		uconn.config.RecordPadding = DefaultRecordPaddingConfig()
 	}
+}
+
+// GreaseSeed returns a copy of the GREASE seed array.
+// Used for frozen GREASE restoration in session consistency.
+// The array indices correspond to ssl_grease_cipher (0), ssl_grease_group (1),
+// ssl_grease_extension1 (2), ssl_grease_extension2 (3), ssl_grease_version (4).
+// Note: Array size is 5 elements (indices 0-4).
+func (uconn *UConn) GreaseSeed() [ssl_grease_last_index]uint16 {
+	return uconn.greaseSeed
+}
+
+// SetGreaseSeedAt sets a specific GREASE seed value by index.
+// Valid indices: ssl_grease_cipher (0), ssl_grease_group (1),
+// ssl_grease_extension1 (2), ssl_grease_extension2 (3),
+// ssl_grease_version (4).
+// Note: ssl_grease_ticket_extension (5) is NOT a valid index - the array
+// has only 5 elements (indices 0-4). Returns error if index is out of bounds.
+func (uconn *UConn) SetGreaseSeedAt(index int, value uint16) error {
+	if index < 0 || index >= ssl_grease_last_index {
+		return fmt.Errorf("invalid GREASE index: %d (valid range: 0-%d)", index, ssl_grease_last_index-1)
+	}
+	uconn.greaseSeed[index] = value
+	return nil
+}
+
+// SetGreaseSeedFromFrozen applies frozen GREASE values for session consistency.
+// This ensures that GREASE values remain consistent across multiple connections
+// within the same session, which is critical for fingerprint stability.
+// The high byte of each frozen value is used as the seed, which is then
+// transformed by GetBoringGREASEValue to produce the actual GREASE value.
+func (uconn *UConn) SetGreaseSeedFromFrozen(frozen *FrozenGREASEValues) {
+	if frozen == nil {
+		return
+	}
+	// Extract high byte from each frozen value to use as seed
+	// GetBoringGREASEValue will transform: seed & 0xf0 | 0x0a, then duplicate
+	uconn.greaseSeed[ssl_grease_cipher] = frozen.CipherSuite >> 8
+	uconn.greaseSeed[ssl_grease_group] = frozen.SupportedGroup >> 8
+	uconn.greaseSeed[ssl_grease_extension1] = frozen.Extension1 >> 8
+	uconn.greaseSeed[ssl_grease_extension2] = frozen.Extension2 >> 8
+	uconn.greaseSeed[ssl_grease_version] = frozen.SupportedVersion >> 8
+	// Note: KeyShare uses same value as SupportedGroup per Chrome behavior
+	// SignatureAlgo and PSKMode are not in standard greaseSeed array
+}
+
+// RawServerHello returns captured ServerHello bytes for JA4S calculation.
+// Returns nil if ServerHello hasn't been received yet.
+// The returned slice is a copy to prevent modification of internal state.
+func (uconn *UConn) RawServerHello() []byte {
+	if uconn.rawServerHello == nil {
+		return nil
+	}
+	// Return copy to prevent modification
+	result := make([]byte, len(uconn.rawServerHello))
+	copy(result, uconn.rawServerHello)
+	return result
+}
+
+// SetRawServerHello stores raw ServerHello bytes.
+// This is primarily used for testing and ServerHello replay scenarios.
+func (uconn *UConn) SetRawServerHello(raw []byte) {
+	if raw == nil {
+		uconn.rawServerHello = nil
+		return
+	}
+	uconn.rawServerHello = make([]byte, len(raw))
+	copy(uconn.rawServerHello, raw)
+}
+
+// Note: ClearRawServerHello is defined in u_fingerprint.go
+
+// ExtensionTypes returns ordered list of extension type IDs from current Extensions.
+// This is the public accessor for extensionsList(), used for fingerprint calculation
+// and ECH outer extension compression.
+func (uconn *UConn) ExtensionTypes() []uint16 {
+	return uconn.extensionsList()
+}
+
+// CertCompressionAlgs returns the advertised certificate compression algorithms.
+// Returns nil if no compression algorithms were advertised.
+// The returned slice is a copy to prevent modification of internal state.
+func (uconn *UConn) CertCompressionAlgs() []CertCompressionAlgo {
+	if uconn.certCompressionAlgs == nil {
+		return nil
+	}
+	result := make([]CertCompressionAlgo, len(uconn.certCompressionAlgs))
+	copy(result, uconn.certCompressionAlgs)
+	return result
+}
+
+// SetCertCompressionAlgs sets the certificate compression algorithms to advertise.
+func (uconn *UConn) SetCertCompressionAlgs(algs []CertCompressionAlgo) {
+	if algs == nil {
+		uconn.certCompressionAlgs = nil
+		return
+	}
+	uconn.certCompressionAlgs = make([]CertCompressionAlgo, len(algs))
+	copy(uconn.certCompressionAlgs, algs)
+}
+
+// EchContextInfo provides read-only access to ECH context state.
+type EchContextInfo struct {
+	Enabled         bool   // Whether ECH is configured
+	ConfigID        uint8  // ECH config ID
+	KdfID           uint16 // KDF algorithm ID
+	AeadID          uint16 // AEAD algorithm ID
+	Rejected        bool   // Whether ECH was rejected by server
+	HasRetryConfigs bool   // Whether retry configs are available
+}
+
+// EchContext returns information about the ECH (Encrypted Client Hello) context.
+// Returns nil if ECH is not configured for this connection.
+// Thread-safety: Takes local copy to avoid TOCTOU race.
+func (uconn *UConn) EchContext() *EchContextInfo {
+	// Take local copy to avoid TOCTOU race
+	echCtx := uconn.echCtx
+	if echCtx == nil {
+		return nil
+	}
+	info := &EchContextInfo{
+		Enabled:  true,
+		KdfID:    echCtx.kdfID,
+		AeadID:   echCtx.aeadID,
+		Rejected: echCtx.echRejected,
+	}
+	// Take local copy of config to avoid race
+	config := echCtx.config
+	if config != nil {
+		info.ConfigID = config.ConfigID
+	}
+	info.HasRetryConfigs = len(echCtx.retryConfigs) > 0
+	return info
+}
+
+// EchRetryConfigs returns the ECH retry configs provided by the server.
+// Returns nil if ECH was not rejected or no retry configs were provided.
+// Thread-safety: Takes local copy to avoid TOCTOU race.
+func (uconn *UConn) EchRetryConfigs() []byte {
+	// Take local copy to avoid TOCTOU race
+	echCtx := uconn.echCtx
+	if echCtx == nil {
+		return nil
+	}
+	// Take local copy of slice header
+	retryConfigs := echCtx.retryConfigs
+	if len(retryConfigs) == 0 {
+		return nil
+	}
+	result := make([]byte, len(retryConfigs))
+	copy(result, retryConfigs)
+	return result
 }
 
 // extensionsList returns the list of extension type IDs from the current Extensions.

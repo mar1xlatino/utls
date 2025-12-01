@@ -24,12 +24,12 @@ var dummyX25519PublicKey = []byte{
 }
 
 // cipherLen returns the length of a ciphertext corresponding to a message of
-// length mLen.
+// length mLen. Returns -1 for invalid AEAD identifiers.
 func cipherLen(a uint16, mLen int) int {
 	switch a {
 	case hpke.AEAD_AES_128_GCM, hpke.AEAD_AES_256_GCM, hpke.AEAD_ChaCha20Poly1305:
 		return mLen + 16
 	default:
-		panic("hpke: invalid AEAD identifier")
+		return -1 // Invalid AEAD identifier
 	}
 }

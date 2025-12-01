@@ -304,9 +304,10 @@ type HTTP2FingerprintConfig struct {
 }
 
 // Clone creates a deep copy of the FingerprintProfile.
+// Returns empty profile if receiver is nil (never returns nil).
 func (p *FingerprintProfile) Clone() *FingerprintProfile {
 	if p == nil {
-		return nil
+		return &FingerprintProfile{}
 	}
 
 	clone := &FingerprintProfile{

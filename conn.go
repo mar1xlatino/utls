@@ -168,6 +168,14 @@ func (c *Conn) NetConn() net.Conn {
 	return c.conn
 }
 
+// ClientProtocol returns the negotiated ALPN protocol.
+// Returns empty string if ALPN was not used or handshake is not complete.
+// This is equivalent to ConnectionState().NegotiatedProtocol but can be
+// called without copying the full connection state.
+func (c *Conn) ClientProtocol() string {
+	return c.clientProtocol
+}
+
 // A halfConn represents one direction of the record layer
 // connection, either sending or receiving.
 type halfConn struct {

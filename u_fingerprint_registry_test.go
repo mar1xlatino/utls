@@ -335,41 +335,6 @@ func TestGet_ReturnsClone(t *testing.T) {
 }
 
 // =============================================================================
-// MustGet Tests
-// =============================================================================
-
-// TestMustGet_ReturnsProfile verifies that MustGet returns profile for valid ID.
-func TestMustGet_ReturnsProfile(t *testing.T) {
-	registry := NewProfileRegistry()
-	profile := &FingerprintProfile{
-		ID:      "must_get_test",
-		Browser: "chrome",
-		ClientHello: ClientHelloConfig{
-			CipherSuites:       []uint16{TLS_AES_128_GCM_SHA256},
-			CompressionMethods: []uint8{0},
-		},
-	}
-	_ = registry.Register(profile)
-
-	retrieved := registry.MustGet("must_get_test")
-	if retrieved == nil {
-		t.Error("MustGet returned nil")
-	}
-}
-
-// TestMustGet_PanicsForUnknown verifies that MustGet panics for unknown profiles.
-func TestMustGet_PanicsForUnknown(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("MustGet should panic for unknown profile")
-		}
-	}()
-
-	registry := NewProfileRegistry()
-	_ = registry.MustGet("nonexistent")
-}
-
-// =============================================================================
 // Unregister Tests
 // =============================================================================
 
@@ -1296,12 +1261,15 @@ func TestProfileClone_CreatesDeepCopy(t *testing.T) {
 	}
 }
 
-// TestProfileClone_NilReturnsNil verifies Clone of nil returns nil.
-func TestProfileClone_NilReturnsNil(t *testing.T) {
+// TestProfileClone_NilReturnsEmpty verifies Clone of nil returns empty profile (not nil).
+func TestProfileClone_NilReturnsEmpty(t *testing.T) {
 	var profile *FingerprintProfile = nil
 	clone := profile.Clone()
-	if clone != nil {
-		t.Error("Clone of nil should return nil")
+	if clone == nil {
+		t.Fatal("Clone of nil should return empty profile, not nil")
+	}
+	if clone.ID != "" {
+		t.Error("Clone of nil should have empty ID")
 	}
 }
 

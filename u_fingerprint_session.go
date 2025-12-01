@@ -114,83 +114,87 @@ func randomGREASE() uint16 {
 }
 
 // NewSessionFingerprintState creates a new session state from a profile.
-// Returns nil if profile is nil - callers must check the return value.
+// Always returns a valid state. If profile is nil, returns a state with empty profile ID.
 func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *SessionFingerprintState {
-	if profile == nil {
-		return nil
-	}
-
 	now := time.Now()
+
+	profileID := ""
+	if profile != nil {
+		profileID = profile.ID
+	}
 
 	state := &SessionFingerprintState{
 		ID:        generateSessionID(),
-		ProfileID: profile.ID,
+		ProfileID: profileID,
 		Origin:    origin,
 		CreatedAt: now,
 		lastUsed:  now,
 	}
 
-	// Generate frozen GREASE values
-	if profile.ClientHello.GREASE.Enabled {
-		// Generate Extension1 and Extension2 with deduplication
-		// Real Chrome/BoringSSL never has duplicate GREASE extension values
-		// (see u_parrots.go lines 914-931 for the original deduplication logic)
-		ext1 := randomGREASE()
-		ext2 := randomGREASE()
-		// Regenerate ext2 if it collides with ext1 (6.25% probability per attempt)
-		// Use bounded loop to prevent infinite loop with pathological PRNG
-		for attempts := 0; ext2 == ext1 && attempts < maxGREASEDeduplicationAttempts; attempts++ {
-			ext2 = randomGREASE()
-		}
-		// If still colliding after max attempts (should never happen with proper PRNG),
-		// force a different value by picking the next GREASE value in sequence
-		if ext2 == ext1 {
-			for i, v := range greaseValues {
-				if v == ext1 {
-					ext2 = greaseValues[(i+1)%len(greaseValues)]
-					break
+	// Only populate profile-dependent fields if profile is provided
+	if profile != nil {
+		// Generate frozen GREASE values
+		if profile.ClientHello.GREASE.Enabled {
+			// Generate Extension1 and Extension2 with deduplication
+			// Real Chrome/BoringSSL never has duplicate GREASE extension values
+			// (see u_parrots.go lines 914-931 for the original deduplication logic)
+			ext1 := randomGREASE()
+			ext2 := randomGREASE()
+			// Regenerate ext2 if it collides with ext1 (6.25% probability per attempt)
+			// Use bounded loop to prevent infinite loop with pathological PRNG
+			for attempts := 0; ext2 == ext1 && attempts < maxGREASEDeduplicationAttempts; attempts++ {
+				ext2 = randomGREASE()
+			}
+			// If still colliding after max attempts (should never happen with proper PRNG),
+			// force a different value by picking the next GREASE value in sequence
+			if ext2 == ext1 {
+				for i, v := range greaseValues {
+					if v == ext1 {
+						ext2 = greaseValues[(i+1)%len(greaseValues)]
+						break
+					}
 				}
+			}
+
+			// Generate SupportedGroup GREASE
+			// CRITICAL: Chrome/BoringSSL uses ssl_grease_group for BOTH supported_groups
+			// and key_share extensions. They MUST be the same value!
+			supportedGroup := randomGREASE()
+
+			state.FrozenGREASE = FrozenGREASEValues{
+				CipherSuite:      randomGREASE(),
+				Extension1:       ext1,
+				Extension2:       ext2,
+				SupportedGroup:   supportedGroup,
+				SupportedVersion: randomGREASE(),
+				KeyShare:         supportedGroup, // MUST match SupportedGroup per Chrome behavior
+				SignatureAlgo:    randomGREASE(),
+				PSKMode:          randomGREASE(),
 			}
 		}
 
-		// Generate SupportedGroup GREASE
-		// CRITICAL: Chrome/BoringSSL uses ssl_grease_group for BOTH supported_groups
-		// and key_share extensions. They MUST be the same value!
-		supportedGroup := randomGREASE()
-
-		state.FrozenGREASE = FrozenGREASEValues{
-			CipherSuite:      randomGREASE(),
-			Extension1:       ext1,
-			Extension2:       ext2,
-			SupportedGroup:   supportedGroup,
-			SupportedVersion: randomGREASE(),
-			KeyShare:         supportedGroup, // MUST match SupportedGroup per Chrome behavior
-			SignatureAlgo:    randomGREASE(),
-			PSKMode:          randomGREASE(),
+		// Freeze extension order if shuffling is enabled
+		if profile.ClientHello.ShuffleExtensions {
+			if len(profile.ClientHello.Extensions) > 0 {
+				// Use Extensions if available (has both type and data)
+				state.FrozenExtensionOrder = shuffleExtensionOrder(profile.ClientHello.Extensions, profile.ClientHello.ShuffleSeed)
+			} else if len(profile.ClientHello.ExtensionOrder) > 0 {
+				// Fall back to ExtensionOrder for built-in profiles
+				state.FrozenExtensionOrder = shuffleExtensionOrderFromTypes(profile.ClientHello.ExtensionOrder, profile.ClientHello.ShuffleSeed)
+			}
 		}
-	}
 
-	// Freeze extension order if shuffling is enabled
-	if profile.ClientHello.ShuffleExtensions {
-		if len(profile.ClientHello.Extensions) > 0 {
-			// Use Extensions if available (has both type and data)
-			state.FrozenExtensionOrder = shuffleExtensionOrder(profile.ClientHello.Extensions, profile.ClientHello.ShuffleSeed)
-		} else if len(profile.ClientHello.ExtensionOrder) > 0 {
-			// Fall back to ExtensionOrder for built-in profiles
-			state.FrozenExtensionOrder = shuffleExtensionOrderFromTypes(profile.ClientHello.ExtensionOrder, profile.ClientHello.ShuffleSeed)
+		// Copy key share groups order
+		if len(profile.ClientHello.KeyShareGroups) > 0 {
+			state.FrozenKeyShareGroups = make([]CurveID, len(profile.ClientHello.KeyShareGroups))
+			copy(state.FrozenKeyShareGroups, profile.ClientHello.KeyShareGroups)
 		}
-	}
 
-	// Copy key share groups order
-	if len(profile.ClientHello.KeyShareGroups) > 0 {
-		state.FrozenKeyShareGroups = make([]CurveID, len(profile.ClientHello.KeyShareGroups))
-		copy(state.FrozenKeyShareGroups, profile.ClientHello.KeyShareGroups)
-	}
-
-	// Copy signature algorithm order
-	if len(profile.ClientHello.SignatureAlgorithms) > 0 {
-		state.FrozenSigAlgOrder = make([]SignatureScheme, len(profile.ClientHello.SignatureAlgorithms))
-		copy(state.FrozenSigAlgOrder, profile.ClientHello.SignatureAlgorithms)
+		// Copy signature algorithm order
+		if len(profile.ClientHello.SignatureAlgorithms) > 0 {
+			state.FrozenSigAlgOrder = make([]SignatureScheme, len(profile.ClientHello.SignatureAlgorithms))
+			copy(state.FrozenSigAlgOrder, profile.ClientHello.SignatureAlgorithms)
+		}
 	}
 
 	return state
@@ -600,13 +604,8 @@ func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfi
 		delete(c.cache, origin)
 	}
 
-	// Create new state
+	// Create new state (always returns valid state, even if profile is nil)
 	state := NewSessionFingerprintState(profile, origin)
-
-	// Don't cache nil state (happens when profile is nil)
-	if state == nil {
-		return nil
-	}
 
 	// Touch the new state so connectionCount becomes 1
 	// This allows ApplyFingerprintProfile to distinguish:
@@ -647,10 +646,16 @@ func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
 
 	// Re-check under write lock (another goroutine may have modified)
 	state, ok = c.cache[origin]
-	if ok && time.Since(state.CreatedAt) >= c.maxAge {
-		state.Clear()
-		delete(c.cache, origin)
+	if !ok {
+		return nil
 	}
+	// Check again - entry may have been replaced with fresh one
+	if time.Since(state.CreatedAt) < c.maxAge {
+		return state
+	}
+	// Still expired, remove it
+	state.Clear()
+	delete(c.cache, origin)
 	return nil
 }
 
@@ -695,12 +700,21 @@ func (c *SessionStateCache) Clear() {
 }
 
 // evictOldest removes the oldest session state.
+// Also opportunistically removes expired entries to reduce memory pressure.
 // Must be called with lock held.
 func (c *SessionStateCache) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time
+	now := time.Now()
+	var expiredKeys []string
 
 	for key, state := range c.cache {
+		// Collect expired entries for removal
+		if now.Sub(state.CreatedAt) > c.maxAge {
+			expiredKeys = append(expiredKeys, key)
+			continue
+		}
+
 		// Read LastUsed() once to avoid race condition where Touch() is called
 		// between the comparison and assignment. Although we hold c.mu, state.mu
 		// is released between calls to LastUsed(), allowing concurrent Touch().
@@ -711,6 +725,20 @@ func (c *SessionStateCache) evictOldest() {
 		}
 	}
 
+	// Remove all expired entries first
+	for _, key := range expiredKeys {
+		if state, ok := c.cache[key]; ok {
+			state.Clear()
+		}
+		delete(c.cache, key)
+	}
+
+	// If we removed expired entries and are now under capacity, we're done
+	if len(expiredKeys) > 0 && len(c.cache) < c.maxSize {
+		return
+	}
+
+	// Otherwise remove the oldest valid entry
 	if oldestKey != "" {
 		if state, ok := c.cache[oldestKey]; ok {
 			state.Clear()

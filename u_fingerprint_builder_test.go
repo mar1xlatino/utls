@@ -1117,36 +1117,6 @@ func TestBuild_FailsValidation(t *testing.T) {
 	}
 }
 
-// TestMustBuild_Panics verifies MustBuild() panics on error.
-func TestMustBuild_Panics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("MustBuild() should panic on error")
-		}
-	}()
-
-	builder := NewEmptyProfileBuilder() // Missing required fields
-	_ = builder.MustBuild()
-}
-
-// TestMustBuild_Success verifies MustBuild() returns profile on success.
-func TestMustBuild_Success(t *testing.T) {
-	builder := NewEmptyProfileBuilder().
-		WithID("must_build_test").
-		WithBrowser("chrome").
-		WithPlatform("linux").
-		WithVersion(100).
-		WithCipherSuites([]uint16{TLS_AES_128_GCM_SHA256}).
-		WithSupportedVersions([]uint16{VersionTLS13}).
-		WithSupportedGroups([]CurveID{X25519}).
-		WithSignatureAlgorithms([]SignatureScheme{ECDSAWithP256AndSHA256})
-
-	profile := builder.MustBuild()
-	if profile == nil {
-		t.Error("MustBuild() returned nil")
-	}
-}
-
 // =============================================================================
 // Validate and Errors Tests
 // =============================================================================

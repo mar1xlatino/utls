@@ -5,10 +5,37 @@
 package tls
 
 import (
+	"crypto"
 	"crypto/x509"
+	"fmt"
 	"sync"
 	"time"
 )
+
+// ErrHookPanic wraps a panic that occurred in a hook callback.
+type ErrHookPanic struct {
+	Hook  string
+	Panic interface{}
+}
+
+func (e *ErrHookPanic) Error() string {
+	return fmt.Sprintf("tls: hook %s panicked: %v", e.Hook, e.Panic)
+}
+
+// SessionTicketData represents modifiable session ticket parameters.
+// Used by OnBeforeSessionTicketSend hook to customize ticket fields.
+type SessionTicketData struct {
+	// Lifetime is the ticket lifetime in seconds (default: 7 days).
+	Lifetime uint32
+	// AgeAdd is the obfuscated age addition value.
+	AgeAdd uint32
+	// Nonce is the ticket nonce (typically increments 0, 1 for 2 tickets).
+	Nonce []byte
+	// Label is the ticket label (encrypted ticket data).
+	Label []byte
+	// MaxEarlyData is the maximum early data size (0 to disable).
+	MaxEarlyData uint32
+}
 
 // FingerprintHooks allows external code to hook into fingerprint operations.
 // These hooks enable integrators to monitor, validate, and customize
@@ -97,6 +124,124 @@ type FingerprintHooks struct {
 
 	// OnValidationFailure is called when any validation fails.
 	OnValidationFailure func(what string, result *ValidationResult) error
+
+	// === SESSION ID HOOKS ===
+
+	// OnBeforeSessionIDGeneration is called before session ID is generated.
+	// Return non-nil []byte to use custom session ID (must be 32 bytes for TLS 1.3).
+	// Return nil to use default random generation.
+	OnBeforeSessionIDGeneration func(config *Config) []byte
+
+	// OnSessionIDGenerated is called after session ID is set.
+	OnSessionIDGenerated func(sessionID []byte)
+
+	// === CERTIFICATE GENERATION HOOKS ===
+
+	// OnBeforeCertificateGeneration is called before ephemeral cert creation.
+	// Modify template in-place to customize certificate fields.
+	OnBeforeCertificateGeneration func(template *x509.Certificate, hostname string)
+
+	// OnAfterCertificateGeneration is called after cert is created but before use.
+	// Return error to reject certificate and fail handshake.
+	OnAfterCertificateGeneration func(cert *x509.Certificate, privateKey crypto.PrivateKey) error
+
+	// OnBeforeCertificateSign is called before certificate is signed.
+	// Return custom signature bytes to override default signing.
+	// Return nil to use default signing.
+	OnBeforeCertificateSign func(cert *x509.Certificate, signatureAlgorithm x509.SignatureAlgorithm) []byte
+
+	// === SERVERHELLO BUILDER HOOKS ===
+
+	// OnBeforeServerHelloBuild is called before ServerHello is constructed.
+	// Modify builder in-place to customize ServerHello fields.
+	OnBeforeServerHelloBuild func(builder *ServerHelloBuilder, clientHello *ClientHelloInfo)
+
+	// OnServerHelloBuilt is called after ServerHello is built but before sending.
+	// Return modified bytes to replace ServerHello, or nil to use default.
+	OnServerHelloBuilt func(serverHello []byte) []byte
+
+	// OnBeforeServerHelloSend is called just before ServerHello is written.
+	// Last chance to inspect/log the exact bytes being sent.
+	OnBeforeServerHelloSend func(serverHello []byte)
+
+	// === EXTENSION HOOKS ===
+
+	// OnBeforeExtensionsBuild is called before extensions are marshaled.
+	// Modify extensions slice in-place to add/remove/reorder extensions.
+	OnBeforeExtensionsBuild func(extensions *[]TLSExtension, isClientHello bool)
+
+	// OnExtensionData allows injecting custom data into specific extension.
+	// Return nil to use default extension data.
+	OnExtensionData func(extType uint16, isClientHello bool) []byte
+
+	// === ALPN HOOKS ===
+
+	// OnBeforeALPNNegotiation is called before ALPN selection.
+	// Return selected protocol to override, or empty string for default.
+	OnBeforeALPNNegotiation func(clientProtocols []string, serverProtocols []string) string
+
+	// OnALPNNegotiated is called after ALPN is selected.
+	OnALPNNegotiated func(selectedProtocol string)
+
+	// === KEY GENERATION HOOKS ===
+
+	// OnBeforeKeyGeneration is called before ephemeral key generation.
+	// Return custom key pair to override, or nil for default generation.
+	OnBeforeKeyGeneration func(group CurveID) (publicKey, privateKey []byte)
+
+	// OnKeyGenerated is called after ephemeral key is generated.
+	OnKeyGenerated func(group CurveID, publicKey []byte)
+
+	// === HELLO RETRY REQUEST HOOKS ===
+
+	// OnBeforeHelloRetryRequest is called before HRR is sent.
+	// Modify fields to customize HRR. Return false to skip HRR.
+	OnBeforeHelloRetryRequest func(selectedGroup CurveID, cookie []byte) bool
+
+	// OnHelloRetryRequestSent is called after HRR is sent.
+	OnHelloRetryRequestSent func(hrrBytes []byte)
+
+	// OnClientHelloAfterHRR is called when second ClientHello is received.
+	OnClientHelloAfterHRR func(clientHello *ClientHelloInfo)
+
+	// === SESSION TICKET HOOKS ===
+
+	// OnBeforeSessionTicketSend is called before each session ticket is sent.
+	// Modify ticket data in-place. Return false to skip this ticket.
+	OnBeforeSessionTicketSend func(ticketNum int, ticketData *SessionTicketData) bool
+
+	// OnSessionTicketCount allows customizing number of tickets to send.
+	// Return -1 for default (usually 2 for browser mimicry).
+	OnSessionTicketCount func() int
+
+	// === AUTHENTICATION HOOKS ===
+
+	// OnAuthenticationData is called to get authentication data.
+	// Return auth data to embed in session ID or certificate.
+	OnAuthenticationData func(config *Config) []byte
+
+	// OnAuthenticationVerify is called to verify client authentication.
+	// Return nil error if authentication succeeds.
+	OnAuthenticationVerify func(authData []byte, expected []byte) error
+
+	// OnAuthenticationSuccess is called when authentication succeeds.
+	OnAuthenticationSuccess func(remoteAddr string, authData []byte)
+
+	// OnAuthenticationFailure is called when authentication fails.
+	OnAuthenticationFailure func(remoteAddr string, reason string)
+
+	// === EARLY DATA (0-RTT) HOOKS ===
+
+	// OnEarlyDataWrite is called before early data is encrypted.
+	// Return modified data or nil to use original.
+	OnEarlyDataWrite func(data []byte) []byte
+
+	// OnEarlyDataAccepted is called when server accepts 0-RTT.
+	OnEarlyDataAccepted func()
+
+	// OnEarlyDataRejected is called when server rejects 0-RTT.
+	// The buffered data that needs resending is provided.
+	OnEarlyDataRejected func(bufferedData []byte)
 }
 
 // DefaultHooks returns an empty hooks structure with no callbacks.
@@ -105,13 +250,14 @@ func DefaultHooks() *FingerprintHooks {
 }
 
 // Clone creates a shallow copy of the hooks structure.
+// Returns empty hooks if receiver is nil (never returns nil).
 // Note: Function callbacks are copied by reference, not cloned. If your
 // callbacks capture mutable state via closures, the clone and original
 // will share that state. This is intentional - function values cannot
 // be deep-copied in Go.
 func (h *FingerprintHooks) Clone() *FingerprintHooks {
 	if h == nil {
-		return nil
+		return &FingerprintHooks{}
 	}
 	clone := *h
 	return &clone
@@ -192,6 +338,104 @@ func (h *FingerprintHooks) Merge(other *FingerprintHooks) *FingerprintHooks {
 		merged.OnValidationFailure = other.OnValidationFailure
 	}
 
+	// Session ID hooks
+	if other.OnBeforeSessionIDGeneration != nil {
+		merged.OnBeforeSessionIDGeneration = other.OnBeforeSessionIDGeneration
+	}
+	if other.OnSessionIDGenerated != nil {
+		merged.OnSessionIDGenerated = other.OnSessionIDGenerated
+	}
+
+	// Certificate generation hooks
+	if other.OnBeforeCertificateGeneration != nil {
+		merged.OnBeforeCertificateGeneration = other.OnBeforeCertificateGeneration
+	}
+	if other.OnAfterCertificateGeneration != nil {
+		merged.OnAfterCertificateGeneration = other.OnAfterCertificateGeneration
+	}
+	if other.OnBeforeCertificateSign != nil {
+		merged.OnBeforeCertificateSign = other.OnBeforeCertificateSign
+	}
+
+	// ServerHello builder hooks
+	if other.OnBeforeServerHelloBuild != nil {
+		merged.OnBeforeServerHelloBuild = other.OnBeforeServerHelloBuild
+	}
+	if other.OnServerHelloBuilt != nil {
+		merged.OnServerHelloBuilt = other.OnServerHelloBuilt
+	}
+	if other.OnBeforeServerHelloSend != nil {
+		merged.OnBeforeServerHelloSend = other.OnBeforeServerHelloSend
+	}
+
+	// Extension hooks
+	if other.OnBeforeExtensionsBuild != nil {
+		merged.OnBeforeExtensionsBuild = other.OnBeforeExtensionsBuild
+	}
+	if other.OnExtensionData != nil {
+		merged.OnExtensionData = other.OnExtensionData
+	}
+
+	// ALPN hooks
+	if other.OnBeforeALPNNegotiation != nil {
+		merged.OnBeforeALPNNegotiation = other.OnBeforeALPNNegotiation
+	}
+	if other.OnALPNNegotiated != nil {
+		merged.OnALPNNegotiated = other.OnALPNNegotiated
+	}
+
+	// Key generation hooks
+	if other.OnBeforeKeyGeneration != nil {
+		merged.OnBeforeKeyGeneration = other.OnBeforeKeyGeneration
+	}
+	if other.OnKeyGenerated != nil {
+		merged.OnKeyGenerated = other.OnKeyGenerated
+	}
+
+	// HRR hooks
+	if other.OnBeforeHelloRetryRequest != nil {
+		merged.OnBeforeHelloRetryRequest = other.OnBeforeHelloRetryRequest
+	}
+	if other.OnHelloRetryRequestSent != nil {
+		merged.OnHelloRetryRequestSent = other.OnHelloRetryRequestSent
+	}
+	if other.OnClientHelloAfterHRR != nil {
+		merged.OnClientHelloAfterHRR = other.OnClientHelloAfterHRR
+	}
+
+	// Session ticket hooks
+	if other.OnBeforeSessionTicketSend != nil {
+		merged.OnBeforeSessionTicketSend = other.OnBeforeSessionTicketSend
+	}
+	if other.OnSessionTicketCount != nil {
+		merged.OnSessionTicketCount = other.OnSessionTicketCount
+	}
+
+	// Authentication hooks
+	if other.OnAuthenticationData != nil {
+		merged.OnAuthenticationData = other.OnAuthenticationData
+	}
+	if other.OnAuthenticationVerify != nil {
+		merged.OnAuthenticationVerify = other.OnAuthenticationVerify
+	}
+	if other.OnAuthenticationSuccess != nil {
+		merged.OnAuthenticationSuccess = other.OnAuthenticationSuccess
+	}
+	if other.OnAuthenticationFailure != nil {
+		merged.OnAuthenticationFailure = other.OnAuthenticationFailure
+	}
+
+	// Early data hooks
+	if other.OnEarlyDataWrite != nil {
+		merged.OnEarlyDataWrite = other.OnEarlyDataWrite
+	}
+	if other.OnEarlyDataAccepted != nil {
+		merged.OnEarlyDataAccepted = other.OnEarlyDataAccepted
+	}
+	if other.OnEarlyDataRejected != nil {
+		merged.OnEarlyDataRejected = other.OnEarlyDataRejected
+	}
+
 	return merged
 }
 
@@ -199,9 +443,16 @@ func (h *FingerprintHooks) Merge(other *FingerprintHooks) *FingerprintHooks {
 // The chained function calls each hook in order, stopping on error.
 // HookChain is thread-safe for concurrent Add and Call operations.
 type HookChain struct {
-	hooks []*FingerprintHooks
-	mu    sync.RWMutex
+	hooks    []*FingerprintHooks
+	mu       sync.RWMutex
+	maxHooks int // Maximum hooks allowed (0 = default 100)
 }
+
+// MaxHooksDefault is the default maximum number of hooks in a chain.
+const MaxHooksDefault = 100
+
+// ErrHookChainFull is returned when adding to a full hook chain.
+var ErrHookChainFull = fmt.Errorf("tls: hook chain capacity exceeded")
 
 // NewHookChain creates a new hook chain.
 // Nil hooks in the input are filtered out for consistency with Add().
@@ -218,13 +469,36 @@ func NewHookChain(hooks ...*FingerprintHooks) *HookChain {
 
 // Add adds a hook to the chain.
 // Nil hooks are ignored. Safe to call on nil receiver.
-func (c *HookChain) Add(hook *FingerprintHooks) {
+// Returns error if chain is at capacity.
+func (c *HookChain) Add(hook *FingerprintHooks) error {
 	if c == nil || hook == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Enforce capacity limit to prevent memory exhaustion
+	maxHooks := c.maxHooks
+	if maxHooks <= 0 {
+		maxHooks = MaxHooksDefault
+	}
+	if len(c.hooks) >= maxHooks {
+		return ErrHookChainFull
+	}
+
+	c.hooks = append(c.hooks, hook)
+	return nil
+}
+
+// SetMaxHooks sets the maximum number of hooks allowed.
+// Zero uses the default (100). Negative values are treated as unlimited.
+func (c *HookChain) SetMaxHooks(max int) {
+	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.hooks = append(c.hooks, hook)
+	c.maxHooks = max
 }
 
 // Remove removes a hook from the chain by pointer comparison.
@@ -290,7 +564,13 @@ func (c *HookChain) getHooks() []*FingerprintHooks {
 }
 
 // CallProfileSelected calls OnProfileSelected on all hooks.
-func (c *HookChain) CallProfileSelected(profile *FingerprintProfile) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallProfileSelected(profile *FingerprintProfile) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnProfileSelected", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnProfileSelected != nil {
 			if err := h.OnProfileSelected(profile); err != nil {
@@ -435,16 +715,26 @@ func (c *HookChain) CallCertificateValidation(result *ValidationResult) error {
 
 // CallBeforeWriteRecord calls OnBeforeWriteRecord on all hooks.
 // Returns the possibly modified data, padding amount, and any error.
-// The first hook that returns modified data or an error stops the chain.
-func (c *HookChain) CallBeforeWriteRecord(rt recordType, data []byte) ([]byte, int, error) {
+// The first hook that returns modified data, non-zero padding, or an error stops the chain.
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallBeforeWriteRecord(rt recordType, data []byte) (modData []byte, padding int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			modData, padding, err = nil, 0, &ErrHookPanic{Hook: "OnBeforeWriteRecord", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnBeforeWriteRecord != nil {
-			modData, padding, err := h.OnBeforeWriteRecord(rt, data)
-			if err != nil {
-				return nil, 0, err
+			md, p, e := h.OnBeforeWriteRecord(rt, data)
+			if e != nil {
+				return nil, 0, e
 			}
-			if modData != nil {
-				return modData, padding, nil
+			// Return if data modified OR padding requested (fix: don't lose padding)
+			if md != nil || p > 0 {
+				if md == nil {
+					md = data // Use original data with requested padding
+				}
+				return md, p, nil
 			}
 		}
 	}
@@ -547,6 +837,320 @@ func (c *HookChain) CallValidationFailure(what string, result *ValidationResult)
 	return nil
 }
 
+// === SESSION ID HOOKS ===
+
+// CallBeforeSessionIDGeneration calls OnBeforeSessionIDGeneration on all hooks.
+// Returns the first non-nil custom session ID, or nil for default.
+func (c *HookChain) CallBeforeSessionIDGeneration(config *Config) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeSessionIDGeneration != nil {
+			if id := h.OnBeforeSessionIDGeneration(config); id != nil {
+				return id
+			}
+		}
+	}
+	return nil
+}
+
+// CallSessionIDGenerated calls OnSessionIDGenerated on all hooks.
+func (c *HookChain) CallSessionIDGenerated(sessionID []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnSessionIDGenerated != nil {
+			h.OnSessionIDGenerated(sessionID)
+		}
+	}
+}
+
+// === CERTIFICATE GENERATION HOOKS ===
+
+// CallBeforeCertificateGeneration calls OnBeforeCertificateGeneration on all hooks.
+func (c *HookChain) CallBeforeCertificateGeneration(template *x509.Certificate, hostname string) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeCertificateGeneration != nil {
+			h.OnBeforeCertificateGeneration(template, hostname)
+		}
+	}
+}
+
+// CallAfterCertificateGeneration calls OnAfterCertificateGeneration on all hooks.
+func (c *HookChain) CallAfterCertificateGeneration(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnAfterCertificateGeneration != nil {
+			if err := h.OnAfterCertificateGeneration(cert, privateKey); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// CallBeforeCertificateSign calls OnBeforeCertificateSign on all hooks.
+// Returns the first non-nil custom signature, or nil for default signing.
+func (c *HookChain) CallBeforeCertificateSign(cert *x509.Certificate, sigAlgo x509.SignatureAlgorithm) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeCertificateSign != nil {
+			if sig := h.OnBeforeCertificateSign(cert, sigAlgo); sig != nil {
+				return sig
+			}
+		}
+	}
+	return nil
+}
+
+// === SERVERHELLO BUILDER HOOKS ===
+
+// CallBeforeServerHelloBuild calls OnBeforeServerHelloBuild on all hooks.
+func (c *HookChain) CallBeforeServerHelloBuild(builder *ServerHelloBuilder, clientHello *ClientHelloInfo) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeServerHelloBuild != nil {
+			h.OnBeforeServerHelloBuild(builder, clientHello)
+		}
+	}
+}
+
+// CallServerHelloBuilt calls OnServerHelloBuilt on all hooks.
+// Returns the first non-nil modified bytes, or nil to use default.
+func (c *HookChain) CallServerHelloBuilt(serverHello []byte) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnServerHelloBuilt != nil {
+			if modified := h.OnServerHelloBuilt(serverHello); modified != nil {
+				return modified
+			}
+		}
+	}
+	return nil
+}
+
+// CallBeforeServerHelloSend calls OnBeforeServerHelloSend on all hooks.
+func (c *HookChain) CallBeforeServerHelloSend(serverHello []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeServerHelloSend != nil {
+			h.OnBeforeServerHelloSend(serverHello)
+		}
+	}
+}
+
+// === EXTENSION HOOKS ===
+
+// CallBeforeExtensionsBuild calls OnBeforeExtensionsBuild on all hooks.
+func (c *HookChain) CallBeforeExtensionsBuild(extensions *[]TLSExtension, isClientHello bool) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeExtensionsBuild != nil {
+			h.OnBeforeExtensionsBuild(extensions, isClientHello)
+		}
+	}
+}
+
+// CallExtensionData calls OnExtensionData on all hooks.
+// Returns the first non-nil custom data, or nil for default.
+func (c *HookChain) CallExtensionData(extType uint16, isClientHello bool) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnExtensionData != nil {
+			if data := h.OnExtensionData(extType, isClientHello); data != nil {
+				return data
+			}
+		}
+	}
+	return nil
+}
+
+// === ALPN HOOKS ===
+
+// CallBeforeALPNNegotiation calls OnBeforeALPNNegotiation on all hooks.
+// Returns the first non-empty protocol override, or empty string for default.
+func (c *HookChain) CallBeforeALPNNegotiation(clientProtocols, serverProtocols []string) string {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeALPNNegotiation != nil {
+			if proto := h.OnBeforeALPNNegotiation(clientProtocols, serverProtocols); proto != "" {
+				return proto
+			}
+		}
+	}
+	return ""
+}
+
+// CallALPNNegotiated calls OnALPNNegotiated on all hooks.
+func (c *HookChain) CallALPNNegotiated(selectedProtocol string) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnALPNNegotiated != nil {
+			h.OnALPNNegotiated(selectedProtocol)
+		}
+	}
+}
+
+// === KEY GENERATION HOOKS ===
+
+// CallBeforeKeyGeneration calls OnBeforeKeyGeneration on all hooks.
+// Returns the first valid key pair (both non-nil), or (nil, nil) for default generation.
+// Security: Both public AND private key must be non-nil to be accepted.
+// Recovers from panics and returns (nil, nil) to allow default key generation.
+func (c *HookChain) CallBeforeKeyGeneration(group CurveID) (publicKey, privateKey []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			// On panic, return nil to use default key generation
+			publicKey, privateKey = nil, nil
+		}
+	}()
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeKeyGeneration != nil {
+			pub, priv := h.OnBeforeKeyGeneration(group)
+			// Security: Require BOTH keys to be non-nil to prevent crypto failures
+			if pub != nil && priv != nil {
+				return pub, priv
+			}
+		}
+	}
+	return nil, nil
+}
+
+// CallKeyGenerated calls OnKeyGenerated on all hooks.
+func (c *HookChain) CallKeyGenerated(group CurveID, publicKey []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnKeyGenerated != nil {
+			h.OnKeyGenerated(group, publicKey)
+		}
+	}
+}
+
+// === HRR HOOKS ===
+
+// CallBeforeHelloRetryRequest calls OnBeforeHelloRetryRequest on all hooks.
+// Returns false if any hook returns false (to skip HRR).
+func (c *HookChain) CallBeforeHelloRetryRequest(selectedGroup CurveID, cookie []byte) bool {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeHelloRetryRequest != nil {
+			if !h.OnBeforeHelloRetryRequest(selectedGroup, cookie) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CallHelloRetryRequestSent calls OnHelloRetryRequestSent on all hooks.
+func (c *HookChain) CallHelloRetryRequestSent(hrrBytes []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnHelloRetryRequestSent != nil {
+			h.OnHelloRetryRequestSent(hrrBytes)
+		}
+	}
+}
+
+// CallClientHelloAfterHRR calls OnClientHelloAfterHRR on all hooks.
+func (c *HookChain) CallClientHelloAfterHRR(clientHello *ClientHelloInfo) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnClientHelloAfterHRR != nil {
+			h.OnClientHelloAfterHRR(clientHello)
+		}
+	}
+}
+
+// === SESSION TICKET HOOKS ===
+
+// CallBeforeSessionTicketSend calls OnBeforeSessionTicketSend on all hooks.
+// Returns false if any hook returns false (to skip this ticket).
+func (c *HookChain) CallBeforeSessionTicketSend(ticketNum int, ticketData *SessionTicketData) bool {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnBeforeSessionTicketSend != nil {
+			if !h.OnBeforeSessionTicketSend(ticketNum, ticketData) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// CallSessionTicketCount calls OnSessionTicketCount on all hooks.
+// Returns the first non-negative count, or -1 for default.
+func (c *HookChain) CallSessionTicketCount() int {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnSessionTicketCount != nil {
+			if count := h.OnSessionTicketCount(); count >= 0 {
+				return count
+			}
+		}
+	}
+	return -1
+}
+
+// === AUTHENTICATION HOOKS ===
+
+// CallAuthenticationData calls OnAuthenticationData on all hooks.
+// Returns the first non-nil auth data, or nil.
+func (c *HookChain) CallAuthenticationData(config *Config) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnAuthenticationData != nil {
+			if data := h.OnAuthenticationData(config); data != nil {
+				return data
+			}
+		}
+	}
+	return nil
+}
+
+// CallAuthenticationVerify calls OnAuthenticationVerify on all hooks.
+func (c *HookChain) CallAuthenticationVerify(authData, expected []byte) error {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnAuthenticationVerify != nil {
+			if err := h.OnAuthenticationVerify(authData, expected); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// CallAuthenticationSuccess calls OnAuthenticationSuccess on all hooks.
+func (c *HookChain) CallAuthenticationSuccess(remoteAddr string, authData []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnAuthenticationSuccess != nil {
+			h.OnAuthenticationSuccess(remoteAddr, authData)
+		}
+	}
+}
+
+// CallAuthenticationFailure calls OnAuthenticationFailure on all hooks.
+func (c *HookChain) CallAuthenticationFailure(remoteAddr string, reason string) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnAuthenticationFailure != nil {
+			h.OnAuthenticationFailure(remoteAddr, reason)
+		}
+	}
+}
+
+// === EARLY DATA HOOKS ===
+
+// CallEarlyDataWrite calls OnEarlyDataWrite on all hooks.
+// Returns the first non-nil modified data, or nil to use original.
+func (c *HookChain) CallEarlyDataWrite(data []byte) []byte {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnEarlyDataWrite != nil {
+			if modified := h.OnEarlyDataWrite(data); modified != nil {
+				return modified
+			}
+		}
+	}
+	return nil
+}
+
+// CallEarlyDataAccepted calls OnEarlyDataAccepted on all hooks.
+func (c *HookChain) CallEarlyDataAccepted() {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnEarlyDataAccepted != nil {
+			h.OnEarlyDataAccepted()
+		}
+	}
+}
+
+// CallEarlyDataRejected calls OnEarlyDataRejected on all hooks.
+func (c *HookChain) CallEarlyDataRejected(bufferedData []byte) {
+	for _, h := range c.getHooks() {
+		if h != nil && h.OnEarlyDataRejected != nil {
+			h.OnEarlyDataRejected(bufferedData)
+		}
+	}
+}
+
 // FingerprintEventType represents different fingerprint events.
 type FingerprintEventType int
 
@@ -592,9 +1196,9 @@ func NewFingerprintMonitor(maxEvents int) *FingerprintMonitor {
 }
 
 // AddListener adds an event listener.
-// Nil listeners are ignored.
+// Nil listeners and nil receivers are ignored.
 func (m *FingerprintMonitor) AddListener(listener FingerprintEventListener) {
-	if listener == nil {
+	if m == nil || listener == nil {
 		return
 	}
 	m.mu.Lock()
@@ -602,8 +1206,11 @@ func (m *FingerprintMonitor) AddListener(listener FingerprintEventListener) {
 	m.listeners = append(m.listeners, listener)
 }
 
-// Emit emits an event.
+// Emit emits an event. Nil receiver is ignored.
 func (m *FingerprintMonitor) Emit(eventType FingerprintEventType, data interface{}) {
+	if m == nil {
+		return
+	}
 	event := FingerprintEvent{
 		Type:      eventType,
 		Timestamp: time.Now().UnixNano(),
@@ -611,9 +1218,13 @@ func (m *FingerprintMonitor) Emit(eventType FingerprintEventType, data interface
 	}
 
 	m.mu.Lock()
-	// Store event
+	// Store event with proper memory management
 	if len(m.events) >= m.maxEvents {
-		m.events = m.events[1:]
+		// Create new slice to avoid memory leak from reslicing
+		// Reslicing (m.events[1:]) keeps old backing array alive
+		newEvents := make([]FingerprintEvent, len(m.events)-1, m.maxEvents)
+		copy(newEvents, m.events[1:])
+		m.events = newEvents
 	}
 	m.events = append(m.events, event)
 
@@ -630,8 +1241,11 @@ func (m *FingerprintMonitor) Emit(eventType FingerprintEventType, data interface
 	}
 }
 
-// Events returns collected events.
+// Events returns collected events. Returns nil for nil receiver.
 func (m *FingerprintMonitor) Events() []FingerprintEvent {
+	if m == nil {
+		return nil
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	result := make([]FingerprintEvent, len(m.events))
@@ -639,8 +1253,11 @@ func (m *FingerprintMonitor) Events() []FingerprintEvent {
 	return result
 }
 
-// Clear clears collected events.
+// Clear clears collected events. Nil receiver is ignored.
 func (m *FingerprintMonitor) Clear() {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = nil
@@ -648,7 +1265,11 @@ func (m *FingerprintMonitor) Clear() {
 
 // ToHooks converts the monitor to FingerprintHooks.
 // All generated hooks handle nil inputs gracefully.
+// Returns empty hooks for nil receiver.
 func (m *FingerprintMonitor) ToHooks() *FingerprintHooks {
+	if m == nil {
+		return &FingerprintHooks{}
+	}
 	return &FingerprintHooks{
 		OnProfileSelected: func(profile *FingerprintProfile) error {
 			var id string
@@ -706,7 +1327,11 @@ func (m *FingerprintMonitor) ToHooks() *FingerprintHooks {
 
 // LoggingHooks returns hooks that log all events.
 // All hooks handle nil inputs gracefully.
+// Returns empty hooks if logFunc is nil.
 func LoggingHooks(logFunc func(format string, args ...interface{})) *FingerprintHooks {
+	if logFunc == nil {
+		return &FingerprintHooks{}
+	}
 	return &FingerprintHooks{
 		OnProfileSelected: func(profile *FingerprintProfile) error {
 			if profile == nil {

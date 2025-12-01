@@ -1634,12 +1634,15 @@ func TestServerProfile_Clone(t *testing.T) {
 	}
 }
 
-// TestServerProfile_CloneNil verifies nil clone handling.
+// TestServerProfile_CloneNil verifies nil clone returns empty profile (not nil).
 func TestServerProfile_CloneNil(t *testing.T) {
 	var p *ServerProfile
 	clone := p.Clone()
-	if clone != nil {
-		t.Error("Clone of nil should be nil")
+	if clone == nil {
+		t.Fatal("Clone of nil should return empty profile, not nil")
+	}
+	if clone.ID != "" {
+		t.Error("Clone of nil should have empty ID")
 	}
 }
 

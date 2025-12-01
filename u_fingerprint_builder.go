@@ -475,15 +475,6 @@ func (b *ProfileBuilder) Build() (*FingerprintProfile, error) {
 	return b.profile.Clone(), nil
 }
 
-// MustBuild creates the final profile, panics if invalid.
-func (b *ProfileBuilder) MustBuild() *FingerprintProfile {
-	profile, err := b.Build()
-	if err != nil {
-		panic(err)
-	}
-	return profile
-}
-
 // Validate checks for errors without building.
 func (b *ProfileBuilder) Validate() []error {
 	if len(b.errors) > 0 {

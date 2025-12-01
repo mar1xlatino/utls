@@ -67,6 +67,10 @@ type ServerFingerprintControllerOptions struct {
 
 	// AllowedClientFingerprints is a list of allowed JA4 patterns (if validation enabled)
 	AllowedClientFingerprints []string
+
+	// OnError is called when non-fatal errors occur (e.g., fingerprint analysis failures).
+	// If nil, errors are silently ignored.
+	OnError func(err error)
 }
 
 // DefaultServerFingerprintControllerOptions returns sensible defaults.
@@ -127,8 +131,10 @@ func (sfc *ServerFingerprintController) GetConfigForClient(chi *ClientHelloInfo)
 	// Analyze client fingerprint
 	clientFP, err := sfc.AnalyzeClientHello(chi)
 	if err != nil {
-		// Non-fatal: log but continue
-		_ = err
+		// Non-fatal: report via callback but continue
+		if sfc.opts.OnError != nil {
+			sfc.opts.OnError(err)
+		}
 	}
 
 	// Validate client fingerprint if enabled
@@ -420,8 +426,9 @@ func (sfc *ServerFingerprintController) Hooks() *HookChain {
 }
 
 // AddHook adds a fingerprint hook to the controller.
-func (sfc *ServerFingerprintController) AddHook(hook *FingerprintHooks) {
-	sfc.hooks.Add(hook)
+// Returns error if hook chain is at capacity.
+func (sfc *ServerFingerprintController) AddHook(hook *FingerprintHooks) error {
+	return sfc.hooks.Add(hook)
 }
 
 // Stats returns server fingerprint statistics.
