@@ -61,7 +61,7 @@ var Safari18Ios = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, 14},
+			ExtensionPositions: []int{0, -1},
 		},
 	},
 
