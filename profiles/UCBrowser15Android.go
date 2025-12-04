@@ -61,7 +61,7 @@ var UCBrowser15Android = &tls.FingerprintProfile{
 			SupportedGroups:    true,
 			SupportedVersions:  true,
 			KeyShare:           true,
-			ExtensionPositions: []int{0, -1},
+			ExtensionPositions: []int{0, 17},
 		},
 	},
 
