@@ -238,7 +238,7 @@ func (hc *halfConn) changeCipherSpec() error {
 	return nil
 }
 
-func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) {
+func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) error {
 	// Zero the old traffic secret before replacing it to minimize
 	// the window where it could be extracted from memory.
 	if hc.trafficSecret != nil {
@@ -246,7 +246,10 @@ func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncrypti
 	}
 	hc.trafficSecret = secret
 	hc.level = level
-	key, iv := suite.trafficKey(secret)
+	key, iv, err := suite.trafficKey(secret)
+	if err != nil {
+		return err
+	}
 	hc.cipher = suite.aead(key, iv)
 	// Zero the derived key and IV after AEAD construction.
 	// Note: AEAD implementations typically copy these internally.
@@ -255,21 +258,27 @@ func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncrypti
 	for i := range hc.seq {
 		hc.seq[i] = 0
 	}
+	return nil
 }
 
+// errSequenceOverflow is returned when TLS sequence number would wrap around.
+// This indicates the connection has processed 2^64 records and must be closed.
+var errSequenceOverflow = errors.New("tls: sequence number overflow")
+
 // incSeq increments the sequence number.
-func (hc *halfConn) incSeq() {
+// Returns an error if the sequence number would overflow.
+func (hc *halfConn) incSeq() error {
 	for i := 7; i >= 0; i-- {
 		hc.seq[i]++
 		if hc.seq[i] != 0 {
-			return
+			return nil
 		}
 	}
 
 	// Not allowed to let sequence number wrap.
 	// Instead, must renegotiate before it does.
-	// Not likely enough to bother.
-	panic("TLS: sequence number wraparound")
+	// Return error instead of panic for graceful handling.
+	return errSequenceOverflow
 }
 
 // explicitNonceLen returns the number of bytes of explicit nonce or IV included
@@ -478,7 +487,9 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 		plaintext = payload[:n]
 	}
 
-	hc.incSeq()
+	if err := hc.incSeq(); err != nil {
+		return nil, 0, alertInternalError
+	}
 	return plaintext, typ, nil
 }
 
@@ -592,7 +603,9 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader, paddingLen i
 	n := len(record) - recordHeaderLen
 	record[3] = byte(n >> 8)
 	record[4] = byte(n)
-	hc.incSeq()
+	if err := hc.incSeq(); err != nil {
+		return nil, err
+	}
 
 	return record, nil
 }
@@ -925,13 +938,42 @@ const (
 //
 // In the interests of simplicity and determinism, this code does not attempt
 // to reset the record size once the connection is idle, however.
+//
+// [uTLS] This function also respects the negotiated record_size_limit (RFC 8449)
+// when the extension was negotiated. The limit applies to the inner plaintext.
 func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
+	// [uTLS] Determine the effective maximum plaintext based on record_size_limit.
+	// RFC 8449 Section 4: The limit is for the inner plaintext, which in TLS 1.3
+	// includes the content type byte. So for TLS 1.3, if limit is L, we can send
+	// L-1 bytes of actual application data (1 byte reserved for content type).
+	effectiveMax := maxPlaintext
+	if c.utls.negotiatedRecordSizeLimit > 0 {
+		// The negotiated limit is for inner plaintext (before encryption overhead).
+		// In TLS 1.3, this includes the 1-byte content type, so actual data is limit-1.
+		// In TLS 1.2, the limit applies directly to the plaintext.
+		limit := int(c.utls.negotiatedRecordSizeLimit)
+		if c.vers == VersionTLS13 {
+			// RFC 8449 Section 4: For TLS 1.3, the limit includes content type byte
+			effectiveMax = limit - 1
+		} else {
+			effectiveMax = limit
+		}
+		// Ensure we don't exceed the protocol maximum
+		if effectiveMax > maxPlaintext {
+			effectiveMax = maxPlaintext
+		}
+		// Ensure minimum reasonable size (RFC 8449 minimum is 64, minus content type = 63)
+		if effectiveMax < 63 {
+			effectiveMax = 63
+		}
+	}
+
 	if c.config.DynamicRecordSizingDisabled || typ != recordTypeApplicationData {
-		return maxPlaintext
+		return effectiveMax
 	}
 
 	if c.bytesSent.Load() >= recordSizeBoostThreshold {
-		return maxPlaintext
+		return effectiveMax
 	}
 
 	// Subtract TLS overheads to get the maximum payload size.
@@ -962,12 +1004,12 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 	// Atomically increment and get the previous value (Add returns new value).
 	pkt := c.packetsSent.Add(1) - 1
 	if pkt > 1000 {
-		return maxPlaintext // avoid overflow in multiply below
+		return effectiveMax // avoid overflow in multiply below
 	}
 
 	n := payloadBytes * int(pkt+1)
-	if n > maxPlaintext {
-		n = maxPlaintext
+	if n > effectiveMax {
+		n = effectiveMax
 	}
 	return n
 }
@@ -1054,7 +1096,10 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 		outBuf[3] = byte(m >> 8)
 		outBuf[4] = byte(m)
 
-		// [uTLS] Generate TLS 1.3 record padding if configured
+		// [uTLS] Generate TLS 1.3 record padding for fingerprint resistance.
+		// For UConn (uTLS), padding is ENABLED BY DEFAULT via uClient().
+		// For standard Conn, padding is disabled unless explicitly configured.
+		// Use config.RecordPadding = DisabledRecordPaddingConfig() to disable.
 		paddingLen := 0
 		if c.vers == VersionTLS13 && c.config.RecordPadding != nil {
 			paddingLen = c.config.RecordPadding.GeneratePadding()
@@ -1221,7 +1266,11 @@ func (c *Conn) unmarshalHandshakeMessage(data []byte, transcript transcriptHash)
 	data = append([]byte(nil), data...)
 
 	if !m.unmarshal(data) {
-		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		// RFC 8446 Section 6: decode_error - A message could not be decoded
+		// because some field was out of the specified range or the length of
+		// the message was incorrect. This includes duplicate extensions, invalid
+		// lengths, and malformed data structures.
+		return nil, c.in.setErrorLocked(c.sendAlert(alertDecodeError))
 	}
 
 	if transcript != nil {
@@ -1375,8 +1424,9 @@ func (c *Conn) handlePostHandshakeMessage() error {
 
 func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 	if c.quic != nil {
-		c.sendAlert(alertUnexpectedMessage)
-		return c.in.setErrorLocked(errors.New("tls: received unexpected key update message"))
+		// RFC 9001, Section 6: Key updates are not used in QUIC.
+		// Return the alert error so callers can properly check for it.
+		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
 
 	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)
@@ -1384,8 +1434,13 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 		return c.in.setErrorLocked(c.sendAlert(alertInternalError))
 	}
 
-	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
-	c.in.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
+	newSecret, err := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
+	if err != nil {
+		return c.in.setErrorLocked(c.sendAlert(alertInternalError))
+	}
+	if err := c.in.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret); err != nil {
+		return c.in.setErrorLocked(c.sendAlert(alertInternalError))
+	}
 
 	if keyUpdate.updateRequested {
 		c.out.Lock()
@@ -1398,13 +1453,21 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 		}
 		_, err = c.writeRecordLocked(recordTypeHandshake, msgBytes)
 		if err != nil {
-			// Surface the error at the next write.
+			// Surface the error at the next write and return it immediately.
+			// RFC 8446 Section 4.6.3: KeyUpdate failures must be reported to caller.
 			c.out.setErrorLocked(err)
-			return nil
+			return err
 		}
 
-		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
-		c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
+		newSecret, err := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
+		if err != nil {
+			c.out.setErrorLocked(err)
+			return err
+		}
+		if err := c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret); err != nil {
+			c.out.setErrorLocked(err)
+			return err
+		}
 	}
 
 	return nil
@@ -1513,8 +1576,34 @@ func (c *Conn) closeNotify() error {
 	defer c.out.Unlock()
 
 	if !c.closeNotifySent {
+		// [uTLS] Apply close_notify jitter for fingerprint resistance.
+		// Real browsers have variable timing/behavior when closing connections.
+		jitterCfg := c.config.CloseNotifyJitter
+		if jitterCfg != nil && jitterCfg.Enabled {
+			// Check if we should skip close_notify entirely (mimics browser abrupt close)
+			if jitterCfg.ShouldSkip() {
+				c.closeNotifySent = true
+				// No error - skipping is intentional behavior
+				c.closeNotifyErr = nil
+				return nil
+			}
+
+			// Apply random delay before sending close_notify
+			if delay := jitterCfg.GetDelay(); delay > 0 {
+				// Unlock while sleeping to avoid blocking other operations
+				c.out.Unlock()
+				time.Sleep(delay)
+				c.out.Lock()
+				// Re-check after sleeping in case another goroutine sent it
+				if c.closeNotifySent {
+					return c.closeNotifyErr
+				}
+			}
+		}
+
 		// Set a Write Deadline to prevent possibly blocking forever.
-		c.SetWriteDeadline(time.Now().Add(time.Second * 5))
+		// Use configurable timeout from Config, defaulting to 5 seconds. [uTLS]
+		c.SetWriteDeadline(time.Now().Add(c.config.closeNotifyTimeout()))
 		c.closeNotifyErr = c.sendAlertLocked(alertCloseNotify)
 		c.closeNotifySent = true
 		// Any subsequent writes will fail.
@@ -1733,6 +1822,9 @@ func (c *Conn) VerifyHostname(host string) error {
 	}
 	if len(c.verifiedChains) == 0 {
 		return errors.New("tls: handshake did not verify certificate chain")
+	}
+	if len(c.peerCertificates) == 0 {
+		return errors.New("tls: no peer certificates available")
 	}
 	return c.peerCertificates[0].VerifyHostname(host)
 }

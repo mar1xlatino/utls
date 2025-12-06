@@ -1447,7 +1447,7 @@ func TestHandshakeClientExportKeyingMaterial(t *testing.T) {
 		config: testConfig.Clone(),
 		validate: func(state ConnectionState) error {
 			if km, err := state.ExportKeyingMaterial("test", nil, 42); err != nil {
-				return fmt.Errorf("ExportKeyingMaterial failed: %v", err)
+				return fmt.Errorf("ExportKeyingMaterial failed: %w", err)
 			} else if len(km) != 42 {
 				return fmt.Errorf("Got %d bytes from ExportKeyingMaterial, wanted %d", len(km), 42)
 			}

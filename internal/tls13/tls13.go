@@ -7,28 +7,27 @@
 package tls13
 
 import (
-	fips140 "hash"
+	"errors"
+	"hash"
 
 	"github.com/refraction-networking/utls/internal/byteorder"
 	"github.com/refraction-networking/utls/internal/hkdf"
 )
+
+// ErrLabelTooLong is returned when the label or context passed to ExpandLabel
+// exceeds the maximum allowed length (255 bytes for "tls13 "+label, 255 bytes for context).
+var ErrLabelTooLong = errors.New("tls13: label or context too long")
 
 // We don't set the service indicator in this package but we delegate that to
 // the underlying functions because the TLS 1.3 KDF does not have a standard of
 // its own.
 
 // ExpandLabel implements HKDF-Expand-Label from RFC 8446, Section 7.1.
-func ExpandLabel[H fips140.Hash](hash func() H, secret []byte, label string, context []byte, length int) []byte {
+// Returns ErrLabelTooLong if the label (including "tls13 " prefix) or context
+// exceeds 255 bytes.
+func ExpandLabel[H hash.Hash](h func() H, secret []byte, label string, context []byte, length int) ([]byte, error) {
 	if len("tls13 ")+len(label) > 255 || len(context) > 255 {
-		// It should be impossible for this to panic: labels are fixed strings,
-		// and context is either a fixed-length computed hash, or parsed from a
-		// field which has the same length limitation.
-		//
-		// Another reasonable approach might be to return a randomized slice if
-		// we encounter an error, which would break the connection, but avoid
-		// panicking. This would perhaps be safer but significantly more
-		// confusing to users.
-		panic("tls13: label or context too long")
+		return nil, ErrLabelTooLong
 	}
 	hkdfLabel := make([]byte, 0, 2+1+len("tls13 ")+len(label)+1+len(context))
 	hkdfLabel = byteorder.BEAppendUint16(hkdfLabel, uint16(length))
@@ -37,21 +36,21 @@ func ExpandLabel[H fips140.Hash](hash func() H, secret []byte, label string, con
 	hkdfLabel = append(hkdfLabel, label...)
 	hkdfLabel = append(hkdfLabel, byte(len(context)))
 	hkdfLabel = append(hkdfLabel, context...)
-	return hkdf.Expand(hash, secret, string(hkdfLabel), length)
+	return hkdf.Expand(h, secret, string(hkdfLabel), length)
 }
 
-func extract[H fips140.Hash](hash func() H, newSecret, currentSecret []byte) []byte {
+func extract[H hash.Hash](h func() H, newSecret, currentSecret []byte) ([]byte, error) {
 	if newSecret == nil {
-		newSecret = make([]byte, hash().Size())
+		newSecret = make([]byte, h().Size())
 	}
-	return hkdf.Extract(hash, newSecret, currentSecret)
+	return hkdf.Extract(h, newSecret, currentSecret)
 }
 
-func deriveSecret[H fips140.Hash](hash func() H, secret []byte, label string, transcript fips140.Hash) []byte {
+func deriveSecret[H hash.Hash](h func() H, secret []byte, label string, transcript hash.Hash) ([]byte, error) {
 	if transcript == nil {
-		transcript = hash()
+		transcript = h()
 	}
-	return ExpandLabel(hash, secret, label, transcript.Sum(nil), transcript.Size())
+	return ExpandLabel(h, secret, label, transcript.Sum(nil), transcript.Size())
 }
 
 const (
@@ -68,107 +67,136 @@ const (
 
 type EarlySecret struct {
 	secret []byte
-	hash   func() fips140.Hash
+	hash   func() hash.Hash
 }
 
-func NewEarlySecret[H fips140.Hash](hash func() H, psk []byte) *EarlySecret {
-	return &EarlySecret{
-		secret: extract(hash, psk, nil),
-		hash:   func() fips140.Hash { return hash() },
+func NewEarlySecret[H hash.Hash](h func() H, psk []byte) (*EarlySecret, error) {
+	secret, err := extract(h, psk, nil)
+	if err != nil {
+		return nil, err
 	}
+	return &EarlySecret{
+		secret: secret,
+		hash:   func() hash.Hash { return h() },
+	}, nil
 }
 
-func (s *EarlySecret) ResumptionBinderKey() []byte {
+func (s *EarlySecret) ResumptionBinderKey() ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, resumptionBinderLabel, nil)
 }
 
 // ClientEarlyTrafficSecret derives the client_early_traffic_secret from the
 // early secret and the transcript up to the ClientHello.
-func (s *EarlySecret) ClientEarlyTrafficSecret(transcript fips140.Hash) []byte {
+func (s *EarlySecret) ClientEarlyTrafficSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, clientEarlyTrafficLabel, transcript)
 }
 
 type HandshakeSecret struct {
 	secret []byte
-	hash   func() fips140.Hash
+	hash   func() hash.Hash
 }
 
-func (s *EarlySecret) HandshakeSecret(sharedSecret []byte) *HandshakeSecret {
-	derived := deriveSecret(s.hash, s.secret, "derived", nil)
-	return &HandshakeSecret{
-		secret: extract(s.hash, sharedSecret, derived),
-		hash:   s.hash,
+func (s *EarlySecret) HandshakeSecret(sharedSecret []byte) (*HandshakeSecret, error) {
+	derived, err := deriveSecret(s.hash, s.secret, "derived", nil)
+	if err != nil {
+		return nil, err
 	}
+	secret, err := extract(s.hash, sharedSecret, derived)
+	if err != nil {
+		return nil, err
+	}
+	return &HandshakeSecret{
+		secret: secret,
+		hash:   s.hash,
+	}, nil
 }
 
 // ClientHandshakeTrafficSecret derives the client_handshake_traffic_secret from
 // the handshake secret and the transcript up to the ServerHello.
-func (s *HandshakeSecret) ClientHandshakeTrafficSecret(transcript fips140.Hash) []byte {
+func (s *HandshakeSecret) ClientHandshakeTrafficSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, clientHandshakeTrafficLabel, transcript)
 }
 
 // ServerHandshakeTrafficSecret derives the server_handshake_traffic_secret from
 // the handshake secret and the transcript up to the ServerHello.
-func (s *HandshakeSecret) ServerHandshakeTrafficSecret(transcript fips140.Hash) []byte {
+func (s *HandshakeSecret) ServerHandshakeTrafficSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, serverHandshakeTrafficLabel, transcript)
 }
 
 type MasterSecret struct {
 	secret []byte
-	hash   func() fips140.Hash
+	hash   func() hash.Hash
 }
 
-func (s *HandshakeSecret) MasterSecret() *MasterSecret {
-	derived := deriveSecret(s.hash, s.secret, "derived", nil)
-	return &MasterSecret{
-		secret: extract(s.hash, nil, derived),
-		hash:   s.hash,
+func (s *HandshakeSecret) MasterSecret() (*MasterSecret, error) {
+	derived, err := deriveSecret(s.hash, s.secret, "derived", nil)
+	if err != nil {
+		return nil, err
 	}
+	secret, err := extract(s.hash, nil, derived)
+	if err != nil {
+		return nil, err
+	}
+	return &MasterSecret{
+		secret: secret,
+		hash:   s.hash,
+	}, nil
 }
 
 // ClientApplicationTrafficSecret derives the client_application_traffic_secret_0
 // from the master secret and the transcript up to the server Finished.
-func (s *MasterSecret) ClientApplicationTrafficSecret(transcript fips140.Hash) []byte {
+func (s *MasterSecret) ClientApplicationTrafficSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, clientApplicationTrafficLabel, transcript)
 }
 
 // ServerApplicationTrafficSecret derives the server_application_traffic_secret_0
 // from the master secret and the transcript up to the server Finished.
-func (s *MasterSecret) ServerApplicationTrafficSecret(transcript fips140.Hash) []byte {
+func (s *MasterSecret) ServerApplicationTrafficSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, serverApplicationTrafficLabel, transcript)
 }
 
 // ResumptionMasterSecret derives the resumption_master_secret from the master secret
 // and the transcript up to the client Finished.
-func (s *MasterSecret) ResumptionMasterSecret(transcript fips140.Hash) []byte {
+func (s *MasterSecret) ResumptionMasterSecret(transcript hash.Hash) ([]byte, error) {
 	return deriveSecret(s.hash, s.secret, resumptionLabel, transcript)
 }
 
 type ExporterMasterSecret struct {
 	secret []byte
-	hash   func() fips140.Hash
+	hash   func() hash.Hash
 }
 
 // ExporterMasterSecret derives the exporter_master_secret from the master secret
 // and the transcript up to the server Finished.
-func (s *MasterSecret) ExporterMasterSecret(transcript fips140.Hash) *ExporterMasterSecret {
-	return &ExporterMasterSecret{
-		secret: deriveSecret(s.hash, s.secret, exporterLabel, transcript),
-		hash:   s.hash,
+func (s *MasterSecret) ExporterMasterSecret(transcript hash.Hash) (*ExporterMasterSecret, error) {
+	secret, err := deriveSecret(s.hash, s.secret, exporterLabel, transcript)
+	if err != nil {
+		return nil, err
 	}
+	return &ExporterMasterSecret{
+		secret: secret,
+		hash:   s.hash,
+	}, nil
 }
 
 // EarlyExporterMasterSecret derives the exporter_master_secret from the early secret
 // and the transcript up to the ClientHello.
-func (s *EarlySecret) EarlyExporterMasterSecret(transcript fips140.Hash) *ExporterMasterSecret {
-	return &ExporterMasterSecret{
-		secret: deriveSecret(s.hash, s.secret, earlyExporterLabel, transcript),
-		hash:   s.hash,
+func (s *EarlySecret) EarlyExporterMasterSecret(transcript hash.Hash) (*ExporterMasterSecret, error) {
+	secret, err := deriveSecret(s.hash, s.secret, earlyExporterLabel, transcript)
+	if err != nil {
+		return nil, err
 	}
+	return &ExporterMasterSecret{
+		secret: secret,
+		hash:   s.hash,
+	}, nil
 }
 
-func (s *ExporterMasterSecret) Exporter(label string, context []byte, length int) []byte {
-	secret := deriveSecret(s.hash, s.secret, label, nil)
+func (s *ExporterMasterSecret) Exporter(label string, context []byte, length int) ([]byte, error) {
+	secret, err := deriveSecret(s.hash, s.secret, label, nil)
+	if err != nil {
+		return nil, err
+	}
 	h := s.hash()
 	h.Write(context)
 	return ExpandLabel(s.hash, secret, "exporter", h.Sum(nil), length)

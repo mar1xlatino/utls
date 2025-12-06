@@ -58,6 +58,7 @@
 		{"name": "psk_key_exchange_modes", "ke_modes": [
 			"psk_dhe_ke"
 		]},
+		{"name": "cookie"},
 		{"name": "supported_versions", "versions": [
 			"GREASE",
 			"TLS 1.3",

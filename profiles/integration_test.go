@@ -48,7 +48,10 @@ func TestCapturedProfilesIntegration(t *testing.T) {
 	for _, profileID := range testProfiles {
 		t.Run(profileID, func(t *testing.T) {
 			// Create UConn
-			uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			// Apply profile via FingerprintController
 			ctrl := tls.NewFingerprintController()
@@ -94,7 +97,10 @@ func TestProfilesExtensionOrder(t *testing.T) {
 	// Test Firefox (non-shuffling) profile
 	profileID := "firefox_145_linux"
 
-	uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "test.example.com"}, tls.HelloCustom)
+	uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "test.example.com"}, tls.HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := tls.NewFingerprintController()
 	if err := ctrl.ApplyProfile(uconn, profileID); err != nil {
@@ -136,7 +142,10 @@ func TestProfilesGREASEConfiguration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.profileID, func(t *testing.T) {
-			uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			ctrl := tls.NewFingerprintController()
 			if err := ctrl.ApplyProfile(uconn, tt.profileID); err != nil {
@@ -186,7 +195,10 @@ func TestProfilesSessionConsistency(t *testing.T) {
 	var firstGREASECipher uint16
 
 	for i := 0; i < 5; i++ {
-		uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: serverName}, tls.HelloCustom)
+		uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: serverName}, tls.HelloCustom)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient error: %v", i, err)
+		}
 
 		ctrl := tls.NewFingerprintController()
 		if err := ctrl.ApplyProfile(uconn, profileID); err != nil {
@@ -232,7 +244,10 @@ func TestProfilesSessionConsistency(t *testing.T) {
 func TestAllCapturedProfilesBuildSuccessfully(t *testing.T) {
 	for _, p := range profiles.All() {
 		t.Run(p.ID, func(t *testing.T) {
-			uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			ctrl := tls.NewFingerprintController()
 			if err := ctrl.ApplyProfile(uconn, p.ID); err != nil {
@@ -278,7 +293,10 @@ func TestProfilesMatchExpectedJA4Prefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.profileID, func(t *testing.T) {
-			uconn := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			ctrl := tls.NewFingerprintController()
 			if err := ctrl.ApplyProfile(uconn, tt.profileID); err != nil {

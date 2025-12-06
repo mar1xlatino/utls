@@ -21,7 +21,10 @@ import (
 // TestE2E_ChromeFingerprintApplication verifies that applying a Chrome profile
 // produces expected JA4 fingerprint characteristics.
 func TestE2E_ChromeFingerprintApplication(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_120)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_120)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -108,7 +111,10 @@ func TestE2E_SessionConsistency(t *testing.T) {
 	var firstJA4 string
 
 	for i := 0; i < iterations; i++ {
-		uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient error: %v", i, err)
+		}
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -165,7 +171,10 @@ func TestE2E_SessionConsistency(t *testing.T) {
 
 // TestE2E_GREASEFreezing verifies that GREASE values follow the 0x?a?a pattern.
 func TestE2E_GREASEFreezing(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "grease.example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "grease.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -355,7 +364,10 @@ func TestE2E_ValidationRoundTrip(t *testing.T) {
 		},
 	}
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "validation.example.com"}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "validation.example.com"}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.ApplyPreset(&spec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -398,6 +410,22 @@ func TestE2E_ValidationRoundTrip(t *testing.T) {
 // TestE2E_RecordPaddingIntegration verifies that record padding configuration
 // is correctly applied to connections.
 func TestE2E_RecordPaddingIntegration(t *testing.T) {
+	// Test that padding is ENABLED BY DEFAULT for UConn (security fix)
+	t.Run("default_enabled", func(t *testing.T) {
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("UClient error: %v", err)
+		}
+		// Padding should be enabled by default without calling SetRecordPaddingMode
+		if uconn.config.RecordPadding == nil {
+			t.Error("RecordPadding should be enabled by default for UConn")
+		} else if !uconn.config.RecordPadding.Enabled {
+			t.Error("RecordPadding.Enabled should be true by default")
+		} else if uconn.config.RecordPadding.Distribution != "chrome" {
+			t.Errorf("Default distribution should be 'chrome', got '%s'", uconn.config.RecordPadding.Distribution)
+		}
+	})
+
 	tests := []struct {
 		name string
 		mode string
@@ -410,15 +438,21 @@ func TestE2E_RecordPaddingIntegration(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			uconn := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
+			uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			// Apply padding mode
 			uconn.SetRecordPaddingMode(tc.mode)
 
 			// Verify configuration was set
 			if tc.mode == "none" {
-				if uconn.config.RecordPadding != nil {
-					t.Error("RecordPadding should be nil for 'none' mode")
+				// "none" mode uses DisabledRecordPaddingConfig() with Enabled=false
+				if uconn.config.RecordPadding == nil {
+					t.Error("RecordPadding should not be nil for 'none' mode (should be disabled config)")
+				} else if uconn.config.RecordPadding.Enabled {
+					t.Error("RecordPadding should be disabled for 'none' mode")
 				}
 			} else {
 				if uconn.config.RecordPadding == nil {
@@ -435,7 +469,10 @@ func TestE2E_RecordPaddingIntegration(t *testing.T) {
 
 // TestE2E_RecordPaddingConfig verifies custom record padding configuration.
 func TestE2E_RecordPaddingConfig(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	// Set custom padding config
 	customCfg := &RecordPaddingConfig{
@@ -532,10 +569,13 @@ func TestE2E_ErrorHandling_DuplicateRegistration(t *testing.T) {
 // TestE2E_ErrorHandling_FingerprintBeforeHandshake tests error when getting
 // fingerprint before building handshake state.
 func TestE2E_ErrorHandling_FingerprintBeforeHandshake(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	// Don't call BuildHandshakeState
 
-	_, err := uconn.Fingerprint()
+	_, err = uconn.Fingerprint()
 	if err == nil {
 		t.Error("Expected error when calling Fingerprint before BuildHandshakeState")
 	}
@@ -807,7 +847,10 @@ func TestE2E_BrowserFingerprintConsistency(t *testing.T) {
 			const iterations = 20
 
 			for i := 0; i < iterations; i++ {
-				uconn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, browser.id)
+				uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, browser.id)
+				if err != nil {
+					t.Fatalf("iteration %d: UClient error: %v", i, err)
+				}
 				if err := uconn.BuildHandshakeState(); err != nil {
 					t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 				}
@@ -840,12 +883,18 @@ func TestE2E_BrowserFingerprintConsistency(t *testing.T) {
 // TestE2E_FirefoxVsChromeCharacteristics verifies browser-specific characteristics.
 func TestE2E_FirefoxVsChromeCharacteristics(t *testing.T) {
 	// Chrome uses GREASE, Firefox doesn't
-	chromeConn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+	chromeConn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("Chrome UClient error: %v", err)
+	}
 	if err := chromeConn.BuildHandshakeState(); err != nil {
 		t.Fatalf("Chrome BuildHandshakeState failed: %v", err)
 	}
 
-	firefoxConn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloFirefox_145)
+	firefoxConn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloFirefox_145)
+	if err != nil {
+		t.Fatalf("Firefox UClient error: %v", err)
+	}
 	if err := firefoxConn.BuildHandshakeState(); err != nil {
 		t.Fatalf("Firefox BuildHandshakeState failed: %v", err)
 	}
@@ -923,7 +972,10 @@ func TestE2E_CustomSpecApplication(t *testing.T) {
 		},
 	}
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "custom.example.com"}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "custom.example.com"}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.ApplyPreset(&spec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -969,7 +1021,10 @@ func TestE2E_CustomSpecApplication(t *testing.T) {
 
 // TestE2E_JA3FormatVerification verifies JA3 string format correctness.
 func TestE2E_JA3FormatVerification(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "ja3.example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "ja3.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -1031,12 +1086,18 @@ func TestE2E_JA3FormatVerification(t *testing.T) {
 // TestE2E_JA4ComparisonUtility tests the JA4 comparison function.
 func TestE2E_JA4ComparisonUtility(t *testing.T) {
 	// Create two different connections
-	chrome := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+	chrome, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("Chrome UClient error: %v", err)
+	}
 	if err := chrome.BuildHandshakeState(); err != nil {
 		t.Fatalf("Chrome BuildHandshakeState failed: %v", err)
 	}
 
-	firefox := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloFirefox_145)
+	firefox, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloFirefox_145)
+	if err != nil {
+		t.Fatalf("Firefox UClient error: %v", err)
+	}
 	if err := firefox.BuildHandshakeState(); err != nil {
 		t.Fatalf("Firefox BuildHandshakeState failed: %v", err)
 	}
@@ -1260,7 +1321,10 @@ func TestE2E_SNIHandling(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			config := &Config{ServerName: tc.serverName, InsecureSkipVerify: true}
-			uconn := UClient(&net.TCPConn{}, config, HelloChrome_142)
+			uconn, err := UClient(&net.TCPConn{}, config, HelloChrome_142)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 			if tc.serverName == "" {
 				uconn.SetSNI("")
 			}
@@ -1567,7 +1631,10 @@ func TestE2E_FullProfileApplication(t *testing.T) {
 	}
 
 	// Step 5: Create connection with built-in Chrome profile and verify fingerprint
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "e2e.example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "e2e.example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}

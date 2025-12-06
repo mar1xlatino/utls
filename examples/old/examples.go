@@ -41,7 +41,10 @@ func HttpGetByHelloID(hostname string, addr string, helloID tls.ClientHelloID) (
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, &config, helloID)
+	uTlsConn, err := tls.UClient(dialConn, &config, helloID)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 
 	err = uTlsConn.Handshake()
@@ -59,7 +62,10 @@ func HttpGetConsistentRandomized(hostname string, addr string) (*http.Response, 
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(tcpConn, &config, tls.HelloRandomized)
+	uTlsConn, err := tls.UClient(tcpConn, &config, tls.HelloRandomized)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 	err = uTlsConn.Handshake()
 	if err != nil {
@@ -73,7 +79,10 @@ func HttpGetConsistentRandomized(hostname string, addr string) (*http.Response, 
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn2 := tls.UClient(tcpConn2, &config, uTlsConn.ClientHelloID)
+	uTlsConn2, err := tls.UClient(tcpConn2, &config, uTlsConn.ClientHelloID)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn2.Close()
 	err = uTlsConn2.Handshake()
 	if err != nil {
@@ -88,7 +97,10 @@ func HttpGetExplicitRandom(hostname string, addr string) (*http.Response, error)
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, nil, tls.HelloGolang)
+	uTlsConn, err := tls.UClient(dialConn, nil, tls.HelloGolang)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 
 	uTlsConn.SetSNI(hostname) // have to set SNI, if config was nil
@@ -122,7 +134,10 @@ func HttpGetTicket(hostname string, addr string) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, &config, tls.HelloGolang)
+	uTlsConn, err := tls.UClient(dialConn, &config, tls.HelloGolang)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 
 	err = uTlsConn.BuildHandshakeState()
@@ -162,7 +177,10 @@ func HttpGetTicketHelloID(hostname string, addr string, helloID tls.ClientHelloI
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, &config, helloID)
+	uTlsConn, err := tls.UClient(dialConn, &config, helloID)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 
 	masterSecret := make([]byte, 48)
@@ -192,7 +210,10 @@ func HttpGetCustom(hostname string, addr string) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, &config, tls.HelloCustom)
+	uTlsConn, err := tls.UClient(dialConn, &config, tls.HelloCustom)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	defer uTlsConn.Close()
 
 	// do not use this particular spec in production
@@ -230,7 +251,7 @@ func HttpGetCustom(hostname string, addr string) (*http.Response, error) {
 				tls.ECDSAWithSHA1,
 				tls.PKCS1WithSHA1}},
 			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{
-				{Group: tls.CurveID(tls.GREASE_PLACEHOLDER), Data: []byte{0}},
+				{Group: tls.CurveID(tls.GREASE_PLACEHOLDER)}, // Data auto-generated with random length/content
 				{Group: tls.X25519},
 			}},
 			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{1}}, // pskModeDHE
@@ -291,7 +312,11 @@ func forgeConn() {
 		return
 	}
 
-	clientUtls := tls.UClient(clientTcp, nil, tls.HelloGolang)
+	clientUtls, err := tls.UClient(clientTcp, nil, tls.HelloGolang)
+	if err != nil {
+		fmt.Printf("tls.UClient error: %+v", err)
+		return
+	}
 	defer clientUtls.Close()
 	clientUtls.SetSNI("google.com") // have to set SNI, if config was nil
 	err = clientUtls.Handshake()

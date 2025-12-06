@@ -2,6 +2,57 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// QUIC Transport Support for uTLS
+//
+// This file provides UQUICConn, a QUIC-TLS integration type that allows using
+// uTLS fingerprinting capabilities with QUIC transport protocols (RFC 9001).
+//
+// CONCURRENCY WARNING
+//
+// UQUICConn is NOT safe for concurrent use. All method calls on a single
+// UQUICConn instance MUST be serialized by the caller. Concurrent access
+// from multiple goroutines will result in undefined behavior, data races,
+// and potential security vulnerabilities.
+//
+// The following methods are NOT concurrent-safe:
+//   - Start: Initiates handshake, spawns internal goroutine
+//   - NextEvent: Reads and consumes events from internal queue
+//   - HandleData: Processes incoming handshake data
+//   - SetTransportParameters: Modifies connection state
+//   - SendSessionTicket: Modifies session state
+//   - ApplyPreset: Modifies ClientHello configuration
+//   - Close: Terminates connection and waits for goroutines
+//
+// Only ConnectionState may be called concurrently after the handshake completes.
+//
+// Recommended Usage Patterns:
+//
+// Pattern 1 - Single Goroutine (Recommended):
+//
+//	func handleQUIC(conn *UQUICConn) {
+//	    // All operations on conn happen in this single goroutine
+//	    conn.Start(ctx)
+//	    for {
+//	        event := conn.NextEvent()
+//	        // ... process event
+//	    }
+//	}
+//
+// Pattern 2 - External Synchronization:
+//
+//	var mu sync.Mutex
+//	func sendData(conn *UQUICConn, data []byte) {
+//	    mu.Lock()
+//	    defer mu.Unlock()
+//	    conn.HandleData(level, data)
+//	}
+//
+// For concurrent access detection during development, run your tests with:
+//
+//	go test -race ./...
+//
+// The Go race detector will identify concurrent access violations.
+
 package tls
 
 import (
@@ -10,22 +61,36 @@ import (
 	"fmt"
 )
 
-// A UQUICConn represents a connection which uses a QUIC implementation as the underlying
-// transport as described in RFC 9001.
+// UQUICConn represents a connection which uses a QUIC implementation as the
+// underlying transport as described in RFC 9001.
 //
-// Methods of UQUICConn are not safe for concurrent use.
+// WARNING: NOT CONCURRENT-SAFE
+//
+// Methods of UQUICConn are NOT safe for concurrent use from multiple goroutines.
+// The caller MUST ensure that only one goroutine accesses a UQUICConn at a time,
+// or use external synchronization (e.g., sync.Mutex).
+//
+// Concurrent access will cause data races and undefined behavior. Use the Go
+// race detector (-race flag) during development to catch violations.
+//
+// See package-level documentation for safe usage patterns and the complete list
+// of non-concurrent-safe methods.
 type UQUICConn struct {
 	conn *UConn
 
 	sessionTicketSent bool
 }
 
-// QUICClient returns a new TLS client side connection using QUICTransport as the
+// UQUICClient returns a new TLS client side connection using QUICTransport as the
 // underlying transport. The config cannot be nil.
 //
 // The config's MinVersion must be at least TLS 1.3.
+//
+// Unlike UClient, this function does not require a net.Conn because QUIC
+// manages the underlying transport internally. The nil connection is valid
+// for QUIC usage only.
 func UQUICClient(config *QUICConfig, clientHelloID ClientHelloID) *UQUICConn {
-	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID))
+	return newUQUICConn(uClient(nil, config.TLSConfig, clientHelloID))
 }
 
 func newUQUICConn(uconn *UConn) *UQUICConn {
@@ -49,7 +114,7 @@ func (q *UQUICConn) Start(ctx context.Context) error {
 	}
 	q.conn.quic.started = true
 	if q.conn.config.MinVersion < VersionTLS13 {
-		return quicError(errors.New("tls: Config MinVersion must be at least TLS 1.13"))
+		return quicError(errors.New("tls: Config MinVersion must be at least TLS 1.3"))
 	}
 	go q.conn.HandshakeContext(ctx)
 	if _, ok := <-q.conn.quic.blockedc; !ok {
@@ -70,6 +135,14 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 		// Write over some of the previous event's data,
 		// to catch callers erroniously retaining it.
 		qs.events[last].Data[0] = 0
+	}
+	// Handle drain synchronization for session resumption events (QUICResumeSession)
+	// This must be checked before returning QUICNoEvent to ensure proper synchronization
+	// with quicResumeSession() which sets waitingForDrain = true
+	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain.Load() {
+		qs.waitingForDrain.Store(false)
+		<-qs.signalc
+		<-qs.blockedc
 	}
 	if qs.nextEvent >= len(qs.events) {
 		qs.events = qs.events[:0]

@@ -59,7 +59,10 @@ func HttpGetCustom(hostname string, addr string) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("net.DialTimeout error: %+v", err)
 	}
-	uTlsConn := tls.UClient(dialConn, &config, tls.HelloGolang)
+	uTlsConn, err := tls.UClient(dialConn, &config, tls.HelloGolang)
+	if err != nil {
+		return nil, fmt.Errorf("tls.UClient error: %+v", err)
+	}
 	// uTlsConn := tls.Client(dialConn, &config)
 	defer uTlsConn.Close()
 

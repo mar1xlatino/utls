@@ -185,12 +185,20 @@ func prependRecordHeader(hello []byte, minTLSVersion uint16) []byte {
 }
 
 func checkUTLSFingerPrintClientHello(t *testing.T, clientHelloID ClientHelloID, serverName string) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, clientHelloID)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, clientHelloID)
+	if err != nil {
+		t.Errorf("got error: %v; expected to succeed", err)
+		return
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
 
-	generatedUConn := UClient(&net.TCPConn{}, &Config{ServerName: "foobar"}, HelloCustom)
+	generatedUConn, err := UClient(&net.TCPConn{}, &Config{ServerName: "foobar"}, HelloCustom)
+	if err != nil {
+		t.Errorf("got error: %v; expected to succeed", err)
+		return
+	}
 	fingerprinter := &Fingerprinter{}
 	minTLSVers := createMinTLSVersion(uconn.vers)
 	generatedSpec, err := fingerprinter.FingerprintClientHello(prependRecordHeader(uconn.HandshakeState.Hello.Raw, minTLSVers))
@@ -261,7 +269,11 @@ func TestUTLSFingerprintClientHelloBluntMimicry(t *testing.T) {
 	}
 	specWithGeneric.Extensions = append(specWithGeneric.Extensions, &GenericExtension{extensionId, extensionData})
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Errorf("got error: %v; expected to succeed", err)
+		return
+	}
 
 	if err := uconn.ApplyPreset(&specWithGeneric); err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)
@@ -323,8 +335,8 @@ func TestUTLSFingerprintClientHelloAlwaysAddPadding(t *testing.T) {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
 
-	uconnWithoutPadding := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
-	uconnWithPadding := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconnWithoutPadding, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconnWithPadding, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 
 	if err := uconnWithoutPadding.ApplyPreset(&specWithoutPadding); err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)

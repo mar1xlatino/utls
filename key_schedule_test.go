@@ -38,45 +38,86 @@ func TestACVPVectors(t *testing.T) {
 	// the hash in sequence to develop the transcript.
 	transcript := sha256.New()
 
-	es := tls13.NewEarlySecret(sha256.New, psk)
+	es, err := tls13.NewEarlySecret(sha256.New, psk)
+	if err != nil {
+		t.Fatalf("NewEarlySecret failed: %v", err)
+	}
 
 	transcript.Write(helloClientRandom)
 
-	if got := es.ClientEarlyTrafficSecret(transcript); !bytes.Equal(got, clientEarlyTrafficSecret) {
+	got, err := es.ClientEarlyTrafficSecret(transcript)
+	if err != nil {
+		t.Fatalf("ClientEarlyTrafficSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, clientEarlyTrafficSecret) {
 		t.Errorf("clientEarlyTrafficSecret = %x, want %x", got, clientEarlyTrafficSecret)
 	}
-	if got := tls13.TestingOnlyExporterSecret(es.EarlyExporterMasterSecret(transcript)); !bytes.Equal(got, earlyExporterMasterSecret) {
+	ems, err := es.EarlyExporterMasterSecret(transcript)
+	if err != nil {
+		t.Fatalf("EarlyExporterMasterSecret failed: %v", err)
+	}
+	if got := tls13.TestingOnlyExporterSecret(ems); !bytes.Equal(got, earlyExporterMasterSecret) {
 		t.Errorf("earlyExporterMasterSecret = %x, want %x", got, earlyExporterMasterSecret)
 	}
 
-	hs := es.HandshakeSecret(dhe)
+	hs, err := es.HandshakeSecret(dhe)
+	if err != nil {
+		t.Fatalf("HandshakeSecret failed: %v", err)
+	}
 
 	transcript.Write(helloServerRandom)
 
-	if got := hs.ClientHandshakeTrafficSecret(transcript); !bytes.Equal(got, clientHandshakeTrafficSecret) {
+	got, err = hs.ClientHandshakeTrafficSecret(transcript)
+	if err != nil {
+		t.Fatalf("ClientHandshakeTrafficSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, clientHandshakeTrafficSecret) {
 		t.Errorf("clientHandshakeTrafficSecret = %x, want %x", got, clientHandshakeTrafficSecret)
 	}
-	if got := hs.ServerHandshakeTrafficSecret(transcript); !bytes.Equal(got, serverHandshakeTrafficSecret) {
+	got, err = hs.ServerHandshakeTrafficSecret(transcript)
+	if err != nil {
+		t.Fatalf("ServerHandshakeTrafficSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, serverHandshakeTrafficSecret) {
 		t.Errorf("serverHandshakeTrafficSecret = %x, want %x", got, serverHandshakeTrafficSecret)
 	}
 
-	ms := hs.MasterSecret()
+	ms, err := hs.MasterSecret()
+	if err != nil {
+		t.Fatalf("MasterSecret failed: %v", err)
+	}
 
 	transcript.Write(finishedServerRandom)
 
-	if got := ms.ClientApplicationTrafficSecret(transcript); !bytes.Equal(got, clientApplicationTrafficSecret) {
+	got, err = ms.ClientApplicationTrafficSecret(transcript)
+	if err != nil {
+		t.Fatalf("ClientApplicationTrafficSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, clientApplicationTrafficSecret) {
 		t.Errorf("clientApplicationTrafficSecret = %x, want %x", got, clientApplicationTrafficSecret)
 	}
-	if got := ms.ServerApplicationTrafficSecret(transcript); !bytes.Equal(got, serverApplicationTrafficSecret) {
+	got, err = ms.ServerApplicationTrafficSecret(transcript)
+	if err != nil {
+		t.Fatalf("ServerApplicationTrafficSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, serverApplicationTrafficSecret) {
 		t.Errorf("serverApplicationTrafficSecret = %x, want %x", got, serverApplicationTrafficSecret)
 	}
-	if got := tls13.TestingOnlyExporterSecret(ms.ExporterMasterSecret(transcript)); !bytes.Equal(got, exporterMasterSecret) {
+	expMs, err := ms.ExporterMasterSecret(transcript)
+	if err != nil {
+		t.Fatalf("ExporterMasterSecret failed: %v", err)
+	}
+	if got := tls13.TestingOnlyExporterSecret(expMs); !bytes.Equal(got, exporterMasterSecret) {
 		t.Errorf("exporterMasterSecret = %x, want %x", got, exporterMasterSecret)
 	}
 
 	transcript.Write(finishedClientRandom)
 
-	if got := ms.ResumptionMasterSecret(transcript); !bytes.Equal(got, resumptionMasterSecret) {
+	got, err = ms.ResumptionMasterSecret(transcript)
+	if err != nil {
+		t.Fatalf("ResumptionMasterSecret failed: %v", err)
+	}
+	if !bytes.Equal(got, resumptionMasterSecret) {
 		t.Errorf("resumptionMasterSecret = %x, want %x", got, resumptionMasterSecret)
 	}
 }
@@ -110,7 +151,10 @@ func TestTrafficKey(t *testing.T) {
 		`iv expanded (12 octets):  5d 31 3e b2 67 12 76 ee 13 00 0b 30`)
 
 	c := cipherSuitesTLS13[0]
-	gotKey, gotIV := c.trafficKey(trafficSecret)
+	gotKey, gotIV, err := c.trafficKey(trafficSecret)
+	if err != nil {
+		t.Fatalf("trafficKey failed: %v", err)
+	}
 	if !bytes.Equal(gotKey, wantKey) {
 		t.Errorf("cipherSuiteTLS13.trafficKey() gotKey = % x, want % x", gotKey, wantKey)
 	}

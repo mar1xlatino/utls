@@ -41,6 +41,11 @@ var defaultSupportedSignatureAlgorithms = []SignatureScheme{
 	PKCS1WithSHA512,
 	ECDSAWithP384AndSHA384,
 	ECDSAWithP521AndSHA512,
+	// SHA-1 algorithms below are included for backwards compatibility with legacy
+	// servers. They are placed at the END of the list so modern algorithms are
+	// preferred. SHA-1 has known collision vulnerabilities (SHAttered, 2017) but
+	// many real-world servers still require SHA-1 support for handshake completion.
+	// To disable SHA-1, create a custom Config.SignatureAlgorithms without these.
 	PKCS1WithSHA1,
 	ECDSAWithSHA1,
 }
@@ -102,36 +107,6 @@ var defaultCipherSuitesTLS13NoAES = []uint16{
 // The FIPS-only policies below match BoringSSL's
 // ssl_compliance_policy_fips_202205, which is based on NIST SP 800-52r2.
 // https://cs.opensource.google/boringssl/boringssl/+/master:ssl/ssl_lib.cc;l=3289;drc=ea7a88fa
-
-var defaultSupportedVersionsFIPS = []uint16{
-	VersionTLS12,
-	VersionTLS13,
-}
-
-// defaultCurvePreferencesFIPS are the FIPS-allowed curves,
-// in preference order (most preferable first).
-var defaultCurvePreferencesFIPS = []CurveID{CurveP256, CurveP384}
-
-// defaultSupportedSignatureAlgorithmsFIPS currently are a subset of
-// defaultSupportedSignatureAlgorithms without Ed25519 and SHA-1.
-var defaultSupportedSignatureAlgorithmsFIPS = []SignatureScheme{
-	PSSWithSHA256,
-	PSSWithSHA384,
-	PSSWithSHA512,
-	PKCS1WithSHA256,
-	ECDSAWithP256AndSHA256,
-	PKCS1WithSHA384,
-	ECDSAWithP384AndSHA384,
-	PKCS1WithSHA512,
-}
-
-// defaultCipherSuitesFIPS are the FIPS-allowed cipher suites.
-var defaultCipherSuitesFIPS = []uint16{
-	TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-	TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-}
 
 // defaultCipherSuitesTLS13FIPS are the FIPS-allowed cipher suites for TLS 1.3.
 var defaultCipherSuitesTLS13FIPS = []uint16{

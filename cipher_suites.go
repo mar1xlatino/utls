@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"hash"
 	"runtime"
+	"sync"
 	_ "unsafe" // for linkname
 
 	"github.com/refraction-networking/utls/internal/boring"
@@ -375,6 +376,21 @@ var (
 	hasAESGCMHardwareSupport = hasGCMAsmAMD64 || hasGCMAsmARM64 || hasGCMAsmS390X || hasGCMAsmPPC64
 )
 
+// HasAESGCMHardwareSupport returns true if the current CPU has hardware
+// acceleration for AES-GCM operations (AES-NI on x86/AMD64, AES instructions
+// on ARM64, etc.). This is used by uTLS to dynamically reorder cipher suites
+// to match real browser behavior.
+//
+// Real browsers like Chrome prefer AES-GCM cipher suites when hardware
+// acceleration is available (faster), and prefer ChaCha20-Poly1305 when
+// it's not (ChaCha20 is faster in software on ARM/mobile devices).
+//
+// This function is primarily used with CipherSuiteOrderAuto to automatically
+// select the appropriate cipher suite ordering.
+func HasAESGCMHardwareSupport() bool {
+	return hasAESGCMHardwareSupport
+}
+
 var aesgcmCiphers = map[uint16]bool{
 	// TLS 1.2
 	TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:   true,
@@ -400,18 +416,30 @@ func aesgcmPreferred(ciphers []uint16) bool {
 	return false
 }
 
+// cipherRC4 creates an RC4 stream cipher.
+// Returns nil if cipher creation fails (invalid key length).
+// Callers must check for nil return value.
 func cipherRC4(key, iv []byte, isRead bool) any {
 	cipher, err := rc4.NewCipher(key)
 	if err != nil {
-		panic(err)
+		// Return nil instead of panicking - caller must check for nil.
+		// This can only fail if key length is 0 or > 256 bytes,
+		// which should not happen with properly configured cipher suites.
+		return nil
 	}
 	return cipher
 }
 
+// cipher3DES creates a 3DES-CBC block cipher.
+// Returns nil if cipher creation fails (invalid key length).
+// Callers must check for nil return value.
 func cipher3DES(key, iv []byte, isRead bool) any {
 	block, err := des.NewTripleDESCipher(key)
 	if err != nil {
-		panic(err)
+		// Return nil instead of panicking - caller must check for nil.
+		// This can only fail if key length is not exactly 24 bytes,
+		// which should not happen with properly configured cipher suites.
+		return nil
 	}
 	if isRead {
 		return cipher.NewCBCDecrypter(block, iv)
@@ -419,10 +447,16 @@ func cipher3DES(key, iv []byte, isRead bool) any {
 	return cipher.NewCBCEncrypter(block, iv)
 }
 
+// cipherAES creates an AES-CBC block cipher.
+// Returns nil if cipher creation fails (invalid key length).
+// Callers must check for nil return value.
 func cipherAES(key, iv []byte, isRead bool) any {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err)
+		// Return nil instead of panicking - caller must check for nil.
+		// This can only fail if key length is not 16, 24, or 32 bytes,
+		// which should not happen with properly configured cipher suites.
+		return nil
 	}
 	if isRead {
 		return cipher.NewCBCDecrypter(block, iv)
@@ -619,13 +653,71 @@ func (c *cthWrapper) Reset()                      { c.h.Reset() }
 func (c *cthWrapper) Write(p []byte) (int, error) { return c.h.Write(p) }
 func (c *cthWrapper) Sum(b []byte) []byte         { return c.h.ConstantTimeSum(b) }
 
+// constantTimeHashAvailable tracks whether the runtime supports ConstantTimeSum.
+// This is checked once at init time for SHA1 and SHA256.
+var (
+	sha1ConstantTimeAvailable   bool
+	sha256ConstantTimeAvailable bool
+	constantTimeHashChecked     bool
+)
+
+// checkConstantTimeHashSupport performs one-time detection of ConstantTimeSum support.
+// Called lazily on first use to avoid init-time panics.
+func checkConstantTimeHashSupport() {
+	if constantTimeHashChecked {
+		return
+	}
+	constantTimeHashChecked = true
+
+	// Check SHA1 support
+	testSHA1 := sha1.New()
+	_, sha1ConstantTimeAvailable = testSHA1.(constantTimeHash)
+
+	// Check SHA256 support
+	testSHA256 := sha256.New()
+	_, sha256ConstantTimeAvailable = testSHA256.(constantTimeHash)
+}
+
+// CBCConstantTimeAvailable returns whether constant-time CBC MAC is available.
+// When false, CBC cipher suites may be vulnerable to Lucky13-style timing attacks.
+// Applications concerned about this should prefer AEAD cipher suites (GCM, ChaCha20-Poly1305).
+func CBCConstantTimeAvailable() bool {
+	checkConstantTimeHashSupport()
+	return sha1ConstantTimeAvailable && sha256ConstantTimeAvailable
+}
+
+// cbcTimingWarningOnce ensures the CBC timing warning is only processed once.
+var cbcTimingWarningOnce sync.Once
+
+// CBCTimingVulnerable is set to true when CBC cipher suites are used without
+// constant-time MAC support. Applications can check this flag to detect
+// potential Lucky13 timing attack vulnerability at runtime.
+// This is set once when the first CBC cipher suite is initialized without
+// constant-time hash support.
+var CBCTimingVulnerable bool
+
 func newConstantTimeHash(h func() hash.Hash) func() hash.Hash {
 	boring.Unreachable()
-	// Test if the hash implements constantTimeHash at runtime.
-	// Go 1.25+ removed ConstantTimeSum from some hash implementations,
-	// so we gracefully fall back to the regular hash if unavailable.
+
+	// Perform one-time constant-time support check
+	checkConstantTimeHashSupport()
+
+	// Test if THIS specific hash implements constantTimeHash at runtime.
+	// Go 1.25+ removed ConstantTimeSum from some hash implementations.
 	testHash := h()
 	if _, ok := testHash.(constantTimeHash); !ok {
+		// SECURITY WARNING: Constant-time hash not available.
+		// CBC cipher suites using this hash may be vulnerable to Lucky13-style
+		// timing attacks. Consider using AEAD cipher suites instead.
+		//
+		// We return the non-constant-time hash to maintain functionality,
+		// but callers should be aware of the security implications.
+		// Use CBCConstantTimeAvailable() to check runtime support.
+		//
+		// Set the vulnerability flag once to alert applications.
+		cbcTimingWarningOnce.Do(func() {
+			CBCTimingVulnerable = true
+		})
 		return h
 	}
 	return func() hash.Hash {

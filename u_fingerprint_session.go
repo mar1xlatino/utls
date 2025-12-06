@@ -21,9 +21,9 @@ import (
 // must stay CONSISTENT within a session. This struct freezes those values.
 type SessionFingerprintState struct {
 	// Identity
-	ID        string    // Unique session identifier
-	ProfileID string    // Base profile this session uses
-	Origin    string    // "example.com:443"
+	ID        string // Unique session identifier
+	ProfileID string // Base profile this session uses
+	Origin    string // "example.com:443"
 	CreatedAt time.Time
 
 	// Frozen GREASE values
@@ -43,8 +43,8 @@ type SessionFingerprintState struct {
 	ExpectedJA4o string
 
 	// Session state
-	frozen          bool      // Once frozen, no modifications allowed
-	connectionCount int       // Number of connections using this state
+	frozen          bool // Once frozen, no modifications allowed
+	connectionCount int  // Number of connections using this state
 	lastUsed        time.Time
 
 	// TLS session data (for resumption)
@@ -88,12 +88,6 @@ func IsGreaseExtMarker(v uint16) bool {
 	return v == GreaseExtMarker1 || v == GreaseExtMarker2
 }
 
-// maxGREASEDeduplicationAttempts limits the number of attempts to generate
-// unique GREASE values for Extension1 and Extension2. With 16 possible GREASE
-// values and 6.25% collision probability, 100 attempts is more than sufficient.
-// In practice, this loop almost never runs more than once or twice.
-const maxGREASEDeduplicationAttempts = 100
-
 // greaseValues is the set of valid GREASE values per RFC 8701.
 var greaseValues = []uint16{
 	0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a,
@@ -135,26 +129,15 @@ func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *Ses
 	if profile != nil {
 		// Generate frozen GREASE values
 		if profile.ClientHello.GREASE.Enabled {
-			// Generate Extension1 and Extension2 with deduplication
-			// Real Chrome/BoringSSL never has duplicate GREASE extension values
-			// (see u_parrots.go lines 914-931 for the original deduplication logic)
+			// Generate Extension1 and Extension2 independently (NO deduplication)
+			// Real Chrome/BoringSSL generates GREASE values independently without
+			// deduplication. With 16 possible GREASE values (0x0A0A through 0xFAFA),
+			// there's a natural 1/16 = 6.25% collision rate. This is CORRECT behavior.
+			// Previous code always deduplicated, giving 0% collision rate, which was
+			// detectable as non-Chrome behavior.
 			ext1 := randomGREASE()
 			ext2 := randomGREASE()
-			// Regenerate ext2 if it collides with ext1 (6.25% probability per attempt)
-			// Use bounded loop to prevent infinite loop with pathological PRNG
-			for attempts := 0; ext2 == ext1 && attempts < maxGREASEDeduplicationAttempts; attempts++ {
-				ext2 = randomGREASE()
-			}
-			// If still colliding after max attempts (should never happen with proper PRNG),
-			// force a different value by picking the next GREASE value in sequence
-			if ext2 == ext1 {
-				for i, v := range greaseValues {
-					if v == ext1 {
-						ext2 = greaseValues[(i+1)%len(greaseValues)]
-						break
-					}
-				}
-			}
+			// Allow natural collision - do NOT deduplicate
 
 			// Generate SupportedGroup GREASE
 			// CRITICAL: Chrome/BoringSSL uses ssl_grease_group for BOTH supported_groups

@@ -28,6 +28,18 @@ func init() {
 	slices.Sort(sortedSupportedAEADs)
 }
 
+// sniExtensionOverhead is the byte overhead of the SNI extension structure
+// excluding the actual server name bytes:
+//   - 2 bytes: extension type
+//   - 2 bytes: extension length
+//   - 2 bytes: server name list length
+//   - 1 byte:  server name type (host_name = 0)
+//   - 2 bytes: server name length
+//
+// Total: 9 bytes. Used in ECH padding calculations to ensure consistent
+// ClientHello sizes regardless of whether SNI is present.
+const sniExtensionOverhead = 9
+
 type echCipher struct {
 	KDFID  uint16
 	AEADID uint16
@@ -54,7 +66,8 @@ type echConfig struct {
 	Extensions    []echExtension
 }
 
-var errMalformedECHConfig = errors.New("tls: malformed ECHConfigList")
+// Use generic error to avoid revealing ECH configuration parsing
+var errMalformedECHConfig = errors.New("tls: malformed configuration")
 
 func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	s := cryptobyte.String(enc)
@@ -65,10 +78,13 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	if !s.ReadUint16(&ec.Length) {
 		return false, echConfig{}, errMalformedECHConfig
 	}
-	if len(ec.raw) < int(ec.Length)+4 {
+	// Use int arithmetic to prevent uint16 overflow when ec.Length is near MaxUint16.
+	// Without this, ec.Length+4 could wrap around (e.g., 65535+4=3 in uint16).
+	totalLen := int(ec.Length) + 4
+	if len(ec.raw) < totalLen {
 		return false, echConfig{}, errMalformedECHConfig
 	}
-	ec.raw = ec.raw[:ec.Length+4]
+	ec.raw = ec.raw[:totalLen]
 	if ec.Version != extensionEncryptedClientHello {
 		s.Skip(int(ec.Length))
 		return true, echConfig{}, nil
@@ -81,6 +97,29 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	}
 	if !readUint16LengthPrefixed(&s, &ec.PublicKey) {
 		return false, echConfig{}, errMalformedECHConfig
+	}
+	// Validate public key is not empty
+	if len(ec.PublicKey) == 0 {
+		return false, echConfig{}, errors.New("tls: config has empty public key")
+	}
+	// Validate public key length based on KEM type.
+	// This prevents cryptographic errors when SetupSender() is called.
+	switch ec.KemID {
+	case 0x0010: // DHKEM(P-256, HKDF-SHA256)
+		// P-256 uncompressed point: 0x04 prefix + 32 bytes X + 32 bytes Y = 65 bytes
+		if len(ec.PublicKey) != 65 {
+			return false, echConfig{}, errors.New("tls: config has invalid P-256 public key length")
+		}
+	case 0x0011: // DHKEM(P-384, HKDF-SHA384)
+		// P-384 uncompressed point: 0x04 prefix + 48 bytes X + 48 bytes Y = 97 bytes
+		if len(ec.PublicKey) != 97 {
+			return false, echConfig{}, errors.New("tls: config has invalid P-384 public key length")
+		}
+	case 0x0020: // DHKEM(X25519, HKDF-SHA256)
+		// X25519 public key is exactly 32 bytes
+		if len(ec.PublicKey) != 32 {
+			return false, echConfig{}, errors.New("tls: config has invalid X25519 public key length")
+		}
 	}
 	var cipherSuites cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&cipherSuites) {
@@ -99,6 +138,12 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	if !s.ReadUint8(&ec.MaxNameLength) {
 		return false, echConfig{}, errMalformedECHConfig
 	}
+	// Note: MaxNameLength=0 is allowed for backwards compatibility with real-world
+	// configs (e.g., Cloudflare). When MaxNameLength=0, the padding calculation
+	// in encodeInnerClientHello handles it gracefully:
+	// - If serverName is set: namePadding = max(0, 0 - len(serverName)) = 0
+	// - If serverName is empty: namePadding = 0 + sniExtensionOverhead = 9 bytes
+	// This effectively means "no padding hint" which is acceptable behavior.
 	var publicName cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&publicName) {
 		return false, echConfig{}, errMalformedECHConfig
@@ -137,14 +182,19 @@ func parseECHConfigList(data []byte) ([]echConfig, error) {
 	var configs []echConfig
 	for len(s) > 0 {
 		if len(s) < 4 {
-			return nil, errors.New("tls: malformed ECHConfig")
+			return nil, errors.New("tls: malformed configuration")
 		}
 		configLen := uint16(s[2])<<8 | uint16(s[3])
+		// Bounds check: ensure we have enough data before reslicing
+		totalLen := int(configLen) + 4
+		if totalLen > len(s) {
+			return nil, errors.New("tls: ECH config length exceeds available data")
+		}
 		skip, ec, err := parseECHConfig(s)
 		if err != nil {
 			return nil, err
 		}
-		s = s[configLen+4:]
+		s = s[totalLen:]
 		if !skip {
 			configs = append(configs, ec)
 		}
@@ -207,6 +257,79 @@ func pickECHCipherSuite(suites []echCipher) (echCipher, error) {
 	return echCipher{}, errors.New("tls: no supported symmetric ciphersuites for ECH")
 }
 
+// filterUsableECHConfigs parses and re-encodes only the usable ECH configs from
+// the raw config list. This ensures that the RetryConfigList in ECHRejectionError
+// only contains configs that the client can actually use.
+//
+// Returns nil if no usable configs exist or on parse errors.
+func filterUsableECHConfigs(rawConfigs []byte) []byte {
+	if len(rawConfigs) == 0 {
+		return nil
+	}
+
+	configs, err := parseECHConfigList(rawConfigs)
+	if err != nil {
+		return nil
+	}
+
+	// Filter to only usable configs
+	var usableRawConfigs []byte
+	for _, ec := range configs {
+		// Check KEM support
+		if _, ok := hpke.SupportedKEMs[ec.KemID]; !ok {
+			continue
+		}
+
+		// Check for at least one valid cipher suite
+		var hasValidSuite bool
+		for _, cs := range ec.SymmetricCipherSuite {
+			if _, ok := hpke.SupportedAEADs[cs.AEADID]; !ok {
+				continue
+			}
+			if _, ok := hpke.SupportedKDFs[cs.KDFID]; !ok {
+				continue
+			}
+			hasValidSuite = true
+			break
+		}
+		if !hasValidSuite {
+			continue
+		}
+
+		// Check valid public name
+		if !validDNSName(string(ec.PublicName)) {
+			continue
+		}
+
+		// Check for unsupported mandatory extensions
+		var unsupportedExt bool
+		for _, ext := range ec.Extensions {
+			if ext.Type&uint16(1<<15) != 0 {
+				unsupportedExt = true
+				break
+			}
+		}
+		if unsupportedExt {
+			continue
+		}
+
+		// This config is usable, include its raw bytes
+		usableRawConfigs = append(usableRawConfigs, ec.raw...)
+	}
+
+	if len(usableRawConfigs) == 0 {
+		return nil
+	}
+
+	// Re-encode with length prefix
+	result := make([]byte, 2+len(usableRawConfigs))
+	result[0] = byte(len(usableRawConfigs) >> 8)
+	result[1] = byte(len(usableRawConfigs))
+	copy(result[2:], usableRawConfigs)
+
+	return result
+}
+
 // [uTLS SECTION BEGIN]
 func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, error) {
 	return encodeInnerClientHelloReorderOuterExts(inner, maxNameLength, nil)
@@ -229,7 +352,10 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 	if inner.serverName != "" {
 		namePadding = max(0, maxNameLength-len(inner.serverName))
 	} else {
-		namePadding = maxNameLength + 9
+		// When serverName is empty (no SNI extension), we still need to pad to
+		// maxNameLength plus the SNI extension structure overhead. This ensures
+		// consistent ClientHello sizes regardless of whether SNI is present.
+		namePadding = maxNameLength + sniExtensionOverhead
 	}
 	// Calculate alignment padding: how many bytes to add to reach next 32-byte boundary
 	// after accounting for name padding
@@ -312,6 +438,13 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// The specification says we must verify that the trailing padding is all
 	// zeros. This is kind of weird for TLS messages, where we generally just
 	// throw away any trailing garbage.
+	//
+	// Limit maximum padding to prevent memory exhaustion attacks.
+	// 16KB is more than sufficient for any realistic ECH padding.
+	const maxECHPadding = 16384
+	if len(innerReader) > maxECHPadding {
+		return nil, errors.New("tls: padding too large")
+	}
 	for _, p := range innerReader {
 		if p != 0 {
 			return nil, errors.New("tls: invalid inner client hello")
@@ -402,14 +535,101 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// The second condition is simplified: if len != 1, we fail; otherwise len == 1,
 	// so we can safely check supportedVersions[0] without the redundant length check.
 	if len(inner.supportedVersions) != 1 || inner.supportedVersions[0] != VersionTLS13 {
-		return nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
+		return nil, errors.New("tls: incompatible protocol versions")
 	}
 
 	return inner, nil
 }
 
-func decryptECHPayload(context *hpke.Receipient, hello, payload []byte) ([]byte, error) {
-	outerAAD := bytes.Replace(hello[4:], payload, make([]byte, len(payload)), 1)
+// findECHPayloadPosition finds the byte offset of the ECH payload within the
+// ClientHello message (starting from byte 4, after the header). Returns the
+// position relative to hello[4:], or -1 if not found.
+func findECHPayloadPosition(hello []byte, payloadLen int) int {
+	if len(hello) < 4+2+32+1 { // header + version + random + min session id len
+		return -1
+	}
+
+	s := cryptobyte.String(hello[4:]) // skip header
+	originalLen := len(s)
+
+	// Skip: version (2), random (32), session ID, cipher suites, compression methods
+	if !s.Skip(2+32) ||
+		!skipUint8LengthPrefixed(&s) || // session ID
+		!skipUint16LengthPrefixed(&s) || // cipher suites
+		!skipUint8LengthPrefixed(&s) { // compression methods
+		return -1
+	}
+
+	var extensionsLen uint16
+	if !s.ReadUint16(&extensionsLen) {
+		return -1
+	}
+
+	for len(s) > 0 {
+		extStart := originalLen - len(s)
+		var extType uint16
+		var extLen uint16
+		if !s.ReadUint16(&extType) || !s.ReadUint16(&extLen) {
+			return -1
+		}
+
+		if extType == extensionEncryptedClientHello {
+			// Found ECH extension. Parse to find payload position.
+			// ECH outer structure: type(1) + kdf(2) + aead(2) + configId(1) + encapKeyLen(2) + encapKey + payloadLen(2) + payload
+			if int(extLen) < 10 { // minimum ECH extension size
+				return -1
+			}
+			echData := s[:extLen]
+			if len(echData) < 1 {
+				return -1
+			}
+			// Skip: type(1) + kdf(2) + aead(2) + configId(1)
+			echData = echData[6:]
+			if len(echData) < 2 {
+				return -1
+			}
+			encapKeyLen := int(echData[0])<<8 | int(echData[1])
+			echData = echData[2:]
+			if len(echData) < encapKeyLen+2 {
+				return -1
+			}
+			// Skip encapsulated key
+			echData = echData[encapKeyLen:]
+			// Now at payload length prefix
+			payloadLenFromExt := int(echData[0])<<8 | int(echData[1])
+			if payloadLenFromExt != payloadLen {
+				return -1 // payload length mismatch
+			}
+			// Payload position: extStart + 4(type+len) + 6(type+kdf+aead+configId) + 2(encapKeyLen) + encapKeyLen + 2(payloadLen)
+			payloadOffset := extStart + 4 + 6 + 2 + encapKeyLen + 2
+			return payloadOffset
+		}
+
+		if !s.Skip(int(extLen)) {
+			return -1
+		}
+	}
+
+	return -1
+}
+
+func decryptECHPayload(context *hpke.Recipient, hello, payload []byte) ([]byte, error) {
+	// Create AAD by zeroing out the ECH payload at its exact position.
+	// This is safer than bytes.Replace which could match wrong bytes.
+	payloadPos := findECHPayloadPosition(hello, len(payload))
+
+	outerAAD := make([]byte, len(hello)-4)
+	copy(outerAAD, hello[4:])
+
+	if payloadPos >= 0 && payloadPos+len(payload) <= len(outerAAD) {
+		// Zero out payload at the correct position
+		copy(outerAAD[payloadPos:], make([]byte, len(payload)))
+	} else {
+		// Fallback to bytes.Replace if position-based approach fails.
+		// This maintains backward compatibility while logging the issue.
+		outerAAD = bytes.Replace(hello[4:], payload, make([]byte, len(payload)), 1)
+	}
+
 	return context.Open(outerAAD, payload)
 }
 
@@ -433,10 +653,10 @@ func computeAndUpdateOuterECHExtension(outer, inner *clientHelloMsg, ech *echCli
 	if err != nil {
 		return err
 	}
-	// NOTE: the tag lengths for all of the supported AEADs are the same (16
-	// bytes), so we have hardcoded it here. If we add support for another AEAD
-	// with a different tag length, we will need to change this.
-	encryptedLen := len(encodedInner) + 16 // AEAD tag length
+	// Use the AEAD's Overhead() method to get the tag length dynamically.
+	// This ensures correct operation if AEADs with different tag lengths
+	// are added in the future.
+	encryptedLen := len(encodedInner) + ech.hpkeContext.Overhead()
 	outer.encryptedClientHello, err = generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, make([]byte, encryptedLen))
 	if err != nil {
 		return err
@@ -504,8 +724,10 @@ func (e *ECHRejectionError) Error() string {
 	return "tls: server rejected ECH"
 }
 
-var errMalformedECHExt = errors.New("tls: malformed encrypted_client_hello extension")
-var errInvalidECHExt = errors.New("tls: client sent invalid encrypted_client_hello extension")
+// Use generic error messages to avoid revealing ECH usage in logs/error reports.
+// Specific ECH-related errors could be used to fingerprint clients using ECH.
+var errMalformedECHExt = errors.New("tls: malformed extension")
+var errInvalidECHExt = errors.New("tls: invalid extension")
 
 type echExtType uint8
 
@@ -561,16 +783,6 @@ func parseECHExt(ext []byte) (echType echExtType, cs echCipher, configID uint8, 
 	return echType, cs, configID, bytes.Clone(encap), bytes.Clone(payload), nil
 }
 
-func marshalEncryptedClientHelloConfigList(configs []EncryptedClientHelloKey) ([]byte, error) {
-	builder := cryptobyte.NewBuilder(nil)
-	builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
-		for _, c := range configs {
-			builder.AddBytes(c.Config)
-		}
-	})
-	return builder.Bytes()
-}
-
 func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *echServerContext, error) {
 	echType, echCiphersuite, configID, encap, payload, err := parseECHExt(outer.encryptedClientHello)
 	if err != nil {
@@ -591,6 +803,12 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		return outer, nil, nil
 	}
 
+	// Limit trial decryption attempts to prevent CPU exhaustion attacks.
+	// An attacker could send many requests with different encapsulated keys
+	// to force the server to perform expensive HPKE operations.
+	const maxTrialDecryptions = 10
+	var trialAttempts int
+
 	for _, echKey := range c.config.EncryptedClientHelloKeys {
 		skip, config, err := parseECHConfig(echKey.Config)
 		if err != nil {
@@ -609,6 +827,15 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		if config.ConfigID != configID {
 			continue
 		}
+
+		// Check trial decryption limit before expensive operations
+		trialAttempts++
+		if trialAttempts > maxTrialDecryptions {
+			// Return outer ClientHello without decryption on limit exceeded.
+			// This is safer than returning an error that could reveal ECH usage.
+			return outer, nil, nil
+		}
+
 		echPriv, err := hpke.ParseHPKEPrivateKey(config.KemID, echKey.PrivateKey)
 		if err != nil {
 			c.sendAlert(alertInternalError)
@@ -617,7 +844,7 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		info := append([]byte("tls ech\x00"), echKey.Config...)
 		// Use config.KemID instead of hardcoded DHKEM_X25519_HKDF_SHA256
 		// to support configs with different KEM algorithms
-		hpkeContext, err := hpke.SetupReceipient(config.KemID, echCiphersuite.KDFID, echCiphersuite.AEADID, echPriv, info, encap)
+		hpkeContext, err := hpke.SetupRecipient(config.KemID, echCiphersuite.KDFID, echCiphersuite.AEADID, echPriv, info, encap)
 		if err != nil {
 			// attempt next trial decryption
 			continue

@@ -26,7 +26,10 @@ func TestJA3Calculation(t *testing.T) {
 
 	for _, profile := range profiles {
 		t.Run(profile.name, func(t *testing.T) {
-			uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+			uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 			if err := uconn.BuildHandshakeState(); err != nil {
 				t.Fatalf("BuildHandshakeState failed: %v", err)
 			}
@@ -87,7 +90,10 @@ func TestJA4Calculation(t *testing.T) {
 
 	for _, profile := range profiles {
 		t.Run(profile.name, func(t *testing.T) {
-			uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+			uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 			if err := uconn.BuildHandshakeState(); err != nil {
 				t.Fatalf("BuildHandshakeState failed: %v", err)
 			}
@@ -152,7 +158,10 @@ func TestJA4Stability(t *testing.T) {
 			var firstJA3, firstJA4 string
 
 			for i := 0; i < iterations; i++ {
-				uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+				uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, profile.id)
+				if err != nil {
+					t.Fatalf("iteration %d: UClient error: %v", i, err)
+				}
 				if err := uconn.BuildHandshakeState(); err != nil {
 					t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 				}
@@ -184,7 +193,10 @@ func TestJA4Stability(t *testing.T) {
 
 // TestJA4Variants verifies all JA4 variant formats.
 func TestJA4Variants(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -254,7 +266,10 @@ func TestJA4Variants(t *testing.T) {
 
 // TestFingerprintWithoutSNI verifies SNI indicator when no domain is set.
 func TestFingerprintWithoutSNI(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	uconn.SetSNI("")
 
 	if err := uconn.BuildHandshakeState(); err != nil {
@@ -301,7 +316,10 @@ func TestJA4CustomSpec(t *testing.T) {
 		},
 	}
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.ApplyPreset(&spec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -356,7 +374,10 @@ func TestJA3Format(t *testing.T) {
 		},
 	}
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.ApplyPreset(&spec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -417,7 +438,10 @@ func TestJA3Format(t *testing.T) {
 
 // TestCalculateFingerprintsFromRaw verifies standalone function works.
 func TestCalculateFingerprintsFromRaw(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -453,7 +477,10 @@ func TestGREASEFiltering(t *testing.T) {
 	var fingerprints []string
 
 	for i := 0; i < 20; i++ {
-		uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient error: %v", i, err)
+		}
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -479,10 +506,13 @@ func TestGREASEFiltering(t *testing.T) {
 
 // TestFingerprintBeforeHandshake verifies error handling.
 func TestFingerprintBeforeHandshake(t *testing.T) {
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	// Don't call BuildHandshakeState
 
-	_, err := uconn.Fingerprint()
+	_, err = uconn.Fingerprint()
 	if err == nil {
 		t.Error("Expected error when calling Fingerprint before BuildHandshakeState")
 	}
@@ -513,7 +543,11 @@ func TestAllBrowserProfiles(t *testing.T) {
 	t.Log("========================================")
 
 	for _, p := range profiles {
-		uconn := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, p.id)
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, p.id)
+		if err != nil {
+			t.Logf("%-15s FAILED: UClient: %v", p.name, err)
+			continue
+		}
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Logf("%-15s FAILED: %v", p.name, err)
 			continue

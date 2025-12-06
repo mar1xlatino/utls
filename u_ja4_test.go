@@ -242,7 +242,7 @@ func TestJA4StabilityWithShuffledExtensions(t *testing.T) {
 	var ja4Fingerprints []string
 
 	for i := 0; i < iterations; i++ {
-		uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -271,7 +271,7 @@ func TestJA4StabilityWithShuffledExtensions(t *testing.T) {
 func TestJA4ComponentsCalculation(t *testing.T) {
 	serverName := "example.com"
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestJA4ForMultipleBrowserProfiles(t *testing.T) {
 			// Generate fingerprint multiple times to verify stability
 			var fingerprints []string
 			for i := 0; i < 10; i++ {
-				uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, profile.id)
+				uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, profile.id)
 				if err := uconn.BuildHandshakeState(); err != nil {
 					t.Fatalf("BuildHandshakeState failed: %v", err)
 				}
@@ -405,7 +405,7 @@ func TestJA4WithCustomSpec(t *testing.T) {
 		},
 	}
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 	if err := uconn.ApplyPreset(&customSpec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestJA4WithCustomSpec(t *testing.T) {
 
 	// Custom spec should produce consistent fingerprint
 	// Generate again and compare
-	uconn2 := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn2, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 	if err := uconn2.ApplyPreset(&customSpec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -450,7 +450,7 @@ func TestJA4WithCustomSpec(t *testing.T) {
 func TestJA4WithoutSNI(t *testing.T) {
 	// No server name = no SNI extension
 	// InsecureSkipVerify is required when no ServerName is provided
-	uconn := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
+	uconn, _ := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
 	uconn.SetSNI("") // Explicitly set empty SNI
 
 	if err := uconn.BuildHandshakeState(); err != nil {
@@ -512,7 +512,7 @@ func TestJA4ExtensionOrderIndependence(t *testing.T) {
 		},
 	}
 
-	uconn1 := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn1, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 	if err := uconn1.ApplyPreset(&spec1); err != nil {
 		t.Fatalf("ApplyPreset spec1 failed: %v", err)
 	}
@@ -520,7 +520,7 @@ func TestJA4ExtensionOrderIndependence(t *testing.T) {
 		t.Fatalf("BuildHandshakeState spec1 failed: %v", err)
 	}
 
-	uconn2 := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn2, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 	if err := uconn2.ApplyPreset(&spec2); err != nil {
 		t.Fatalf("ApplyPreset spec2 failed: %v", err)
 	}
@@ -552,7 +552,7 @@ func TestJA4GREASEFiltering(t *testing.T) {
 	serverName := "example.com"
 
 	// Chrome profiles include GREASE - they should be filtered out
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -566,7 +566,7 @@ func TestJA4GREASEFiltering(t *testing.T) {
 	// Verify by generating multiple times
 	var fingerprints []string
 	for i := 0; i < 10; i++ {
-		uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -625,7 +625,7 @@ func TestJA4ALPNVariations(t *testing.T) {
 				spec.Extensions = append(spec.Extensions, &ALPNExtension{AlpnProtocols: tc.alpn})
 			}
 
-			uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+			uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
 			if err := uconn.ApplyPreset(&spec); err != nil {
 				t.Fatalf("ApplyPreset failed: %v", err)
 			}
@@ -656,7 +656,7 @@ func TestJA4ALPNVariations(t *testing.T) {
 func TestJA4RawBytesConsistency(t *testing.T) {
 	serverName := "example.com"
 
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}

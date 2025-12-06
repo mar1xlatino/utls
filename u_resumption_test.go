@@ -204,6 +204,12 @@ func testTLS13BasicResumptionWithServer(t *testing.T, serverAddr, serverName str
 
 	for i := 0; i < maxRetries; i++ {
 		t.Logf("Resumption attempt %d/%d...", i+1, maxRetries)
+		// FLAKY TEST NOTE: This sleep is necessary because TLS 1.3 NewSessionTicket
+		// messages are sent asynchronously after the handshake. The server needs time
+		// to send and the client needs time to process the ticket before it can be
+		// used for resumption. Without this delay, the cache may not have the ticket yet.
+		// A more robust approach would be to use channel-based synchronization in
+		// testSessionCache.onPut to signal when a ticket is received.
 		time.Sleep(700 * time.Millisecond) // Longer pause between attempts
 
 		tcpConn2, err := dialWithTimeout(ctx, serverAddr)
@@ -298,6 +304,10 @@ func TestTLS13PSKIdentityExtension(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Allow time for async NewSessionTicket processing.
+	// TLS 1.3 sends session tickets after the handshake completes, so we need
+	// to wait for the cache to be populated. Consider using ticketReceived
+	// channel with select for more reliable synchronization.
 	time.Sleep(200 * time.Millisecond)
 
 	if cache.Count() == 0 {
@@ -404,6 +414,8 @@ func TestTLS13ResumptionAcrossProfiles(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for NewSessionTicket to be processed and cached.
+	// This is inherently racy - the ticket is sent asynchronously after handshake.
 	time.Sleep(200 * time.Millisecond)
 	initialCacheCount := cache.Count()
 	t.Logf("Cache has %d entries after first connection", initialCacheCount)
@@ -524,6 +536,9 @@ func TestClientSessionCacheOperations(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Allow time for NewSessionTicket processing. The 300ms
+	// sleep is slightly longer here to ensure the cache operations (Get/Put)
+	// have completed before we inspect them.
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify cache operations
@@ -624,6 +639,8 @@ func TestTLS12SessionTicketResumption(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for TLS 1.2 session ticket to be processed.
+	// Even TLS 1.2 session tickets may be processed asynchronously.
 	time.Sleep(200 * time.Millisecond)
 
 	if cache.Count() == 0 {
@@ -696,6 +713,9 @@ func TestResumptionWithGoLangProfile(t *testing.T) {
 	readWithTimeout(tlsConn1, 1*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Longer sleep (500ms) to ensure session ticket is
+	// fully processed for HelloGolang profile which has different timing
+	// characteristics than browser profiles.
 	time.Sleep(500 * time.Millisecond)
 
 	// Second connection with retries
@@ -705,6 +725,8 @@ func TestResumptionWithGoLangProfile(t *testing.T) {
 
 	for i := 0; i < maxRetries; i++ {
 		t.Logf("Resumption attempt %d/%d...", i+1, maxRetries)
+		// FLAKY TEST NOTE: Pause between retry attempts to allow server-side
+		// rate limiting to reset and network conditions to stabilize.
 		time.Sleep(500 * time.Millisecond)
 
 		tcpConn2, err := dialWithTimeout(ctx, serverAddr)
@@ -801,6 +823,8 @@ func TestResumptionFingerprintPreservation(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for NewSessionTicket to be cached before making
+	// second connection that will attempt to resume.
 	time.Sleep(200 * time.Millisecond)
 
 	// Second connection - compare ClientHello (excluding PSK which changes)
@@ -888,6 +912,7 @@ func TestMultipleResumptions(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket to be processed and cached.
 	time.Sleep(200 * time.Millisecond)
 
 	// Multiple resumptions
@@ -926,6 +951,8 @@ func TestMultipleResumptions(t *testing.T) {
 		readWithTimeout(tlsConn, 500*time.Millisecond)
 		tlsConn.Close()
 
+		// FLAKY TEST NOTE: Small sleep between consecutive resumption attempts
+		// to avoid overwhelming the server with rapid reconnections.
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -971,6 +998,8 @@ func TestConcurrentResumptions(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for NewSessionTicket to be cached before
+	// starting concurrent resumption attempts.
 	time.Sleep(200 * time.Millisecond)
 
 	// Concurrent resumptions
@@ -1062,6 +1091,7 @@ func TestNoResumptionWithDisabledCache(t *testing.T) {
 		}
 
 		tlsConn.Close()
+		// FLAKY TEST NOTE: Small sleep to avoid connection rate limiting.
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -1097,6 +1127,8 @@ func TestNoResumptionWithSessionTicketsDisabled(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Even with SessionTicketsDisabled, we wait to ensure
+	// any async processing completes before checking the cache.
 	time.Sleep(200 * time.Millisecond)
 
 	// Cache should be empty since tickets are disabled
@@ -1173,6 +1205,7 @@ func TestResumptionWithDifferentServerNames(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket from first server to be cached.
 	time.Sleep(200 * time.Millisecond)
 	cacheCountAfterFirst := cache.Count()
 	t.Logf("Cache entries after first server: %d", cacheCountAfterFirst)
@@ -1240,6 +1273,8 @@ func TestEarlyDataRejection(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket to be cached before attempting
+	// early data test.
 	time.Sleep(200 * time.Millisecond)
 
 	// Second connection - attempt early data (will be rejected by most servers)
@@ -1311,6 +1346,8 @@ func TestHandshakeStatePSKFields(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket to be cached before checking
+	// PSK-related handshake state fields.
 	time.Sleep(200 * time.Millisecond)
 
 	// Second connection - check PSK fields
@@ -1377,6 +1414,7 @@ func BenchmarkResumption(b *testing.B) {
 	readWithTimeout(tlsConn, 2*time.Second)
 	tlsConn.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket to be cached before benchmark.
 	time.Sleep(200 * time.Millisecond)
 
 	if cache.Count() == 0 {
@@ -1474,6 +1512,8 @@ func TestResumptionErrorRecovery(t *testing.T) {
 	readWithTimeout(tlsConn1, 2*time.Second)
 	tlsConn1.Close()
 
+	// FLAKY TEST NOTE: Wait for session ticket to be cached before testing
+	// error recovery scenarios.
 	time.Sleep(200 * time.Millisecond)
 
 	// Multiple connection attempts - even if some fail, should eventually succeed
@@ -1508,6 +1548,8 @@ func TestResumptionErrorRecovery(t *testing.T) {
 		}
 
 		tlsConn.Close()
+		// FLAKY TEST NOTE: Small sleep between attempts to avoid overwhelming
+		// the server with rapid reconnection attempts.
 		time.Sleep(100 * time.Millisecond)
 	}
 

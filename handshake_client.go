@@ -28,6 +28,7 @@ import (
 	"github.com/refraction-networking/utls/internal/fips140tls"
 	"github.com/refraction-networking/utls/internal/hpke"
 	"github.com/refraction-networking/utls/internal/tls13"
+	"golang.org/x/net/idna"
 )
 
 type clientHandshakeState struct {
@@ -50,8 +51,12 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 	config := c.config
 
 	// [UTLS SECTION START]
+	// Validate that the config has enough information for certificate verification.
+	// Either ServerName must be set for hostname verification, or InsecureSkipVerify
+	// must be true to skip verification entirely. InsecureServerNameToVerify is also
+	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
 	if len(config.ServerName) == 0 && !config.InsecureSkipVerify && len(config.InsecureServerNameToVerify) == 0 {
-		return nil, nil, nil, errors.New("tls: at least one of ServerName, InsecureSkipVerify or InsecureServerNameToVerify must be specified in the tls.Config")
+		return nil, nil, nil, errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
 	}
 	// [UTLS SECTION END]
 
@@ -306,6 +311,13 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 		// Split hello into inner and outer
 		ech.innerHello = hello.clone()
 
+		// Clear PSK from outer hello to prevent privacy leak.
+		// PSK/session tickets in outer hello would be visible to network observers
+		// and could be used to correlate connections across sessions, defeating
+		// ECH's privacy goals. See draft-ietf-tls-esni-18 Section 6.1.4.
+		hello.pskIdentities = nil
+		hello.pskBinders = nil
+
 		// Overwrite the server name in the outer hello with the public facing
 		// name.
 		hello.serverName = string(ech.config.PublicName)
@@ -332,12 +344,32 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 	}
 
 	if hello.earlyData {
+		// Safety check: session must be non-nil when earlyData is set.
+		// Invariant: loadSession sets hello.earlyData=true only after accessing
+		// session.EarlyData, guaranteeing session is non-nil. This explicit check
+		// satisfies static analyzers and guards against future code changes.
+		if session == nil {
+			c.sendAlert(alertInternalError)
+			return errors.New("tls: internal error: earlyData set but session is nil")
+		}
 		suite := cipherSuiteTLS13ByID(session.cipherSuite)
+		// Safety check: cipher suite must be valid for TLS 1.3 early data.
+		// Invariant: loadSession validates cipherSuiteTLS13ByID(session.cipherSuite)
+		// at lines 525-528 before enabling earlyData. This explicit check satisfies
+		// static analyzers and provides clear error if invariant is violated.
+		if suite == nil {
+			c.sendAlert(alertInternalError)
+			return errors.New("tls: internal error: invalid cipher suite for early data")
+		}
 		transcript := suite.hash.New()
 		if err := transcriptMsg(hello, transcript); err != nil {
 			return err
 		}
-		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
+		earlyTrafficSecret, err := earlySecret.ClientEarlyTrafficSecret(transcript)
+		if err != nil {
+			c.sendAlert(alertInternalError)
+			return err
+		}
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
 	}
 
@@ -459,7 +491,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	// protect the application from a faulty ClientSessionCache implementation.
 	// [UTLS SECTION START]
 	if !c.config.InsecureSkipTimeVerify {
-		if c.config.time().After(session.peerCertificates[0].NotAfter) {
+		if len(session.peerCertificates) > 0 && c.config.time().After(session.peerCertificates[0].NotAfter) {
 			// Expired certificate, delete the entry.
 			c.config.ClientSessionCache.Put(cacheKey, nil)
 			return nil, nil, nil, nil
@@ -478,7 +510,8 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		} else if c.config.InsecureServerNameToVerify != "*" {
 			dnsName = c.config.InsecureServerNameToVerify
 		}
-		if len(dnsName) > 0 {
+		// Guard against empty peerCertificates slice before accessing [0]
+		if len(dnsName) > 0 && len(session.peerCertificates) > 0 {
 			if err := session.peerCertificates[0].VerifyHostname(dnsName); err != nil {
 				return nil, nil, nil, nil
 			}
@@ -550,16 +583,24 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		return nil, nil, nil, nil
 	}
 
+	// [uTLS] Use jittered ticket age computation to resist DPI correlation.
+	// The jitter simulates natural clock drift between client and server.
 	identity := pskIdentity{
 		label:               session.ticket,
-		obfuscatedTicketAge: uint32(ticketAgeMs) + session.ageAdd,
+		obfuscatedTicketAge: computeTicketAgeWithJitter(ticketAge, session.ageAdd, c.config),
 	}
 	hello.pskIdentities = []pskIdentity{identity}
 	hello.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
 
 	// Compute the PSK binders. See RFC 8446, Section 4.2.11.2.
-	earlySecret = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)
-	binderKey = earlySecret.ResumptionBinderKey()
+	earlySecret, err = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	binderKey, err = earlySecret.ResumptionBinderKey()
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	// [UTLS SECTION START]
 	if c.utls.sessionController != nil {
 		shouldWrite, writeErr := c.utls.sessionController.shouldLoadSessionWriteBinders()
@@ -572,7 +613,13 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	}
 	// [UTLS SECTION END]
 	transcript := cipherSuite.hash.New()
-	if err := computeAndUpdatePSK(hello, binderKey, transcript, cipherSuite.finishedHash); err != nil {
+	// [uTLS] Use constant-time binder computation when configured to prevent timing side-channel attacks.
+	// This is controlled by Config.PSKBinderConstantTime (defaults to true for security).
+	finishedHashFunc := cipherSuite.finishedHash
+	if c.config.PSKBinderConstantTime {
+		finishedHashFunc = cipherSuite.finishedHashConstantTime
+	}
+	if err := computeAndUpdatePSK(hello, binderKey, transcript, finishedHashFunc); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -604,10 +651,27 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 func (hs *clientHandshakeState) handshake() error {
 	c := hs.c
 
+	// [uTLS SECTION START]
+	// Initialize handshake timing controller for fingerprint resistance.
+	// Timing jitter simulates real browser behavior during handshakes.
+	var timingCtrl *handshakeTimingController
+	if hs.uconn != nil {
+		timingCtrl = hs.uconn.getHandshakeTimingController()
+	}
+	// [uTLS SECTION END]
+
 	isResume, err := hs.processServerHello()
 	if err != nil {
 		return err
 	}
+
+	// [uTLS SECTION START]
+	// Apply ServerHello timing delay to simulate parsing and processing time.
+	// Real browsers take measurable time to parse extensions and validate parameters.
+	if timingCtrl != nil {
+		timingCtrl.ApplyServerHelloDelay()
+	}
+	// [uTLS SECTION END]
 
 	hs.finishedHash = newFinishedHash(c.vers, hs.suite)
 
@@ -648,6 +712,14 @@ func (hs *clientHandshakeState) handshake() error {
 				return err
 			}
 		}
+		// [uTLS SECTION START]
+		// Apply Finished timing delay to simulate key derivation computation.
+		// Real browsers take time for final key schedule operations.
+		// Note: No certificate delay for resumed sessions as certs are not reverified.
+		if timingCtrl != nil {
+			timingCtrl.ApplyFinishedDelay()
+		}
+		// [uTLS SECTION END]
 		if err := hs.sendFinished(c.clientFinished[:]); err != nil {
 			return err
 		}
@@ -658,9 +730,24 @@ func (hs *clientHandshakeState) handshake() error {
 		if err := hs.doFullHandshake(); err != nil {
 			return err
 		}
+		// [uTLS SECTION START]
+		// Apply certificate timing delay to simulate chain verification.
+		// Real browsers spend significant time validating certificate chains,
+		// checking OCSP responses, and verifying signatures.
+		if timingCtrl != nil {
+			timingCtrl.ApplyCertificateDelay()
+		}
+		// [uTLS SECTION END]
 		if err := hs.establishKeys(); err != nil {
 			return err
 		}
+		// [uTLS SECTION START]
+		// Apply Finished timing delay to simulate key derivation computation.
+		// Real browsers take time for final key schedule operations.
+		if timingCtrl != nil {
+			timingCtrl.ApplyFinishedDelay()
+		}
+		// [uTLS SECTION END]
 		if err := hs.sendFinished(c.clientFinished[:]); err != nil {
 			return err
 		}
@@ -766,6 +853,8 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 	}
 
 	keyAgreement := hs.suite.ka(c.vers)
+	// Ensure key material is zeroed even on error paths
+	defer keyAgreement.cleanup()
 
 	skx, ok := msg.(*serverKeyExchangeMsg)
 	if ok {
@@ -908,8 +997,14 @@ func (hs *clientHandshakeState) establishKeys() error {
 	var clientHash, serverHash hash.Hash
 	if hs.suite.cipher != nil {
 		clientCipher = hs.suite.cipher(clientKey, clientIV, false /* not for reading */)
+		if clientCipher == nil {
+			return errors.New("tls: failed to create client cipher")
+		}
 		clientHash = hs.suite.mac(clientMAC)
 		serverCipher = hs.suite.cipher(serverKey, serverIV, true /* for reading */)
+		if serverCipher == nil {
+			return errors.New("tls: failed to create server cipher")
+		}
 		serverHash = hs.suite.mac(serverMAC)
 	} else {
 		clientCipher = hs.suite.aead(clientKey, clientIV)
@@ -952,7 +1047,7 @@ func (hs *clientHandshakeState) processServerHello() (bool, error) {
 		var expectedSecureRenegotiation [24]byte
 		copy(expectedSecureRenegotiation[:], c.clientFinished[:])
 		copy(expectedSecureRenegotiation[12:], c.serverFinished[:])
-		if !bytes.Equal(hs.serverHello.secureRenegotiation, expectedSecureRenegotiation[:]) {
+		if subtle.ConstantTimeCompare(hs.serverHello.secureRenegotiation, expectedSecureRenegotiation[:]) != 1 {
 			c.sendAlert(alertHandshakeFailure)
 			return false, errors.New("tls: incorrect renegotiation extension contents")
 		}
@@ -1156,7 +1251,12 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 			return errors.New("tls: failed to parse certificate from server: " + err.Error())
 		}
 		if cert.cert.PublicKeyAlgorithm == x509.RSA {
-			n := cert.cert.PublicKey.(*rsa.PublicKey).N.BitLen()
+			rsaKey, ok := cert.cert.PublicKey.(*rsa.PublicKey)
+			if !ok {
+				c.sendAlert(alertBadCertificate)
+				return errors.New("tls: certificate public key type mismatch for RSA algorithm")
+			}
+			n := rsaKey.N.BitLen()
 			if max, ok := checkKeySize(n); !ok {
 				c.sendAlert(alertBadCertificate)
 				return fmt.Errorf("tls: server sent certificate containing RSA key larger than %d bits", max)
@@ -1175,8 +1275,8 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 			}
 		} else {
 			opts := x509.VerifyOptions{
-				Roots:         c.config.RootCAs,
-				CurrentTime:   c.config.time(),
+				Roots:       c.config.RootCAs,
+				CurrentTime: c.config.time(),
 				// DNSName:       c.serverName, // [uTLS]
 				Intermediates: x509.NewCertPool(),
 				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -1212,8 +1312,8 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 	} else if !c.config.InsecureSkipVerify {
 		// [UTLS SECTION START]
 		opts := x509.VerifyOptions{
-			Roots:         c.config.RootCAs,
-			CurrentTime:   c.config.time(),
+			Roots:       c.config.RootCAs,
+			CurrentTime: c.config.time(),
 			// DNSName:       c.serverName, // [uTLS]
 			Intermediates: x509.NewCertPool(),
 			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -1256,6 +1356,34 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 
 	c.activeCertHandles = activeHandles
 	c.peerCertificates = certs
+
+	// [uTLS] Certificate Transparency validation per RFC 6962
+	// Validate SCTs if RequireCT is enabled. SCTs may come from:
+	// 1. TLS extension (c.scts, set in processServerHello or readServerCertificate)
+	// 2. X.509v3 certificate extension (embedded in leaf certificate)
+	// The validation happens after certificate chain verification to ensure we
+	// have verified certificates before trusting SCT signatures.
+	if c.config.RequireCT && !echRejected {
+		// Collect SCTs from all sources
+		allSCTs := make([][]byte, 0, len(c.scts)+8)
+
+		// Add SCTs from TLS extension (already stored in c.scts)
+		allSCTs = append(allSCTs, c.scts...)
+
+		// Extract SCTs from certificate extension if present
+		if certSCTs, err := ExtractSCTsFromCertificate(certs[0]); err == nil && len(certSCTs) > 0 {
+			allSCTs = append(allSCTs, certSCTs...)
+		}
+
+		// Validate all collected SCTs
+		if err := ValidateSCTs(certs[0], certs, allSCTs, c.config.CTLogs); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return &CertificateVerificationError{
+				UnverifiedCertificates: certs,
+				Err:                    fmt.Errorf("certificate transparency validation failed: %w", err),
+			}
+		}
+	}
 
 	if c.config.VerifyPeerCertificate != nil && !echRejected {
 		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
@@ -1370,7 +1498,8 @@ func (c *Conn) clientSessionCacheKey() string {
 
 // hostnameInSNI converts name into an appropriate hostname for SNI.
 // Literal IP addresses and absolute FQDNs are not permitted as SNI values.
-// See RFC 6066, Section 3.
+// Internationalized Domain Names (IDN) are converted to Punycode (ASCII form).
+// See RFC 6066, Section 3 and RFC 5891 (IDNA 2008).
 func hostnameInSNI(name string) string {
 	host := name
 	if len(host) > 0 && host[0] == '[' && host[len(host)-1] == ']' {
@@ -1385,15 +1514,34 @@ func hostnameInSNI(name string) string {
 	for len(name) > 0 && name[len(name)-1] == '.' {
 		name = name[:len(name)-1]
 	}
-	return name
+
+	// Convert IDN (Internationalized Domain Name) to Punycode (ASCII) form.
+	// SNI extension requires ASCII-compatible encoding per RFC 6066.
+	// idna.Lookup implements the IDNA 2008 Lookup protocol which:
+	// - Converts Unicode to Punycode (e.g., "xn--nxasmq5b" for Greek letters)
+	// - Validates the domain according to IDNA rules
+	// - Returns the original string if it's already ASCII
+	ascii, err := idna.Lookup.ToASCII(name)
+	if err != nil {
+		// If IDN conversion fails, return the original name.
+		// This maintains backward compatibility - the connection may still
+		// succeed if the server accepts the non-ASCII name, or fail with
+		// a more informative error during handshake.
+		return name
+	}
+	return ascii
 }
 
-func computeAndUpdatePSK(m *clientHelloMsg, binderKey []byte, transcript hash.Hash, finishedHash func([]byte, hash.Hash) []byte) error {
+func computeAndUpdatePSK(m *clientHelloMsg, binderKey []byte, transcript hash.Hash, finishedHash func([]byte, hash.Hash) ([]byte, error)) error {
 	helloBytes, err := m.marshalWithoutBinders()
 	if err != nil {
 		return err
 	}
 	transcript.Write(helloBytes)
-	pskBinders := [][]byte{finishedHash(binderKey, transcript)}
+	binder, err := finishedHash(binderKey, transcript)
+	if err != nil {
+		return err
+	}
+	pskBinders := [][]byte{binder}
 	return m.updateBinders(pskBinders)
 }

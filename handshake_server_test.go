@@ -154,11 +154,13 @@ func TestNoRC4ByDefault(t *testing.T) {
 }
 
 func TestRejectSNIWithTrailingDot(t *testing.T) {
+	// RFC 8446 Section 6: When a message fails to parse (e.g., invalid SNI),
+	// decode_error should be sent, not unexpected_message.
 	testClientHelloFailure(t, testConfig, &clientHelloMsg{
 		vers:       VersionTLS12,
 		random:     make([]byte, 32),
 		serverName: "foo.com.",
-	}, "unexpected message")
+	}, "error decoding message")
 }
 
 func TestDontSelectECDSAWithRSAKey(t *testing.T) {
@@ -1284,7 +1286,7 @@ func TestHandshakeServerExportKeyingMaterial(t *testing.T) {
 		config:  testConfig.Clone(),
 		validate: func(state ConnectionState) error {
 			if km, err := state.ExportKeyingMaterial("test", nil, 42); err != nil {
-				return fmt.Errorf("ExportKeyingMaterial failed: %v", err)
+				return fmt.Errorf("ExportKeyingMaterial failed: %w", err)
 			} else if len(km) != 42 {
 				return fmt.Errorf("Got %d bytes from ExportKeyingMaterial, wanted %d", len(km), 42)
 			}

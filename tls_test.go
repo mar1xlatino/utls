@@ -402,7 +402,7 @@ func testConnReadNonzeroAndEOF(t *testing.T, delay time.Duration) error {
 		serverConfig := testConfig.Clone()
 		srv := Server(sconn, serverConfig)
 		if err := srv.Handshake(); err != nil {
-			serr = fmt.Errorf("handshake: %v", err)
+			serr = fmt.Errorf("handshake: %w", err)
 			srvCh <- nil
 			return
 		}
@@ -440,7 +440,7 @@ func testConnReadNonzeroAndEOF(t *testing.T, delay time.Duration) error {
 		return fmt.Errorf("Read = %d, buf= %q; want 6, abcdef", n, buf)
 	}
 	if err != io.EOF {
-		return fmt.Errorf("Second Read error = %v; want io.EOF", err)
+		return fmt.Errorf("Second Read error = %w; want io.EOF", err)
 	}
 	return nil
 }
@@ -562,7 +562,7 @@ func TestConnCloseBreakingWrite(t *testing.T) {
 		serverConfig := testConfig.Clone()
 		srv := Server(sconn, serverConfig)
 		if err := srv.Handshake(); err != nil {
-			serr = fmt.Errorf("handshake: %v", err)
+			serr = fmt.Errorf("handshake: %w", err)
 			srvCh <- nil
 			return
 		}
@@ -632,14 +632,14 @@ func TestConnCloseWrite(t *testing.T) {
 	serverCloseWrite := func() error {
 		sconn, err := ln.Accept()
 		if err != nil {
-			return fmt.Errorf("accept: %v", err)
+			return fmt.Errorf("accept: %w", err)
 		}
 		defer sconn.Close()
 
 		serverConfig := testConfig.Clone()
 		srv := Server(sconn, serverConfig)
 		if err := srv.Handshake(); err != nil {
-			return fmt.Errorf("handshake: %v", err)
+			return fmt.Errorf("handshake: %w", err)
 		}
 		defer srv.Close()
 
@@ -652,7 +652,7 @@ func TestConnCloseWrite(t *testing.T) {
 		}
 
 		if err := srv.CloseWrite(); err != nil {
-			return fmt.Errorf("server CloseWrite: %v", err)
+			return fmt.Errorf("server CloseWrite: %w", err)
 		}
 
 		// Wait for clientCloseWrite to finish, so we know we
@@ -677,11 +677,11 @@ func TestConnCloseWrite(t *testing.T) {
 		defer conn.Close()
 
 		if err := conn.CloseWrite(); err != nil {
-			return fmt.Errorf("client CloseWrite: %v", err)
+			return fmt.Errorf("client CloseWrite: %w", err)
 		}
 
 		if _, err := conn.Write([]byte{0}); err != errShutdown {
-			return fmt.Errorf("CloseWrite error = %v; want errShutdown", err)
+			return fmt.Errorf("CloseWrite error = %w; want errShutdown", err)
 		}
 
 		data, err := io.ReadAll(conn)
@@ -736,14 +736,14 @@ func TestWarningAlertFlood(t *testing.T) {
 	server := func() error {
 		sconn, err := ln.Accept()
 		if err != nil {
-			return fmt.Errorf("accept: %v", err)
+			return fmt.Errorf("accept: %w", err)
 		}
 		defer sconn.Close()
 
 		serverConfig := testConfig.Clone()
 		srv := Server(sconn, serverConfig)
 		if err := srv.Handshake(); err != nil {
-			return fmt.Errorf("handshake: %v", err)
+			return fmt.Errorf("handshake: %w", err)
 		}
 		defer srv.Close()
 
@@ -905,6 +905,22 @@ func TestCloneNonFuncFields(t *testing.T) {
 			f.Set(reflect.ValueOf(map[string][]byte{"a": {1}}))
 		case "RecordPadding": // [UTLS] TLS 1.3 record padding
 			f.Set(reflect.ValueOf(&RecordPaddingConfig{Enabled: true, MinPadding: 1, MaxPadding: 16}))
+		case "CloseNotifyTimeout": // [uTLS] configurable close_notify timeout
+			f.Set(reflect.ValueOf(time.Second * 10))
+		case "CloseNotifyJitter": // [uTLS] close_notify timing jitter
+			f.Set(reflect.ValueOf(&CloseNotifyConfig{Enabled: true, MinDelayMs: 0, MaxDelayMs: 50, SkipProbability: 0.1}))
+		case "EnableMemoryTracking": // [uTLS] memory-aware connection tracking
+			f.Set(reflect.ValueOf(true))
+		case "PSKBinderConstantTime": // [uTLS] constant-time PSK binder
+			f.Set(reflect.ValueOf(true))
+		case "TicketAgeJitter": // [uTLS] ticket age jitter
+			f.Set(reflect.ValueOf(&TicketAgeJitterConfig{Enabled: true, MaxJitterMs: 500}))
+		case "AcceptDelegatedCredentials": // [uTLS] RFC 9345 Delegated Credentials
+			f.Set(reflect.ValueOf(true))
+		case "RequireCT": // [uTLS] RFC 6962 Certificate Transparency
+			f.Set(reflect.ValueOf(true))
+		case "CTLogs": // [uTLS] Custom CT logs for validation
+			f.Set(reflect.ValueOf(map[[32]byte]*CTLogInfo{{1}: {URL: "test"}}))
 		default:
 			t.Errorf("all fields must be accounted for, but saw unknown field %q", fn)
 		}
@@ -965,17 +981,17 @@ func throughput(b *testing.B, version uint16, totalBytes int64, dynamicRecordSiz
 			if err != nil {
 				// panic rather than synchronize to avoid benchmark overhead
 				// (cannot call b.Fatal in goroutine)
-				panic(fmt.Errorf("accept: %v", err))
+				panic(fmt.Errorf("accept: %w", err))
 			}
 			serverConfig := testConfig.Clone()
 			serverConfig.CipherSuites = nil // the defaults may prefer faster ciphers
 			serverConfig.DynamicRecordSizingDisabled = dynamicRecordSizingDisabled
 			srv := Server(sconn, serverConfig)
 			if err := srv.Handshake(); err != nil {
-				panic(fmt.Errorf("handshake: %v", err))
+				panic(fmt.Errorf("handshake: %w", err))
 			}
 			if _, err := io.CopyBuffer(srv, srv, buf); err != nil {
-				panic(fmt.Errorf("copy buffer: %v", err))
+				panic(fmt.Errorf("copy buffer: %w", err))
 			}
 		}
 	}()
@@ -1063,13 +1079,13 @@ func latency(b *testing.B, version uint16, bps int, dynamicRecordSizingDisabled 
 			if err != nil {
 				// panic rather than synchronize to avoid benchmark overhead
 				// (cannot call b.Fatal in goroutine)
-				panic(fmt.Errorf("accept: %v", err))
+				panic(fmt.Errorf("accept: %w", err))
 			}
 			serverConfig := testConfig.Clone()
 			serverConfig.DynamicRecordSizingDisabled = dynamicRecordSizingDisabled
 			srv := Server(&slowConn{sconn, bps}, serverConfig)
 			if err := srv.Handshake(); err != nil {
-				panic(fmt.Errorf("handshake: %v", err))
+				panic(fmt.Errorf("handshake: %w", err))
 			}
 			io.Copy(srv, srv)
 		}

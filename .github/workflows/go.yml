@@ -26,4 +26,17 @@ jobs:
       - name: Build
         run: go build -v ./...
       - name: Test
-        run: go test -v ./...
+        run: go test -v -timeout 5m ./...
+
+  race-detection:
+    name: Race Detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version: "1.24.x"
+      - name: Run tests with race detector
+        run: go test -race -v -timeout 15m ./...
+        env:
+          GORACE: "halt_on_error=1"

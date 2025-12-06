@@ -25,6 +25,15 @@ type testQUICConn struct {
 }
 
 func newTestQUICClient(t *testing.T, config *QUICConfig) *testQUICConn {
+	// RFC 9001 Section 8.1: QUIC connections MUST negotiate ALPN.
+	// Add default ALPN if not configured.
+	if len(config.TLSConfig.NextProtos) == 0 {
+		config.TLSConfig.NextProtos = []string{"h3"}
+	}
+	// CRITICAL: Reset Rand to nil to use crypto/rand instead of zeroSource.
+	// testConfig uses zeroSource{} for deterministic testing, but QUIC requires
+	// actual random bytes - zeros cause "error decoding message".
+	config.TLSConfig.Rand = nil
 	q := &testQUICConn{
 		t:    t,
 		conn: QUICClient(config),
@@ -36,6 +45,15 @@ func newTestQUICClient(t *testing.T, config *QUICConfig) *testQUICConn {
 }
 
 func newTestQUICServer(t *testing.T, config *QUICConfig) *testQUICConn {
+	// RFC 9001 Section 8.1: QUIC connections MUST negotiate ALPN.
+	// Add default ALPN if not configured.
+	if len(config.TLSConfig.NextProtos) == 0 {
+		config.TLSConfig.NextProtos = []string{"h3"}
+	}
+	// CRITICAL: Reset Rand to nil to use crypto/rand instead of zeroSource.
+	// testConfig uses zeroSource{} for deterministic testing, but QUIC requires
+	// actual random bytes - zeros cause "error decoding message".
+	config.TLSConfig.Rand = nil
 	q := &testQUICConn{
 		t:    t,
 		conn: QUICServer(config),
@@ -292,7 +310,7 @@ func TestQUICPostHandshakeClientAuthentication(t *testing.T) {
 }
 
 func TestQUICPostHandshakeKeyUpdate(t *testing.T) {
-	// RFC 9001, Section 6.
+	// RFC 9001, Section 6: Key updates are not allowed in QUIC.
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 	cli := newTestQUICClient(t, config)
@@ -308,10 +326,9 @@ func TestQUICPostHandshakeKeyUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cli.conn.HandleData(QUICEncryptionLevelApplication, append([]byte{
-		byte(typeKeyUpdate),
-		byte(0), byte(0), byte(len(keyUpdateBytes)),
-	}, keyUpdateBytes...)); !errors.Is(err, alertUnexpectedMessage) {
+	// keyUpdateBytes is the complete marshaled message including header.
+	// Key updates should be rejected with unexpected_message in QUIC context.
+	if err := cli.conn.HandleData(QUICEncryptionLevelApplication, keyUpdateBytes); !errors.Is(err, alertUnexpectedMessage) {
 		t.Fatalf("key update request: got error %v, want alertUnexpectedMessage", err)
 	}
 }

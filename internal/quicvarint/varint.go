@@ -6,11 +6,24 @@
 package quicvarint
 
 import (
-	"fmt"
+	"errors"
 	"io"
 
 	"github.com/refraction-networking/utls/internal/quicvarint/protocol"
 )
+
+// ErrNonMinimalEncoding is returned when a varint is encoded using more bytes
+// than necessary, violating RFC 9000 Section 16 which requires minimal encoding.
+var ErrNonMinimalEncoding = errors.New("quic: varint uses non-minimal encoding")
+
+// ErrValueTooLarge is returned when a value exceeds the maximum QUIC varint (2^62-1).
+var ErrValueTooLarge = errors.New("quic: value exceeds maximum varint (2^62-1)")
+
+// ErrInvalidLength is returned when an invalid length is specified for AppendWithLen.
+var ErrInvalidLength = errors.New("quic: invalid varint length (must be 1, 2, 4, or 8)")
+
+// ErrValueTooLargeForLength is returned when a value cannot fit in the specified length.
+var ErrValueTooLargeForLength = errors.New("quic: value too large for specified length")
 
 // taken from the QUIC draft
 const (
@@ -26,23 +39,97 @@ const (
 	maxVarInt8 = 4611686018427387903
 )
 
+// IsValidVarint returns true if i can be encoded as a QUIC variable-length integer.
+// Valid values are in the range [0, 2^62-1].
+func IsValidVarint(i uint64) bool {
+	return i <= maxVarInt8
+}
+
 // Read reads a number in the QUIC varint format from r.
+// Returns ErrNonMinimalEncoding if the value uses more bytes than necessary,
+// as required by RFC 9000 Section 16.
 func Read(r io.ByteReader) (uint64, error) {
 	firstByte, err := r.ReadByte()
 	if err != nil {
 		return 0, err
 	}
 	// the first two bits of the first byte encode the length
-	len := 1 << ((firstByte & 0xc0) >> 6)
+	numBytes := 1 << ((firstByte & 0xc0) >> 6)
 	b1 := firstByte & (0xff - 0xc0)
-	if len == 1 {
+	if numBytes == 1 {
 		return uint64(b1), nil
 	}
 	b2, err := r.ReadByte()
 	if err != nil {
 		return 0, err
 	}
-	if len == 2 {
+	if numBytes == 2 {
+		val := uint64(b2) + uint64(b1)<<8
+		// RFC 9000 Section 16: 2-byte encoding requires val >= 64
+		if val < 64 {
+			return 0, ErrNonMinimalEncoding
+		}
+		return val, nil
+	}
+	b3, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b4, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	if numBytes == 4 {
+		val := uint64(b4) + uint64(b3)<<8 + uint64(b2)<<16 + uint64(b1)<<24
+		// RFC 9000 Section 16: 4-byte encoding requires val >= 16384
+		if val < 16384 {
+			return 0, ErrNonMinimalEncoding
+		}
+		return val, nil
+	}
+	b5, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b6, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b7, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	b8, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	val := uint64(b8) + uint64(b7)<<8 + uint64(b6)<<16 + uint64(b5)<<24 + uint64(b4)<<32 + uint64(b3)<<40 + uint64(b2)<<48 + uint64(b1)<<56
+	// RFC 9000 Section 16: 8-byte encoding requires val >= 1073741824
+	if val < 1073741824 {
+		return 0, ErrNonMinimalEncoding
+	}
+	return val, nil
+}
+
+// ReadLenient reads a number in the QUIC varint format from r.
+// Unlike Read, this function accepts non-minimal encodings for compatibility
+// with implementations that may not strictly follow RFC 9000 Section 16.
+func ReadLenient(r io.ByteReader) (uint64, error) {
+	firstByte, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	// the first two bits of the first byte encode the length
+	numBytes := 1 << ((firstByte & 0xc0) >> 6)
+	b1 := firstByte & (0xff - 0xc0)
+	if numBytes == 1 {
+		return uint64(b1), nil
+	}
+	b2, err := r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	if numBytes == 2 {
 		return uint64(b2) + uint64(b1)<<8, nil
 	}
 	b3, err := r.ReadByte()
@@ -53,7 +140,7 @@ func Read(r io.ByteReader) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len == 4 {
+	if numBytes == 4 {
 		return uint64(b4) + uint64(b3)<<8 + uint64(b2)<<16 + uint64(b1)<<24, nil
 	}
 	b5, err := r.ReadByte()
@@ -76,36 +163,44 @@ func Read(r io.ByteReader) (uint64, error) {
 }
 
 // Append appends i in the QUIC varint format.
-func Append(b []byte, i uint64) []byte {
+// Returns ErrValueTooLarge if i > 2^62-1 (Max, the maximum QUIC varint value).
+func Append(b []byte, i uint64) ([]byte, error) {
 	if i <= maxVarInt1 {
-		return append(b, uint8(i))
+		return append(b, uint8(i)), nil
 	}
 	if i <= maxVarInt2 {
-		return append(b, []byte{uint8(i>>8) | 0x40, uint8(i)}...)
+		return append(b, []byte{uint8(i>>8) | 0x40, uint8(i)}...), nil
 	}
 	if i <= maxVarInt4 {
-		return append(b, []byte{uint8(i>>24) | 0x80, uint8(i >> 16), uint8(i >> 8), uint8(i)}...)
+		return append(b, []byte{uint8(i>>24) | 0x80, uint8(i >> 16), uint8(i >> 8), uint8(i)}...), nil
 	}
 	if i <= maxVarInt8 {
 		return append(b, []byte{
 			uint8(i>>56) | 0xc0, uint8(i >> 48), uint8(i >> 40), uint8(i >> 32),
 			uint8(i >> 24), uint8(i >> 16), uint8(i >> 8), uint8(i),
-		}...)
+		}...), nil
 	}
-	panic(fmt.Sprintf("%#x doesn't fit into 62 bits", i))
+	return nil, ErrValueTooLarge
 }
 
-// AppendWithLen append i in the QUIC varint format with the desired length.
-func AppendWithLen(b []byte, i uint64, length protocol.ByteCount) []byte {
+// AppendWithLen appends i in the QUIC varint format with the desired length.
+// Returns:
+//   - ErrInvalidLength if length is not 1, 2, 4, or 8
+//   - ErrValueTooLargeForLength if i cannot be encoded in the specified length
+//   - ErrValueTooLarge if i > 2^62-1
+func AppendWithLen(b []byte, i uint64, length protocol.ByteCount) ([]byte, error) {
 	if length != 1 && length != 2 && length != 4 && length != 8 {
-		panic("invalid varint length")
+		return nil, ErrInvalidLength
 	}
-	l := Len(i)
+	l, err := Len(i)
+	if err != nil {
+		return nil, err
+	}
 	if l == length {
 		return Append(b, i)
 	}
 	if l > length {
-		panic(fmt.Sprintf("cannot encode %d in %d bytes", i, length))
+		return nil, ErrValueTooLargeForLength
 	}
 	if length == 2 {
 		b = append(b, 0b01000000)
@@ -120,27 +215,23 @@ func AppendWithLen(b []byte, i uint64, length protocol.ByteCount) []byte {
 	for j := protocol.ByteCount(0); j < l; j++ {
 		b = append(b, uint8(i>>(8*(l-1-j))))
 	}
-	return b
+	return b, nil
 }
 
 // Len determines the number of bytes that will be needed to write the number i.
-func Len(i uint64) protocol.ByteCount {
+// Returns ErrValueTooLarge if i > 2^62-1 (Max, the maximum QUIC varint value).
+func Len(i uint64) (protocol.ByteCount, error) {
 	if i <= maxVarInt1 {
-		return 1
+		return 1, nil
 	}
 	if i <= maxVarInt2 {
-		return 2
+		return 2, nil
 	}
 	if i <= maxVarInt4 {
-		return 4
+		return 4, nil
 	}
 	if i <= maxVarInt8 {
-		return 8
+		return 8, nil
 	}
-	// Don't use a fmt.Sprintf here to format the error message.
-	// The function would then exceed the inlining budget.
-	panic(struct {
-		message string
-		num     uint64
-	}{"value doesn't fit into 62 bits: ", i})
+	return 0, ErrValueTooLarge
 }

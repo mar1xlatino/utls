@@ -15,7 +15,6 @@ import (
 	"math/big"
 	"math/rand"
 	"sort"
-	"strconv"
 
 	"github.com/refraction-networking/utls/dicttls"
 )
@@ -152,8 +151,11 @@ var firefoxSignatureAlgorithmsLegacy = []SignatureScheme{
 	PKCS1WithSHA1,
 }
 
-// Firefox signature algorithms for modern versions (no SHA1)
-var firefoxSignatureAlgorithms = []SignatureScheme{
+// Firefox signature algorithms for latest versions (Firefox 145+, 2025)
+// SHA1 removed: Modern Firefox (2025+) no longer includes deprecated SHA1 variants
+// as they are considered cryptographically weak and anachronistic in fingerprints.
+// Using SHA1 in modern browser fingerprints is a DPI detection vector.
+var firefoxSignatureAlgorithmsModern = []SignatureScheme{
 	ECDSAWithP256AndSHA256,
 	ECDSAWithP384AndSHA384,
 	ECDSAWithP521AndSHA512,
@@ -165,6 +167,166 @@ var firefoxSignatureAlgorithms = []SignatureScheme{
 	PKCS1WithSHA512,
 }
 
+// Safari/iOS signature algorithms for modern versions (Safari 26+, iOS 26+, 2025)
+// SHA1 removed: Modern Safari/iOS (2025+) no longer includes deprecated SHA1 variants
+// as they are considered cryptographically weak and anachronistic in fingerprints.
+// Using SHA1 in modern browser fingerprints is a DPI detection vector.
+var safariSignatureAlgorithmsModern = []SignatureScheme{
+	ECDSAWithP256AndSHA256,
+	PSSWithSHA256,
+	PKCS1WithSHA256,
+	ECDSAWithP384AndSHA384,
+	PSSWithSHA384,
+	PKCS1WithSHA384,
+	PSSWithSHA512,
+	PKCS1WithSHA512,
+}
+
+// =============================================================================
+// Cipher Suite Ordering Based on Hardware Capabilities
+// =============================================================================
+//
+// Real browsers (Chrome, Edge) reorder cipher suites based on AES-NI availability:
+//   - With AES hardware: AES-GCM suites first (faster with hardware acceleration)
+//   - Without AES hardware: ChaCha20 suites first (faster in software)
+//
+// This ordering is visible in the ClientHello and affects JA3/JA4 fingerprints.
+// Static ordering across all connections is a detection vector since real
+// browsers show variation based on the underlying hardware.
+//
+// The following functions implement dynamic cipher suite reordering.
+// =============================================================================
+
+// chachaCipherSuites contains all ChaCha20-Poly1305 cipher suite IDs.
+// Used for dynamic reordering based on hardware capabilities.
+var chachaCipherSuites = map[uint16]bool{
+	TLS_CHACHA20_POLY1305_SHA256:           true, // TLS 1.3
+	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305: true, // TLS 1.2
+	TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305:   true, // TLS 1.2
+}
+
+// aesGCMCipherSuites contains all AES-GCM cipher suite IDs.
+// Used for dynamic reordering based on hardware capabilities.
+var aesGCMCipherSuites = map[uint16]bool{
+	// TLS 1.3
+	TLS_AES_128_GCM_SHA256: true,
+	TLS_AES_256_GCM_SHA384: true,
+	// TLS 1.2
+	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: true,
+	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: true,
+	TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:   true,
+	TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:   true,
+	TLS_RSA_WITH_AES_128_GCM_SHA256:         true,
+	TLS_RSA_WITH_AES_256_GCM_SHA384:         true,
+}
+
+// IsChaCha20CipherSuite returns true if the cipher suite is ChaCha20-Poly1305.
+func IsChaCha20CipherSuite(id uint16) bool {
+	return chachaCipherSuites[id]
+}
+
+// IsAESGCMCipherSuite returns true if the cipher suite is AES-GCM.
+func IsAESGCMCipherSuite(id uint16) bool {
+	return aesGCMCipherSuites[id]
+}
+
+// ReorderCipherSuitesForHardware reorders cipher suites based on hardware capabilities.
+// This mimics real browser behavior where:
+//   - With AES-NI: AES-GCM suites are placed before ChaCha20
+//   - Without AES-NI: ChaCha20 suites are placed before AES-GCM
+//
+// The function preserves the relative order within AES-GCM and ChaCha20 groups,
+// and keeps other cipher suites (CBC, RSA-only, etc.) in their original positions.
+//
+// Parameters:
+//   - ciphers: The original cipher suite list
+//   - preferAES: If true, order AES-GCM before ChaCha20; if false, reverse
+//
+// Returns a new slice with reordered cipher suites (does not modify input).
+func ReorderCipherSuitesForHardware(ciphers []uint16, preferAES bool) []uint16 {
+	if len(ciphers) == 0 {
+		return ciphers
+	}
+
+	// Separate cipher suites into categories, preserving original order within each
+	var aesGCM []uint16 // AES-GCM cipher suites
+	var chacha []uint16 // ChaCha20-Poly1305 cipher suites
+	var other []uint16  // Everything else (CBC, RSA-only, 3DES, etc.)
+
+	// Track original GREASE positions for restoration
+	greasePositions := make(map[int]uint16)
+
+	for i, c := range ciphers {
+		if isGREASEUint16(c) {
+			greasePositions[i] = c
+		} else if IsAESGCMCipherSuite(c) {
+			aesGCM = append(aesGCM, c)
+		} else if IsChaCha20CipherSuite(c) {
+			chacha = append(chacha, c)
+		} else {
+			other = append(other, c)
+		}
+	}
+
+	// Build reordered list: preferred algorithm first, then the other, then rest
+	result := make([]uint16, 0, len(ciphers))
+
+	if preferAES {
+		// AES-GCM first (hardware accelerated), then ChaCha20, then others
+		result = append(result, aesGCM...)
+		result = append(result, chacha...)
+	} else {
+		// ChaCha20 first (faster in software), then AES-GCM, then others
+		result = append(result, chacha...)
+		result = append(result, aesGCM...)
+	}
+	result = append(result, other...)
+
+	// Restore GREASE values at their original positions
+	// GREASE is typically at position 0 for Chrome
+	if len(greasePositions) > 0 {
+		// Find the first GREASE position (usually 0 for Chrome)
+		for pos, greaseVal := range greasePositions {
+			if pos == 0 {
+				// Insert GREASE at the beginning
+				result = append([]uint16{greaseVal}, result...)
+			}
+			// Note: Chrome only has one GREASE at position 0 for cipher suites
+			// If other positions are needed, expand this logic
+		}
+	}
+
+	return result
+}
+
+// ApplyCipherSuiteOrder applies the cipher suite ordering hint to a cipher suite list.
+// This is the main entry point for cipher suite reordering based on hardware.
+//
+// Parameters:
+//   - ciphers: The original cipher suite list from the profile
+//   - hint: The ordering hint (auto, aes-first, chacha-first, static)
+//
+// Returns a new slice with reordered cipher suites.
+func ApplyCipherSuiteOrder(ciphers []uint16, hint CipherSuiteOrderHint) []uint16 {
+	switch hint {
+	case CipherSuiteOrderAuto:
+		// Detect hardware and order accordingly
+		return ReorderCipherSuitesForHardware(ciphers, HasAESGCMHardwareSupport())
+	case CipherSuiteOrderAESFirst:
+		// Force AES-GCM first
+		return ReorderCipherSuitesForHardware(ciphers, true)
+	case CipherSuiteOrderChaChaFirst:
+		// Force ChaCha20 first
+		return ReorderCipherSuitesForHardware(ciphers, false)
+	case CipherSuiteOrderStatic, "":
+		// Use profile's exact order (legacy behavior)
+		return ciphers
+	default:
+		// Unknown hint, use static order for safety
+		return ciphers
+	}
+}
+
 // UTLSIdToSpec converts a ClientHelloID to a corresponding ClientHelloSpec.
 func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	switch id {
@@ -172,6 +334,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -194,6 +357,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
@@ -210,6 +374,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -234,6 +399,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
@@ -250,6 +416,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -269,6 +436,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
 				}},
@@ -283,6 +451,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -303,6 +472,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
 				}},
@@ -316,6 +486,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -336,6 +507,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
 				}},
@@ -349,6 +521,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -369,6 +542,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
 				}},
@@ -384,6 +558,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -404,6 +579,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{
 					GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12,
 				}},
@@ -414,9 +590,22 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			}),
 		}, nil
 	case HelloFirefox_120:
+		// =============================================================================
+		// CRITICAL: FFDHE DETECTION VECTOR - READ BEFORE USING THIS PROFILE
+		// =============================================================================
+		// This profile advertises FFDHE groups (FakeCurveFFDHE2048, FakeCurveFFDHE3072) to
+		// match real Firefox. However, uTLS CANNOT generate FFDHE key shares.
+		//
+		// DETECTION RISK: If a server selects FFDHE via HelloRetryRequest, handshake FAILS.
+		// This provides 100% detection for fingerprint-aware servers.
+		//
+		// MITIGATION: Call spec.RemoveFFDHEGroups() to remove FFDHE groups (with fingerprint
+		// deviation trade-off). See IsFFDHEGroup() and RemoveFFDHEGroups() in u_common.go.
+		// =============================================================================
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       firefoxCipherSuites,
 			CompressionMethods: []uint8{0x0},
 			Extensions: []TLSExtension{
@@ -424,6 +613,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&ExtendedMasterSecretExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&SupportedCurvesExtension{Curves: []CurveID{
+					// FFDHE groups below are FAKE - use RemoveFFDHEGroups() to remove them
 					X25519, CurveP256, CurveP384, CurveP521, FakeCurveFFDHE2048, FakeCurveFFDHE3072,
 				}},
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
@@ -435,6 +625,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				}},
 				&KeyShareExtension{KeyShares: []KeyShare{{Group: X25519}, {Group: CurveP256}}},
 				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
+				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsLegacy},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
 				&FakeRecordSizeLimitExtension{Limit: 0x4001},
@@ -451,9 +642,22 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		}, nil
 	case HelloFirefox_145:
 		// Firefox 145 (November 2025) with extension shuffling and X25519MLKEM768
+		// =============================================================================
+		// CRITICAL: FFDHE DETECTION VECTOR - READ BEFORE USING THIS PROFILE
+		// =============================================================================
+		// This profile advertises FFDHE groups (FakeCurveFFDHE2048, FakeCurveFFDHE3072) to
+		// match real Firefox. However, uTLS CANNOT generate FFDHE key shares.
+		//
+		// DETECTION RISK: If a server selects FFDHE via HelloRetryRequest, handshake FAILS.
+		// This provides 100% detection for fingerprint-aware servers.
+		//
+		// MITIGATION: Call spec.RemoveFFDHEGroups() to remove FFDHE groups (with fingerprint
+		// deviation trade-off). See IsFFDHEGroup() and RemoveFFDHEGroups() in u_common.go.
+		// =============================================================================
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       firefoxCipherSuites,
 			CompressionMethods: []uint8{0x0},
 			Extensions: ShuffleFirefoxTLSExtensions([]TLSExtension{
@@ -461,6 +665,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&ExtendedMasterSecretExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&SupportedCurvesExtension{Curves: []CurveID{
+					// FFDHE groups below are FAKE - use RemoveFFDHEGroups() to remove them
 					X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521, FakeCurveFFDHE2048, FakeCurveFFDHE3072,
 				}},
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
@@ -475,7 +680,112 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519MLKEM768}, {Group: X25519}, {Group: CurveP256},
 				}},
 				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
-				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithms},
+				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
+				// SHA1 removed from Firefox 145+: Modern Firefox no longer includes deprecated SHA1
+				// signature algorithms (ECDSAWithSHA1, PKCS1WithSHA1) as they are cryptographically weak.
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsModern},
+				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&FakeRecordSizeLimitExtension{Limit: 0x4001},
+				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{
+					CertCompressionZlib, CertCompressionBrotli, CertCompressionZstd,
+				}},
+				&GREASEEncryptedClientHelloExtension{
+					CandidateCipherSuites: []HPKESymmetricCipherSuite{
+						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_AES_128_GCM},
+						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_CHACHA20_POLY1305},
+					},
+					CandidatePayloadLens: []uint16{223},
+				},
+			}),
+		}, nil
+	case HelloFirefox_120_NoFFDHE:
+		// Firefox 120 WITHOUT FFDHE groups (safer variant)
+		// =============================================================================
+		// This profile is identical to HelloFirefox_120 but with FFDHE groups removed
+		// from supported_groups. This prevents the 100% detection vector that occurs
+		// when a server selects FFDHE via HelloRetryRequest.
+		//
+		// TRADE-OFF: The TLS fingerprint deviates from real Firefox (which includes
+		// FFDHE groups). However, this deviation is much safer than the guaranteed
+		// detection that occurs when FFDHE is selected by a probing server.
+		// =============================================================================
+		return ClientHelloSpec{
+			TLSVersMin:         VersionTLS12,
+			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
+			CipherSuites:       firefoxCipherSuites,
+			CompressionMethods: []uint8{0x0},
+			Extensions: []TLSExtension{
+				&SNIExtension{},
+				&ExtendedMasterSecretExtension{},
+				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
+				&SupportedCurvesExtension{Curves: []CurveID{
+					// FFDHE groups intentionally omitted for safety
+					X25519, CurveP256, CurveP384, CurveP521,
+				}},
+				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
+				&SessionTicketExtension{},
+				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+				&StatusRequestExtension{},
+				&FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
+					ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512, ECDSAWithSHA1,
+				}},
+				&KeyShareExtension{KeyShares: []KeyShare{{Group: X25519}, {Group: CurveP256}}},
+				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
+				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsLegacy},
+				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&FakeRecordSizeLimitExtension{Limit: 0x4001},
+				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli, CertCompressionZlib}},
+				&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle},
+				&GREASEEncryptedClientHelloExtension{
+					CandidateCipherSuites: []HPKESymmetricCipherSuite{
+						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_AES_128_GCM},
+						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_CHACHA20_POLY1305},
+					},
+					CandidatePayloadLens: []uint16{223},
+				},
+			},
+		}, nil
+	case HelloFirefox_145_NoFFDHE:
+		// Firefox 145 WITHOUT FFDHE groups (safer variant)
+		// =============================================================================
+		// This profile is identical to HelloFirefox_145 but with FFDHE groups removed
+		// from supported_groups. This prevents the 100% detection vector that occurs
+		// when a server selects FFDHE via HelloRetryRequest.
+		//
+		// TRADE-OFF: The TLS fingerprint deviates from real Firefox (which includes
+		// FFDHE groups). However, this deviation is much safer than the guaranteed
+		// detection that occurs when FFDHE is selected by a probing server.
+		// =============================================================================
+		return ClientHelloSpec{
+			TLSVersMin:         VersionTLS12,
+			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
+			CipherSuites:       firefoxCipherSuites,
+			CompressionMethods: []uint8{0x0},
+			Extensions: ShuffleFirefoxTLSExtensions([]TLSExtension{
+				&SNIExtension{},
+				&ExtendedMasterSecretExtension{},
+				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
+				&SupportedCurvesExtension{Curves: []CurveID{
+					// FFDHE groups intentionally omitted for safety
+					X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521,
+				}},
+				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
+				&SessionTicketExtension{},
+				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+				&StatusRequestExtension{},
+				&FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
+					ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512,
+				}},
+				&SCTExtension{},
+				&KeyShareExtension{KeyShares: []KeyShare{
+					{Group: X25519MLKEM768}, {Group: X25519}, {Group: CurveP256},
+				}},
+				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
+				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsModern},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
 				&FakeRecordSizeLimitExtension{Limit: 0x4001},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{
@@ -493,9 +803,11 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	case HelloIOS_18:
 		// iOS 18 (September 2024) - Same as Safari 18
 		// No extension shuffling, no post-quantum yet
+		// Safari/iOS uses GREASE in supported_groups (per captured profile GREASEConfig)
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // iOS sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       safariCipherSuites,
 			CompressionMethods: []uint8{0x0},
 			Extensions: []TLSExtension{
@@ -515,6 +827,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: GREASE_PLACEHOLDER, Data: []byte{0}}, {Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionZlib}},
 				&UtlsGREASEExtension{},
@@ -524,10 +837,12 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	case HelloIOS_26:
 		// iOS 26 (November 2025) - Post-quantum support with X25519MLKEM768
 		// No extension shuffling (Apple does not randomize)
+		// Safari/iOS uses GREASE in supported_groups (per captured profile GREASEConfig)
 		// Reference: https://support.apple.com/en-us/122756
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // iOS sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       safariCipherSuitesModern,
 			CompressionMethods: []uint8{0x0},
 			Extensions: []TLSExtension{
@@ -541,7 +856,9 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
 				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
 				&StatusRequestExtension{},
-				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: safariSignatureAlgorithms},
+				// SHA1 removed from iOS 26+: Modern iOS no longer includes deprecated SHA1
+				// signature algorithms (ECDSAWithSHA1, PKCS1WithSHA1) as they are cryptographically weak.
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: safariSignatureAlgorithmsModern},
 				&SCTExtension{},
 				&KeyShareExtension{KeyShares: []KeyShare{
 					{Group: GREASE_PLACEHOLDER, Data: []byte{0}},
@@ -549,6 +866,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionZlib}},
 				&UtlsGREASEExtension{},
@@ -556,12 +874,15 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			},
 		}, nil
 	case HelloEdge_106:
+		// Edge 106 is Chromium-based and should shuffle extensions like Chrome 106+
+		// FIXED: Added ShuffleChromeTLSExtensions to match Chrome's extension shuffling behavior
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []uint8{0x0},
-			Extensions: []TLSExtension{
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware (Edge is Chromium-based)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
 				&ExtendedMasterSecretExtension{},
@@ -579,12 +900,13 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: GREASE_PLACEHOLDER, Data: []byte{0}}, {Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
 				&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}},
 				&UtlsGREASEExtension{},
 				&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle},
-			},
+			}),
 		}, nil
 	case HelloEdge_142:
 		// Edge 142 (October 2025) - follows Chrome 142 fingerprint
@@ -592,6 +914,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware (Edge is Chromium-based)
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -612,6 +935,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
 				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
@@ -623,9 +947,11 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		// Safari 18 (September 2024) - macOS Sequoia / iOS 18
 		// JA4: t13d2014h2 = 20 ciphers, 14 extensions
 		// Safari does NOT shuffle extensions (fixed order)
+		// Safari/iOS uses GREASE in supported_groups (per captured profile GREASEConfig)
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Safari sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       safariCipherSuites,
 			CompressionMethods: []uint8{0x0},
 			Extensions: []TLSExtension{
@@ -645,6 +971,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: GREASE_PLACEHOLDER, Data: []byte{0}}, {Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionZlib}},
 				&UtlsGREASEExtension{},
@@ -654,11 +981,13 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	case HelloSafari_26:
 		// Safari 26 (November 2025) - macOS Tahoe / iOS 26 with post-quantum
 		// No extension shuffling (Apple does not randomize)
+		// Safari/iOS uses GREASE in supported_groups (per captured profile GREASEConfig)
 		// X25519MLKEM768 for quantum-secure key exchange
 		// Reference: https://support.apple.com/en-us/122756
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
+			SessionIDLength:    SessionIDLengthNone, // Safari sends empty session ID for fresh TLS 1.3 connections
 			CipherSuites:       safariCipherSuitesModern,
 			CompressionMethods: []uint8{0x0},
 			Extensions: []TLSExtension{
@@ -672,7 +1001,9 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
 				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
 				&StatusRequestExtension{},
-				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: safariSignatureAlgorithms},
+				// SHA1 removed from Safari 26+: Modern Safari no longer includes deprecated SHA1
+				// signature algorithms (ECDSAWithSHA1, PKCS1WithSHA1) as they are cryptographically weak.
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: safariSignatureAlgorithmsModern},
 				&SCTExtension{},
 				&KeyShareExtension{KeyShares: []KeyShare{
 					{Group: GREASE_PLACEHOLDER, Data: []byte{0}},
@@ -680,6 +1011,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionZlib}},
 				&UtlsGREASEExtension{},
@@ -690,6 +1022,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -708,6 +1041,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}}, {Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
 				&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}},
@@ -719,6 +1053,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -737,6 +1072,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}}, {Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
 				&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}},
@@ -750,6 +1086,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		return ClientHelloSpec{
 			CipherSuites:       chromeCipherSuites,
 			CompressionMethods: []byte{0x00},
+			CipherSuiteOrder:   CipherSuiteOrderAuto, // Dynamic reordering based on hardware
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SNIExtension{},
@@ -770,6 +1107,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
+				&CookieExtension{}, // Placeholder for HRR
 				&SupportedVersionsExtension{Versions: []uint16{GREASE_PLACEHOLDER, VersionTLS13, VersionTLS12}},
 				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli}},
 				&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}},
@@ -789,7 +1127,9 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 
 // shuffleTLSExtensions is the core shuffle function used by browser-specific wrappers.
 // It shuffles extensions in place, keeping padding and PSK in place (RFC compliance).
-func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) []TLSExtension {
+// Returns an error if cryptographic random number generation fails - this is a security
+// requirement to prevent predictable extension ordering.
+func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) ([]TLSExtension, error) {
 	skipShuf := func(idx int) bool {
 		switch exts[idx].(type) {
 		case *UtlsPaddingExtension, PreSharedKeyExtension:
@@ -802,11 +1142,189 @@ func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) []TLSExtension {
 	}
 
 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
-	var rng *rand.Rand
 	if err != nil {
-		rng = rand.New(rand.NewSource(rand.Int63()))
-	} else {
-		rng = rand.New(rand.NewSource(randInt64.Int64()))
+		// SECURITY: Never fall back to weak randomness - return error instead
+		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	rng := rand.New(rand.NewSource(randInt64.Int64()))
+
+	rng.Shuffle(len(exts), func(i, j int) {
+		if skipShuf(i) || skipShuf(j) {
+			return
+		}
+		exts[i], exts[j] = exts[j], exts[i]
+	})
+
+	return exts, nil
+}
+
+// ShuffleFirefoxTLSExtensions shuffles extensions like Firefox (NSS 3.84+).
+// Skips: padding, pre_shared_key. GREASE is shuffled (Firefox has no GREASE).
+// Returns unshuffled extensions if cryptographic random generation fails.
+// For error handling, use ShuffleFirefoxTLSExtensionsWithError instead.
+func ShuffleFirefoxTLSExtensions(exts []TLSExtension) []TLSExtension {
+	result, err := shuffleTLSExtensions(exts, false)
+	if err != nil {
+		// Return unshuffled - shuffling is for fingerprinting, not security.
+		// The TLS connection remains secure without shuffling.
+		return exts
+	}
+	return result
+}
+
+// ShuffleChromeTLSExtensions shuffles extensions like Chrome 106+.
+// Skips: GREASE, padding, pre_shared_key.
+// Returns unshuffled extensions if cryptographic random generation fails.
+// For error handling, use ShuffleChromeTLSExtensionsWithError instead.
+func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
+	result, err := shuffleTLSExtensions(exts, true)
+	if err != nil {
+		// Return unshuffled - shuffling is for fingerprinting, not security.
+		// The TLS connection remains secure without shuffling.
+		return exts
+	}
+	return result
+}
+
+// ShuffleFirefoxTLSExtensionsWithError shuffles extensions like Firefox (NSS 3.84+).
+// Returns an error if cryptographic random generation fails.
+func ShuffleFirefoxTLSExtensionsWithError(exts []TLSExtension) ([]TLSExtension, error) {
+	return shuffleTLSExtensions(exts, false)
+}
+
+// ShuffleChromeTLSExtensionsWithError shuffles extensions like Chrome 106+.
+// Returns an error if cryptographic random generation fails.
+func ShuffleChromeTLSExtensionsWithError(exts []TLSExtension) ([]TLSExtension, error) {
+	return shuffleTLSExtensions(exts, true)
+}
+
+// ShuffleConfig provides fine-grained control over extension shuffling behavior.
+// This allows advanced users to customize shuffling for anti-fingerprinting purposes.
+type ShuffleConfig struct {
+	// ShufflePadding allows padding extension to be shuffled (default: false).
+	// WARNING: Padding position affects ClientHello size calculation. If enabled,
+	// the padding length should be recalculated after shuffle using Update().
+	ShufflePadding bool
+
+	// ShuffleGREASE allows GREASE extensions to be shuffled (default: false for Chrome).
+	// Chrome keeps GREASE at fixed positions, Firefox has no GREASE.
+	// When true with RandomizeGREASEWithinRange, GREASE moves within constrained positions.
+	ShuffleGREASE bool
+
+	// RandomizeGREASEWithinRange enables Chrome-like GREASE position variation.
+	// When true (and ShuffleGREASE is true):
+	//   - First GREASE can move within the first GREASEStartRange positions
+	//   - Last GREASE can move within the last GREASEEndRange positions
+	//   - GREASERandomizeProbability controls how often randomization occurs
+	// This mimics real Chrome behavior where GREASE usually stays at fixed
+	// positions but occasionally varies.
+	RandomizeGREASEWithinRange bool
+
+	// GREASEStartRange defines how many positions from the start the first GREASE
+	// can occupy (default: 3). Only used when RandomizeGREASEWithinRange is true.
+	// Example: GREASEStartRange=3 means first GREASE can be at position 0, 1, or 2.
+	GREASEStartRange int
+
+	// GREASEEndRange defines how many positions from the end the last GREASE
+	// can occupy (default: 3). Only used when RandomizeGREASEWithinRange is true.
+	// Example: GREASEEndRange=3 means last GREASE can be at position n-1, n-2, or n-3
+	// (where n is the length, excluding PSK if preserved).
+	GREASEEndRange int
+
+	// GREASERandomizeProbability is the probability (0.0-1.0) that GREASE positions
+	// will be randomized within their allowed ranges. Default: 0.3 (30%).
+	// - 0.0 means GREASE always stays at default positions (first and last)
+	// - 1.0 means GREASE is always randomized within allowed range
+	// - 0.3 mimics real Chrome: 70% at fixed positions, 30% varied
+	GREASERandomizeProbability float64
+
+	// PreservePSKLast ensures PSK extension stays last (RFC 8446 requirement).
+	// This should almost always be true. Default: true.
+	PreservePSKLast bool
+}
+
+// DefaultChromeShuffleConfig returns the default shuffle config for Chrome-like behavior.
+// GREASE positions vary within constrained ranges (first 3 and last 3 positions) with
+// 30% probability, mimicking real Chrome behavior. Padding stays fixed, PSK stays last.
+func DefaultChromeShuffleConfig() ShuffleConfig {
+	return ShuffleConfig{
+		ShufflePadding:             false,
+		ShuffleGREASE:              true, // Enable GREASE position variation
+		RandomizeGREASEWithinRange: true, // Use Chrome-like constrained randomization
+		GREASEStartRange:           3,    // First GREASE can be at positions 0, 1, or 2
+		GREASEEndRange:             3,    // Last GREASE can be at last 3 positions
+		GREASERandomizeProbability: 0.3,  // 30% chance to randomize, 70% stay fixed
+		PreservePSKLast:            true,
+	}
+}
+
+// DefaultFirefoxShuffleConfig returns the default shuffle config for Firefox-like behavior.
+// GREASE is shuffled (Firefox has no GREASE anyway), Padding stays fixed, PSK stays last.
+func DefaultFirefoxShuffleConfig() ShuffleConfig {
+	return ShuffleConfig{
+		ShufflePadding:  false,
+		ShuffleGREASE:   true,
+		PreservePSKLast: true,
+	}
+}
+
+// AggressiveShuffleConfig returns a config for maximum anti-fingerprinting.
+// All extensions except PSK can be shuffled. Use with caution - padding position
+// affects ClientHello size and may require recalculation.
+func AggressiveShuffleConfig() ShuffleConfig {
+	return ShuffleConfig{
+		ShufflePadding:  true,
+		ShuffleGREASE:   true,
+		PreservePSKLast: true,
+	}
+}
+
+// shuffleTLSExtensionsWithConfig is the core shuffle function with configurable behavior.
+// It shuffles extensions in place based on the provided configuration.
+// Returns an error if cryptographic random number generation fails.
+//
+// When RandomizeGREASEWithinRange is enabled, GREASE extensions are moved within
+// constrained ranges (start and end of the extension list) based on probability,
+// mimicking real Chrome behavior where GREASE usually stays fixed but occasionally varies.
+func shuffleTLSExtensionsWithConfig(exts []TLSExtension, cfg ShuffleConfig) ([]TLSExtension, error) {
+	if len(exts) < 2 {
+		return exts, nil
+	}
+
+	// Generate cryptographically secure random seed
+	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+	if err != nil {
+		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	rng := rand.New(rand.NewSource(randInt64.Int64()))
+
+	// Apply Chrome-like GREASE position randomization if configured
+	if cfg.ShuffleGREASE && cfg.RandomizeGREASEWithinRange {
+		exts, err = randomizeChromeGREASEPositions(exts, cfg, rng)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Determine if GREASE should be skipped in the main shuffle
+	// If we already randomized GREASE within range, skip it in main shuffle
+	// to avoid moving it outside the allowed range
+	skipGREASEInMainShuffle := cfg.RandomizeGREASEWithinRange
+
+	skipShuf := func(idx int) bool {
+		switch exts[idx].(type) {
+		case *UtlsPaddingExtension:
+			return !cfg.ShufflePadding
+		case PreSharedKeyExtension:
+			return cfg.PreservePSKLast
+		case *UtlsGREASEExtension:
+			if skipGREASEInMainShuffle {
+				return true // Already handled by randomizeChromeGREASEPositions
+			}
+			return !cfg.ShuffleGREASE
+		default:
+			return false
+		}
 	}
 
 	rng.Shuffle(len(exts), func(i, j int) {
@@ -816,19 +1334,289 @@ func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) []TLSExtension {
 		exts[i], exts[j] = exts[j], exts[i]
 	})
 
+	return exts, nil
+}
+
+// randomizeChromeGREASEPositions implements Chrome-like GREASE position variation.
+// Chrome typically has GREASE at position 0 (first) and near the end (before padding/PSK).
+// Real Chrome sometimes varies these positions slightly, which this function mimics.
+//
+// Behavior:
+//   - First GREASE: moves within first GREASEStartRange positions (default: 0-2)
+//   - Last GREASE: moves within last GREASEEndRange positions (default: last 3)
+//   - GREASERandomizeProbability controls how often variation occurs (default: 30%)
+//
+// This function is called before the main shuffle, so GREASE positions are established
+// first, then other extensions are shuffled around them.
+func randomizeChromeGREASEPositions(exts []TLSExtension, cfg ShuffleConfig, rng *rand.Rand) ([]TLSExtension, error) {
+	// Roll probability - decide if we randomize at all
+	if rng.Float64() >= cfg.GREASERandomizeProbability {
+		// Keep GREASE at default positions (70% of the time with default config)
+		return exts, nil
+	}
+
+	// Find GREASE extension indices
+	greaseIndices := make([]int, 0, 3)
+	for i, ext := range exts {
+		if _, ok := ext.(*UtlsGREASEExtension); ok {
+			greaseIndices = append(greaseIndices, i)
+		}
+	}
+
+	if len(greaseIndices) == 0 {
+		return exts, nil
+	}
+
+	// Determine valid end range (exclude PSK if it's last)
+	endBoundary := len(exts)
+	if cfg.PreservePSKLast && len(exts) > 0 {
+		if _, ok := exts[len(exts)-1].(PreSharedKeyExtension); ok {
+			endBoundary = len(exts) - 1
+		}
+	}
+
+	// Also exclude padding from the end range if not shuffling padding
+	if !cfg.ShufflePadding && endBoundary > 0 {
+		if _, ok := exts[endBoundary-1].(*UtlsPaddingExtension); ok {
+			endBoundary--
+		}
+	}
+
+	// Apply default ranges if not set
+	startRange := cfg.GREASEStartRange
+	if startRange <= 0 {
+		startRange = 3
+	}
+	endRange := cfg.GREASEEndRange
+	if endRange <= 0 {
+		endRange = 3
+	}
+
+	// Clamp ranges to valid bounds
+	if startRange > endBoundary {
+		startRange = endBoundary
+	}
+	if endRange > endBoundary {
+		endRange = endBoundary
+	}
+
+	// Handle first GREASE (should be near the start)
+	if len(greaseIndices) >= 1 {
+		firstGreaseIdx := greaseIndices[0]
+
+		// Only move if currently at position 0 and we have room
+		if firstGreaseIdx == 0 && startRange > 1 {
+			// Choose new position within first startRange positions
+			newPos := rng.Intn(startRange)
+			if newPos != firstGreaseIdx {
+				exts = moveExtension(exts, firstGreaseIdx, newPos)
+				// Update indices after move
+				greaseIndices = updateIndicesAfterMove(greaseIndices, firstGreaseIdx, newPos)
+			}
+		}
+	}
+
+	// Handle last GREASE (should be near the end)
+	if len(greaseIndices) >= 2 {
+		lastGreaseIdx := greaseIndices[len(greaseIndices)-1]
+
+		// Calculate the valid range for last GREASE
+		// It should be within the last endRange positions (before padding/PSK)
+		minEndPos := endBoundary - endRange
+		if minEndPos < 0 {
+			minEndPos = 0
+		}
+		// Ensure we don't overlap with start range
+		if minEndPos < startRange {
+			minEndPos = startRange
+		}
+
+		// Only move if there's room
+		if minEndPos < endBoundary-1 {
+			// Choose new position within the end range
+			rangeSize := endBoundary - minEndPos
+			if rangeSize > 0 {
+				newPos := minEndPos + rng.Intn(rangeSize)
+				if newPos != lastGreaseIdx && newPos < endBoundary {
+					exts = moveExtension(exts, lastGreaseIdx, newPos)
+				}
+			}
+		}
+	}
+
+	return exts, nil
+}
+
+// moveExtension moves an extension from srcIdx to dstIdx, shifting other elements.
+func moveExtension(exts []TLSExtension, srcIdx, dstIdx int) []TLSExtension {
+	if srcIdx == dstIdx {
+		return exts
+	}
+	if srcIdx < 0 || srcIdx >= len(exts) || dstIdx < 0 || dstIdx >= len(exts) {
+		return exts
+	}
+
+	ext := exts[srcIdx]
+
+	if srcIdx < dstIdx {
+		// Moving forward: shift elements left
+		copy(exts[srcIdx:dstIdx], exts[srcIdx+1:dstIdx+1])
+	} else {
+		// Moving backward: shift elements right
+		copy(exts[dstIdx+1:srcIdx+1], exts[dstIdx:srcIdx])
+	}
+	exts[dstIdx] = ext
+
 	return exts
 }
 
-// ShuffleFirefoxTLSExtensions shuffles extensions like Firefox (NSS 3.84+).
-// Skips: padding, pre_shared_key. GREASE is shuffled (Firefox has no GREASE).
-func ShuffleFirefoxTLSExtensions(exts []TLSExtension) []TLSExtension {
-	return shuffleTLSExtensions(exts, false)
+// updateIndicesAfterMove updates a list of indices after an element was moved.
+func updateIndicesAfterMove(indices []int, srcIdx, dstIdx int) []int {
+	result := make([]int, len(indices))
+	for i, idx := range indices {
+		if idx == srcIdx {
+			result[i] = dstIdx
+		} else if srcIdx < dstIdx {
+			// Element moved forward
+			if idx > srcIdx && idx <= dstIdx {
+				result[i] = idx - 1
+			} else {
+				result[i] = idx
+			}
+		} else {
+			// Element moved backward
+			if idx >= dstIdx && idx < srcIdx {
+				result[i] = idx + 1
+			} else {
+				result[i] = idx
+			}
+		}
+	}
+	return result
 }
 
-// ShuffleChromeTLSExtensions shuffles extensions like Chrome 106+.
-// Skips: GREASE, padding, pre_shared_key.
-func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
-	return shuffleTLSExtensions(exts, true)
+// ShuffleTLSExtensionsWithConfig shuffles extensions with the provided configuration.
+// This is the most flexible shuffle function for advanced anti-fingerprinting needs.
+// Returns the shuffled extensions and any error from random number generation.
+//
+// Example usage for aggressive anti-fingerprinting:
+//
+//	cfg := AggressiveShuffleConfig()
+//	exts, err := ShuffleTLSExtensionsWithConfig(extensions, cfg)
+//	if err != nil {
+//	    // handle error
+//	}
+//	// If padding was shuffled, recalculate padding length
+func ShuffleTLSExtensionsWithConfig(exts []TLSExtension, cfg ShuffleConfig) ([]TLSExtension, error) {
+	return shuffleTLSExtensionsWithConfig(exts, cfg)
+}
+
+// RandomizeChromeGREASEPositions applies Chrome-like GREASE position randomization.
+// This function implements the same behavior as DefaultChromeShuffleConfig():
+//   - 70% chance: GREASE stays at fixed positions (first and second-to-last)
+//   - 30% chance: First GREASE moves within positions 0-2, last GREASE moves within last 3
+//
+// This mimics real Chrome behavior where GREASE usually stays fixed but occasionally varies.
+// Use this before ShuffleChromeTLSExtensions for complete Chrome-like extension shuffling.
+//
+// Example:
+//
+//	exts, err := RandomizeChromeGREASEPositions(extensions)
+//	if err != nil { return err }
+//	exts = ShuffleChromeTLSExtensions(exts)
+func RandomizeChromeGREASEPositions(exts []TLSExtension) ([]TLSExtension, error) {
+	cfg := DefaultChromeShuffleConfig()
+	if len(exts) < 2 {
+		return exts, nil
+	}
+
+	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+	if err != nil {
+		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	rng := rand.New(rand.NewSource(randInt64.Int64()))
+
+	return randomizeChromeGREASEPositions(exts, cfg, rng)
+}
+
+// RandomizeGREASEPositions moves GREASE extensions to random positions within the extension list.
+// This helps reduce fingerprinting by varying where GREASE appears in the ClientHello.
+// PSK extension (if present at the end) is preserved at the last position per RFC 8446.
+// Returns error if cryptographic random generation fails.
+//
+// NOTE: For Chrome-like behavior where GREASE positions vary within constrained ranges,
+// use RandomizeChromeGREASEPositions instead. This function moves GREASE to ANY random
+// position, which may not match real browser behavior.
+//
+// Example:
+//
+//	exts, err := RandomizeGREASEPositions(extensions)
+//	if err != nil { return err }
+//	exts = ShuffleChromeTLSExtensions(exts)
+func RandomizeGREASEPositions(exts []TLSExtension) ([]TLSExtension, error) {
+	if len(exts) < 2 {
+		return exts, nil
+	}
+
+	// Find GREASE extension indices
+	greaseIndices := make([]int, 0, 3)
+	for i, ext := range exts {
+		if _, ok := ext.(*UtlsGREASEExtension); ok {
+			greaseIndices = append(greaseIndices, i)
+		}
+	}
+
+	if len(greaseIndices) == 0 {
+		return exts, nil
+	}
+
+	// Determine valid range (exclude PSK if it's last)
+	maxIdx := len(exts)
+	if len(exts) > 0 {
+		if _, ok := exts[len(exts)-1].(PreSharedKeyExtension); ok {
+			maxIdx = len(exts) - 1
+		}
+	}
+
+	// Generate cryptographically secure random seed
+	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+	if err != nil {
+		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	rng := rand.New(rand.NewSource(randInt64.Int64()))
+
+	// Move each GREASE to a random valid position
+	// We process from highest index to lowest to avoid index shifting issues
+	sort.Sort(sort.Reverse(sort.IntSlice(greaseIndices)))
+
+	for _, greaseIdx := range greaseIndices {
+		if maxIdx <= 1 {
+			break // Not enough room to move
+		}
+
+		// Generate new random position (0 to maxIdx-1)
+		newPos := rng.Intn(maxIdx)
+
+		if newPos == greaseIdx {
+			continue // Already in place
+		}
+
+		// Extract the GREASE extension
+		greaseExt := exts[greaseIdx]
+
+		// Remove from current position
+		exts = append(exts[:greaseIdx], exts[greaseIdx+1:]...)
+
+		// Adjust newPos if it was after the removed position
+		if newPos > greaseIdx {
+			newPos--
+		}
+
+		// Insert at new position
+		exts = append(exts[:newPos], append([]TLSExtension{greaseExt}, exts[newPos:]...)...)
+	}
+
+	return exts, nil
 }
 
 func (uconn *UConn) applyPresetByID(id ClientHelloID) (err error) {
@@ -859,9 +1647,243 @@ func (uconn *UConn) applyPresetByID(id ClientHelloID) (err error) {
 	return uconn.ApplyPreset(uconn.clientHelloSpec)
 }
 
+// cloneExtension creates a deep copy of a TLSExtension to prevent shared state
+// between connections. This is critical for thread safety when multiple goroutines
+// use the same ClientHelloSpec.
+func cloneExtension(ext TLSExtension) TLSExtension {
+	if ext == nil {
+		return nil
+	}
+
+	switch e := ext.(type) {
+	case *SNIExtension:
+		return &SNIExtension{ServerName: e.ServerName}
+	case *StatusRequestExtension:
+		return &StatusRequestExtension{}
+	case *SupportedCurvesExtension:
+		curves := make([]CurveID, len(e.Curves))
+		copy(curves, e.Curves)
+		return &SupportedCurvesExtension{Curves: curves}
+	case *SupportedPointsExtension:
+		points := make([]uint8, len(e.SupportedPoints))
+		copy(points, e.SupportedPoints)
+		return &SupportedPointsExtension{SupportedPoints: points}
+	case *SignatureAlgorithmsExtension:
+		algos := make([]SignatureScheme, len(e.SupportedSignatureAlgorithms))
+		copy(algos, e.SupportedSignatureAlgorithms)
+		return &SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: algos}
+	case *SignatureAlgorithmsCertExtension:
+		algos := make([]SignatureScheme, len(e.SupportedSignatureAlgorithms))
+		copy(algos, e.SupportedSignatureAlgorithms)
+		return &SignatureAlgorithmsCertExtension{SupportedSignatureAlgorithms: algos}
+	case *StatusRequestV2Extension:
+		return &StatusRequestV2Extension{}
+	case *ALPNExtension:
+		protos := make([]string, len(e.AlpnProtocols))
+		copy(protos, e.AlpnProtocols)
+		return &ALPNExtension{AlpnProtocols: protos}
+	case *ApplicationSettingsExtension:
+		protos := make([]string, len(e.SupportedProtocols))
+		copy(protos, e.SupportedProtocols)
+		return &ApplicationSettingsExtension{SupportedProtocols: protos}
+	case *ApplicationSettingsExtensionNew:
+		protos := make([]string, len(e.SupportedProtocols))
+		copy(protos, e.SupportedProtocols)
+		return &ApplicationSettingsExtensionNew{SupportedProtocols: protos}
+	case *SCTExtension:
+		// Deep clone SCTs (nested [][]byte)
+		var scts [][]byte
+		if len(e.SCTs) > 0 {
+			scts = make([][]byte, len(e.SCTs))
+			for i, sct := range e.SCTs {
+				scts[i] = make([]byte, len(sct))
+				copy(scts[i], sct)
+			}
+		}
+		return &SCTExtension{SCTs: scts}
+	case *GenericExtension:
+		data := make([]byte, len(e.Data))
+		copy(data, e.Data)
+		return &GenericExtension{Id: e.Id, Data: data}
+	case *ExtendedMasterSecretExtension:
+		return &ExtendedMasterSecretExtension{}
+	case *UtlsGREASEExtension:
+		body := make([]byte, len(e.Body))
+		copy(body, e.Body)
+		return &UtlsGREASEExtension{Value: e.Value, Body: body}
+	case *UtlsPaddingExtension:
+		return &UtlsPaddingExtension{
+			GetPaddingLen: e.GetPaddingLen,
+			WillPad:       e.WillPad,
+			PaddingLen:    e.PaddingLen,
+		}
+	case *UtlsCompressCertExtension:
+		algos := make([]CertCompressionAlgo, len(e.Algorithms))
+		copy(algos, e.Algorithms)
+		return &UtlsCompressCertExtension{Algorithms: algos}
+	case *KeyShareExtension:
+		keyShares := make([]KeyShare, len(e.KeyShares))
+		for i, ks := range e.KeyShares {
+			data := make([]byte, len(ks.Data))
+			copy(data, ks.Data)
+			keyShares[i] = KeyShare{Group: ks.Group, Data: data}
+		}
+		return &KeyShareExtension{KeyShares: keyShares}
+	case *QUICTransportParametersExtension:
+		// Deep clone TransportParameters - must handle each concrete type
+		params := make(TransportParameters, len(e.TransportParameters))
+		for i, tp := range e.TransportParameters {
+			switch p := tp.(type) {
+			case *GREASETransportParameter:
+				var valueOverride []byte
+				if len(p.ValueOverride) > 0 {
+					valueOverride = make([]byte, len(p.ValueOverride))
+					copy(valueOverride, p.ValueOverride)
+				}
+				params[i] = &GREASETransportParameter{
+					IdOverride:    p.IdOverride,
+					Length:        p.Length,
+					ValueOverride: valueOverride,
+				}
+			case *FakeQUICTransportParameter:
+				var val []byte
+				if len(p.Val) > 0 {
+					val = make([]byte, len(p.Val))
+					copy(val, p.Val)
+				}
+				params[i] = &FakeQUICTransportParameter{
+					Id:  p.Id,
+					Val: val,
+				}
+			case InitialSourceConnectionID:
+				// Deep clone the []byte
+				cloned := make(InitialSourceConnectionID, len(p))
+				copy(cloned, p)
+				params[i] = cloned
+			case PaddingTransportParameter:
+				// Deep clone the []byte
+				cloned := make(PaddingTransportParameter, len(p))
+				copy(cloned, p)
+				params[i] = cloned
+			case *VersionInformation:
+				// Deep clone AvailableVersions slice
+				var versions []uint32
+				if len(p.AvailableVersions) > 0 {
+					versions = make([]uint32, len(p.AvailableVersions))
+					copy(versions, p.AvailableVersions)
+				}
+				params[i] = &VersionInformation{
+					ChoosenVersion:    p.ChoosenVersion,
+					AvailableVersions: versions,
+					LegacyID:          p.LegacyID,
+				}
+			default:
+				// Value types (uint64 aliases) and empty structs are safe to keep as-is
+				// Examples: MaxIdleTimeout, MaxUDPPayloadSize, DisableActiveMigration, GREASEQUICBit
+				params[i] = tp
+			}
+		}
+		return &QUICTransportParametersExtension{TransportParameters: params}
+	case *PSKKeyExchangeModesExtension:
+		modes := make([]uint8, len(e.Modes))
+		copy(modes, e.Modes)
+		return &PSKKeyExchangeModesExtension{Modes: modes}
+	case *SupportedVersionsExtension:
+		versions := make([]uint16, len(e.Versions))
+		copy(versions, e.Versions)
+		return &SupportedVersionsExtension{Versions: versions}
+	case *CookieExtension:
+		cookie := make([]byte, len(e.Cookie))
+		copy(cookie, e.Cookie)
+		return &CookieExtension{Cookie: cookie}
+	case *NPNExtension:
+		protos := make([]string, len(e.NextProtos))
+		copy(protos, e.NextProtos)
+		return &NPNExtension{NextProtos: protos}
+	case *RenegotiationInfoExtension:
+		// Clone RenegotiatedConnection slice if present
+		var renegConn []byte
+		if len(e.RenegotiatedConnection) > 0 {
+			renegConn = make([]byte, len(e.RenegotiatedConnection))
+			copy(renegConn, e.RenegotiatedConnection)
+		}
+		return &RenegotiationInfoExtension{
+			Renegotiation:          e.Renegotiation,
+			RenegotiatedConnection: renegConn,
+		}
+	case *SessionTicketExtension:
+		ticket := make([]byte, len(e.Ticket))
+		copy(ticket, e.Ticket)
+		return &SessionTicketExtension{
+			Session:     e.Session, // Session is managed separately, keep reference
+			Ticket:      ticket,
+			Initialized: e.Initialized,
+			InitError:   e.InitError,
+		}
+	case *FakeChannelIDExtension:
+		return &FakeChannelIDExtension{OldExtensionID: e.OldExtensionID}
+	case *FakeEncryptThenMACExtension:
+		return &FakeEncryptThenMACExtension{}
+	case *FakeRecordSizeLimitExtension:
+		return &FakeRecordSizeLimitExtension{Limit: e.Limit}
+	case *FakeTokenBindingExtension:
+		keyParams := make([]uint8, len(e.KeyParameters))
+		copy(keyParams, e.KeyParameters)
+		return &FakeTokenBindingExtension{
+			MajorVersion:  e.MajorVersion,
+			MinorVersion:  e.MinorVersion,
+			KeyParameters: keyParams,
+		}
+	case *FakeDelegatedCredentialsExtension:
+		algos := make([]SignatureScheme, len(e.SupportedSignatureAlgorithms))
+		copy(algos, e.SupportedSignatureAlgorithms)
+		return &FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: algos}
+	case *GREASEEncryptedClientHelloExtension:
+		cipherSuites := make([]HPKESymmetricCipherSuite, len(e.CandidateCipherSuites))
+		copy(cipherSuites, e.CandidateCipherSuites)
+		configIds := make([]uint8, len(e.CandidateConfigIds))
+		copy(configIds, e.CandidateConfigIds)
+		payloadLens := make([]uint16, len(e.CandidatePayloadLens))
+		copy(payloadLens, e.CandidatePayloadLens)
+		// Also clone EncapsulatedKey to preserve fingerprint size during round-trip
+		encapKey := make([]byte, len(e.EncapsulatedKey))
+		copy(encapKey, e.EncapsulatedKey)
+		return e.cloneWithState(cipherSuites, configIds, payloadLens, encapKey)
+	case *UtlsPreSharedKeyExtension:
+		// PSK extension needs special handling - it's typically rebuilt per-connection
+		return &UtlsPreSharedKeyExtension{}
+	case *FakePreSharedKeyExtension:
+		// Clone identities
+		identities := make([]PskIdentity, len(e.Identities))
+		for i, id := range e.Identities {
+			label := make([]byte, len(id.Label))
+			copy(label, id.Label)
+			identities[i] = PskIdentity{
+				Label:               label,
+				ObfuscatedTicketAge: id.ObfuscatedTicketAge,
+			}
+		}
+		// Clone binders
+		binders := make([][]byte, len(e.Binders))
+		for i, b := range e.Binders {
+			binder := make([]byte, len(b))
+			copy(binder, b)
+			binders[i] = binder
+		}
+		return &FakePreSharedKeyExtension{
+			Identities: identities,
+			Binders:    binders,
+		}
+	default:
+		// For unknown extension types, return as-is with a warning
+		// This maintains backwards compatibility but may not be thread-safe
+		return ext
+	}
+}
+
 // ApplyPreset should only be used in conjunction with HelloCustom to apply custom specs.
-// Fields of TLSExtensions that are slices/pointers are shared across different connections with
-// same ClientHelloSpec. It is advised to use different specs and avoid any shared state.
+// Extensions are deep-cloned to prevent race conditions when multiple connections share
+// the same ClientHelloSpec.
 func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	var err error
 
@@ -880,7 +1902,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	} else {
 		uconn.HandshakeState.State13.KeyShareKeys = &KeySharePrivateKeys{}
 	}
-	uconn.echCtx = ech
+	uconn.echCtx.Store(ech)
 	hello := uconn.HandshakeState.Hello
 
 	switch len(hello.Random) {
@@ -893,8 +1915,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	case 32:
 	// carry on
 	default:
-		return errors.New("ClientHello expected length: 32 bytes. Got: " +
-			strconv.Itoa(len(hello.Random)) + " bytes")
+		return errors.New("tls: invalid client random length")
 	}
 
 	if len(hello.CompressionMethods) == 0 {
@@ -911,50 +1932,137 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	for i := range uconn.greaseSeed {
 		uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
 	}
-	if GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension1) == GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2) {
-		// Generate a new random seed that produces a different GREASE value.
-		// The original XOR by 0x1010 created a detectable fingerprint because
-		// (grease_ext1 ^ grease_ext2) was always 0x0000 or 0x1010, whereas real
-		// Chrome/BoringSSL generates independent random GREASE values.
-		// GREASE values (0x?A?A pattern per RFC 8701) depend only on bits 4-7 of the seed.
-		var newSeedBytes [2]byte
-		_, err = io.ReadFull(uconn.config.rand(), newSeedBytes[:])
-		if err != nil {
-			return errors.New("tls: short read from Rand for GREASE dedup: " + err.Error())
-		}
-		newSeed := binary.LittleEndian.Uint16(newSeedBytes[:])
-		ext1Nibble := uconn.greaseSeed[ssl_grease_extension1] & 0xf0
-		// If the random seed would produce the same GREASE value, shift to next nibble
-		if (newSeed & 0xf0) == ext1Nibble {
-			newSeed = (newSeed &^ 0xf0) | (((newSeed & 0xf0) + 0x10) & 0xf0)
-		}
-		uconn.greaseSeed[ssl_grease_extension2] = newSeed
-	}
+	// GREASE collision handling: Real Chrome/BoringSSL generates extension1 and extension2
+	// GREASE values independently. With 16 possible GREASE values (0x0A0A through 0xFAFA),
+	// there's a natural 1/16 = 6.25% collision rate. This is CORRECT Chrome behavior.
+	// DO NOT deduplicate - deduplication creates a detectable fingerprint (0% collision
+	// rate vs Chrome's natural 6.25% rate).
 
-	hello.CipherSuites = make([]uint16, len(p.CipherSuites))
-	copy(hello.CipherSuites, p.CipherSuites)
+	// Apply cipher suite ordering based on hardware capabilities.
+	// Real browsers (Chrome, Edge) reorder cipher suites based on AES-NI availability:
+	//   - With AES hardware: AES-GCM suites first (faster with hardware acceleration)
+	//   - Without AES hardware: ChaCha20 suites first (faster in software)
+	// This is controlled by the CipherSuiteOrder field in ClientHelloSpec.
+	orderedCiphers := ApplyCipherSuiteOrder(p.CipherSuites, p.CipherSuiteOrder)
+	hello.CipherSuites = make([]uint16, len(orderedCiphers))
+	copy(hello.CipherSuites, orderedCiphers)
 	for i := range hello.CipherSuites {
 		if isGREASEUint16(hello.CipherSuites[i]) { // just in case the user set a GREASE value instead of unGREASEd
 			hello.CipherSuites[i] = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_cipher)
 		}
 	}
 
-	// A random session ID is used to detect when the server accepted a ticket
-	// and is resuming a session (see RFC 5077). In TLS 1.3, it's always set as
-	// a compatibility measure (see RFC 8446, Section 4.1.2).
+	// Session ID handling with configurable length per browser profile.
+	//
+	// Real browser behavior varies:
+	//   - Chrome: 32 bytes (TLS 1.3 middlebox compatibility mode)
+	//   - Firefox: 0 bytes for fresh TLS 1.3 connections
+	//   - Safari/iOS: 0 bytes for fresh TLS 1.3 connections
+	//
+	// RFC 8446 Section 4.1.2 recommends 32-byte session ID for middlebox compatibility,
+	// but not all browsers follow this. We now support per-profile configuration.
 	//
 	// The session ID is not set for QUIC connections (see RFC 9001, Section 8.4).
 	if uconn.quic == nil {
-		var sessionID [32]byte
-		_, err = io.ReadFull(uconn.config.rand(), sessionID[:])
-		if err != nil {
-			return err
+		sessionIDLen := 32 // Default: 32 bytes for backward compatibility
+		if p.SessionIDLength == SessionIDLengthNone {
+			sessionIDLen = 0 // Firefox/Safari TLS 1.3 behavior
+		} else if p.SessionIDLength > 0 && p.SessionIDLength <= 32 {
+			sessionIDLen = p.SessionIDLength // Explicit length
 		}
-		uconn.HandshakeState.Hello.SessionId = sessionID[:]
+		// SessionIDLengthAuto (0) uses default 32 bytes
+
+		if sessionIDLen > 0 {
+			sessionID := make([]byte, sessionIDLen)
+			_, err = io.ReadFull(uconn.config.rand(), sessionID)
+			if err != nil {
+				return err
+			}
+			uconn.HandshakeState.Hello.SessionId = sessionID
+		} else {
+			// Empty session ID (Firefox/Safari behavior for fresh TLS 1.3)
+			uconn.HandshakeState.Hello.SessionId = nil
+		}
 	}
 
+	// Deep clone extensions to prevent race conditions and shared state
+	// between connections using the same ClientHelloSpec
 	uconn.Extensions = make([]TLSExtension, len(p.Extensions))
-	copy(uconn.Extensions, p.Extensions)
+	for i, ext := range p.Extensions {
+		uconn.Extensions[i] = cloneExtension(ext)
+	}
+
+	// For QUIC connections, automatically add QUICTransportParametersExtension
+	// if not already present in the extensions. This allows using regular TLS
+	// presets (like HelloChrome_120) with QUIC connections.
+	if uconn.quic != nil {
+		hasQUICTransportParams := false
+		for _, ext := range uconn.Extensions {
+			if _, ok := ext.(*QUICTransportParametersExtension); ok {
+				hasQUICTransportParams = true
+				break
+			}
+		}
+		if !hasQUICTransportParams {
+			// Insert QUICTransportParametersExtension after ALPN extension
+			// (per RFC 9001, transport parameters follow ALPN in practice)
+			insertIdx := -1
+			for i, ext := range uconn.Extensions {
+				if _, ok := ext.(*ALPNExtension); ok {
+					insertIdx = i + 1
+					break
+				}
+			}
+			qtpExt := &QUICTransportParametersExtension{}
+			if insertIdx > 0 && insertIdx <= len(uconn.Extensions) {
+				// Insert at the found position
+				uconn.Extensions = append(uconn.Extensions[:insertIdx],
+					append([]TLSExtension{qtpExt}, uconn.Extensions[insertIdx:]...)...)
+			} else {
+				// Append at the end if ALPN not found
+				uconn.Extensions = append(uconn.Extensions, qtpExt)
+			}
+		}
+
+		// RFC 9001 Section 8.1: QUIC connections MUST negotiate ALPN.
+		// Update the ALPN extension to use QUIC-compatible protocols from config.
+		// If config.NextProtos is set (e.g., ["h3"]), use that instead of the
+		// preset's ALPN (e.g., ["h2", "http/1.1"] which is HTTP/2 over TCP).
+		if len(uconn.config.NextProtos) > 0 {
+			for _, ext := range uconn.Extensions {
+				if alpn, ok := ext.(*ALPNExtension); ok {
+					alpn.AlpnProtocols = uconn.config.NextProtos
+					break
+				}
+			}
+		}
+
+		// RFC 9001: QUIC MUST use TLS 1.3 or later.
+		// Filter the SupportedVersionsExtension to only include TLS 1.3+.
+		// Presets like HelloChrome_120 include TLS 1.2 for TCP, but QUIC requires TLS 1.3.
+		for _, ext := range uconn.Extensions {
+			if sv, ok := ext.(*SupportedVersionsExtension); ok {
+				var tls13Versions []uint16
+				for _, v := range sv.Versions {
+					// Keep GREASE values and TLS 1.3+
+					if isGREASEUint16(v) || v >= VersionTLS13 {
+						tls13Versions = append(tls13Versions, v)
+					}
+				}
+				if len(tls13Versions) > 0 {
+					sv.Versions = tls13Versions
+				}
+				break
+			}
+		}
+	}
+
+	// Apply curve order variation if configured.
+	// This must be done BEFORE key share generation since key_share order must match
+	// supported_groups order for TLS fingerprint consistency.
+	if err := uconn.applyCurveOrderVariation(p.CurveOrder); err != nil {
+		return err
+	}
 
 	// Check whether NPN extension actually exists
 	var haveNPN bool
@@ -977,7 +2085,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2)
 				ext.Body = []byte{0}
 			default:
-				return errors.New("at most 2 grease extensions are supported")
+				return errors.New("tls: too many reserved extensions")
 			}
 			grease_extensions_seen += 1
 		case *SupportedCurvesExtension:
@@ -992,13 +2100,34 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 				curveID := ext.KeyShares[i].Group
 				if isGREASEUint16(uint16(curveID)) { // just in case the user set a GREASE value instead of unGREASEd
 					ext.KeyShares[i].Group = CurveID(GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group))
-					// Set dummy data for GREASE key shares if not already set
-					// RFC 8701 allows any data, but servers may reject empty data
+					// Generate random GREASE key share data if not already set.
+					// Previous code always used exactly 1 byte with value 0x00, which is
+					// a detectable fingerprint. Real browsers may use varying lengths
+					// and random content. RFC 8701 allows any data for GREASE key shares.
 					if len(ext.KeyShares[i].Data) == 0 {
-						ext.KeyShares[i].Data = []byte{0}
+						// Random length 1-32 bytes (common range observed in browsers)
+						var lenByte [1]byte
+						_, err = io.ReadFull(uconn.config.rand(), lenByte[:])
+						if err != nil {
+							return errors.New("tls: short read from Rand: " + err.Error())
+						}
+						// Map 0-255 to 1-32: (lenByte % 32) + 1
+						greaseDataLen := int(lenByte[0]%32) + 1
+						greaseData := make([]byte, greaseDataLen)
+						_, err = io.ReadFull(uconn.config.rand(), greaseData)
+						if err != nil {
+							return errors.New("tls: short read from Rand: " + err.Error())
+						}
+						ext.KeyShares[i].Data = greaseData
 					}
 					continue
 				}
+				// DESIGN NOTE: Key shares with Data length > 1 are assumed to be pre-populated
+				// by the caller and are kept as-is. Key shares with empty or minimal Data
+				// (0 or 1 bytes) are treated as placeholders and auto-generated below.
+				// This allows users to either:
+				// 1. Provide empty Data for automatic key generation
+				// 2. Provide complete Data to use a specific pre-generated key
 				if len(ext.KeyShares[i].Data) > 1 {
 					continue
 				}
@@ -1024,6 +2153,18 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 					}
 					uconn.HandshakeState.State13.KeyShareKeys.Mlkem = mlkemKey
 					uconn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe = ecdheKey
+				} else if IsFFDHEGroup(curveID) {
+					// Generate FFDHE key pair for RFC 7919 finite field groups
+					ffdheKey, err := generateFFDHEKey(uconn.config.rand(), curveID)
+					if err != nil {
+						return fmt.Errorf("failed to generate FFDHE key for group %v: %w", curveID, err)
+					}
+					ext.KeyShares[i].Data = ffdheKey.PublicKeyBytes()
+					if !preferredCurveIsSet {
+						// Store FFDHE key for shared secret computation
+						uconn.HandshakeState.State13.KeyShareKeys.Ffdhe = ffdheKey
+						preferredCurveIsSet = true
+					}
 				} else {
 					ecdheKey, err := generateECDHEKey(uconn.config.rand(), curveID)
 					if err != nil {

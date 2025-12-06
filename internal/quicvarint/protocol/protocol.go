@@ -49,6 +49,11 @@ const (
 	ECNCE              // 11
 )
 
+// ParseECNHeaderBits parses ECN bits from IP header.
+// Only the lower 2 bits of the input are significant.
+// PANICS on invalid ECN bit combinations. Callers should validate input
+// or use a switch statement to handle unexpected values if panicking is unacceptable.
+// Valid inputs: 0 (Non), 1 (ECT1), 2 (ECT0), 3 (CE)
 func ParseECNHeaderBits(bits byte) ECN {
 	switch bits {
 	case 0:
@@ -64,6 +69,9 @@ func ParseECNHeaderBits(bits byte) ECN {
 	}
 }
 
+// ToHeaderBits converts ECN value to IP header bits.
+// PANICS if called on ECNUnsupported or an invalid ECN value.
+// Callers should check for ECNUnsupported before calling if panicking is unacceptable.
 func (e ECN) ToHeaderBits() byte {
 	//nolint:exhaustive // There are only 4 values.
 	switch e {

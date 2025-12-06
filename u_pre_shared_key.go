@@ -8,7 +8,7 @@ import (
 	"golang.org/x/crypto/cryptobyte"
 )
 
-var ErrEmptyPsk = errors.New("tls: empty psk detected; remove the psk extension for this connection or set OmitEmptyPsk to true to conceal it in utls")
+var ErrEmptyPsk = errors.New("tls: empty psk detected; remove the psk extension for this connection or set OmitEmptyPsk to true to conceal it")
 
 type PreSharedKeyCommon struct {
 	Identities  []PskIdentity
@@ -68,6 +68,16 @@ type PreSharedKeyCommon struct {
 //     > - Implementations should gather and provide the final pre-shared key (PSK) related data.
 //
 //     > - This data will be incorporated into both the clientHello and HandshakeState, ensuring that the PSK-related information is properly set and ready for the handshake process.
+//
+// HelloRetryRequest Handling:
+//
+//   - [SetHRRPSKBinderState() called]:
+//
+//     > - After receiving HelloRetryRequest, PSK binders must be recalculated with a special
+//     >   transcript (MessageHash(CH1) + HRR). This is done by the standard library code.
+//
+//     > - SetHRRPSKBinderState is called to update the extension with the pre-computed binders
+//     >   and mark them as ready, so PatchBuiltHello will not recalculate them incorrectly.
 type PreSharedKeyExtension interface {
 	// TLSExtension must be implemented by all PreSharedKeyExtension implementations.
 	TLSExtension
@@ -87,6 +97,12 @@ type PreSharedKeyExtension interface {
 	// PatchBuiltHello is called once the hello message is fully applied and marshaled.
 	// Its purpose is to update the binders of PSK (Pre-Shared Key) identities.
 	PatchBuiltHello(hello *PubClientHelloMsg) error
+
+	// SetHRRPSKBinderState sets the PSK state after HelloRetryRequest.
+	// The binders have been pre-computed with the proper HRR transcript by the
+	// standard library code. This prevents PatchBuiltHello from recalculating
+	// binders with an incorrect transcript.
+	SetHRRPSKBinderState(identities []PskIdentity, binders [][]byte)
 
 	mustEmbedUnimplementedPreSharedKeyExtension() // this works like a type guard
 }
@@ -133,6 +149,10 @@ func (*UnimplementedPreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
 	// No-op default; callers should override this method
 }
 
+func (*UnimplementedPreSharedKeyExtension) SetHRRPSKBinderState(identities []PskIdentity, binders [][]byte) {
+	// No-op default; callers should override this method
+}
+
 // UtlsPreSharedKeyExtension is an extension used to set the PSK extension in the
 // ClientHello.
 type UtlsPreSharedKeyExtension struct {
@@ -142,6 +162,14 @@ type UtlsPreSharedKeyExtension struct {
 	cachedLength *int
 	// Deprecated: Set OmitEmptyPsk in Config instead.
 	OmitEmptyPsk bool
+	// hrrBindersPrecomputed is set to true when binders have been pre-computed
+	// for HelloRetryRequest. When true, PatchBuiltHello will skip binder
+	// recalculation and use the existing binders directly.
+	hrrBindersPrecomputed bool
+	// useConstantTime controls whether binder computation uses constant-time
+	// operations to prevent timing side-channel attacks. This is set from
+	// Config.PSKBinderConstantTime during writeToUConn.
+	useConstantTime bool
 }
 
 func (e *UtlsPreSharedKeyExtension) IsInitialized() bool {
@@ -162,6 +190,13 @@ func (e *UtlsPreSharedKeyExtension) InitializeByUtls(session *SessionState, earl
 
 func (e *UtlsPreSharedKeyExtension) writeToUConn(uc *UConn) error {
 	uc.HandshakeState.Hello.TicketSupported = true // This doesn't matter though, as utls doesn't care about this field. We write this for consistency.
+	// Propagate PSKBinderConstantTime setting from config.
+	// Default to true for security if config is nil or unset.
+	if uc.config != nil {
+		e.useConstantTime = uc.config.PSKBinderConstantTime
+	} else {
+		e.useConstantTime = true // Default to secure behavior
+	}
 	return nil
 }
 
@@ -260,13 +295,26 @@ func (e *UtlsPreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
 	e.OmitEmptyPsk = val
 }
 
+// SetHRRPSKBinderState sets the PSK extension state after HelloRetryRequest.
+// This is used when PSK binders have been pre-computed by the standard library
+// code with the proper HRR transcript (MessageHash(CH1) + HRR).
+// The identities and binders are set, and the hrrBindersPrecomputed flag is
+// set to prevent PatchBuiltHello from recalculating with an incorrect transcript.
+func (e *UtlsPreSharedKeyExtension) SetHRRPSKBinderState(identities []PskIdentity, binders [][]byte) {
+	e.Identities = identities
+	e.Binders = binders
+	e.hrrBindersPrecomputed = true
+	// Invalidate cached length since binders may have changed
+	e.cachedLength = nil
+}
+
 func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 	if !e.OmitEmptyPsk && e.Len() == 0 {
 		return 0, ErrEmptyPsk
 	}
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
-		return 0, errors.New("tls: UtlsPreSharedKeyExtension.Read failed: binder count must match identity count")
+		return 0, errors.New("tls: pre_shared_key binder count must match identity count")
 	}
 	return readPskIntoBytes(b, e.Identities, e.Binders)
 }
@@ -282,6 +330,35 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	private.original = hello.Raw
 	private.pskBinders = e.Binders // set the placeholder to the private Hello
 
+	// If binders were pre-computed for HRR, use them directly without recalculation.
+	// During HRR, binders must be calculated with a special transcript that includes
+	// MessageHash(CH1) + HRR, which is done by the standard library code.
+	if e.hrrBindersPrecomputed {
+		// Use the pre-computed binders - just update the raw bytes
+		helloBytes, err := private.marshalWithoutBinders()
+		if err != nil {
+			return err
+		}
+		if err := private.updateBinders(e.Binders); err != nil {
+			return err
+		}
+		lenWithoutBinders := len(helloBytes)
+		b := cryptobyte.NewFixedBuilder(private.original[:lenWithoutBinders])
+		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+			for _, binder := range private.pskBinders {
+				b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
+					b.AddBytes(binder)
+				})
+			}
+		})
+		if out, err := b.Bytes(); err != nil || len(out) != len(private.original) {
+			return errors.New("tls: internal error: failed to update binders")
+		}
+		// Reset the flag after use
+		e.hrrBindersPrecomputed = false
+		return io.EOF
+	}
+
 	//--- mirror loadSession() begin ---//
 	transcript := e.cipherSuite.hash.New()
 	helloBytes, err := private.marshalWithoutBinders() // no marshal() will be actually called, as we have set the field `raw`
@@ -289,7 +366,19 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 		return err
 	}
 	transcript.Write(helloBytes)
-	pskBinders := [][]byte{e.cipherSuite.finishedHash(e.BinderKey, transcript)}
+
+	// Use constant-time binder computation when enabled to prevent timing side-channel attacks.
+	// This is controlled by Config.PSKBinderConstantTime (default: true for security).
+	var binder []byte
+	if e.useConstantTime {
+		binder, err = e.cipherSuite.finishedHashConstantTime(e.BinderKey, transcript)
+	} else {
+		binder, err = e.cipherSuite.finishedHash(e.BinderKey, transcript)
+	}
+	if err != nil {
+		return err
+	}
+	pskBinders := [][]byte{binder}
 
 	if err := private.updateBinders(pskBinders); err != nil {
 		return err
@@ -369,6 +458,13 @@ func (e *FakePreSharedKeyExtension) Len() int {
 
 func (e *FakePreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
 	e.OmitEmptyPsk = val
+}
+
+// SetHRRPSKBinderState sets the PSK state after HelloRetryRequest.
+// For FakePreSharedKeyExtension, this simply updates the identities and binders.
+func (e *FakePreSharedKeyExtension) SetHRRPSKBinderState(identities []PskIdentity, binders [][]byte) {
+	e.Identities = identities
+	e.Binders = binders
 }
 
 func (e *FakePreSharedKeyExtension) Read(b []byte) (int, error) {

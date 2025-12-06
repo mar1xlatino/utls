@@ -57,12 +57,15 @@ func runResumptionCheck(helloID tls.ClientHelloID, getCustomSpec func() *tls.Cli
 	// Everything below this line is brought to you by uTLS API, enjoy!
 
 	// use chs
-	tlsConn := tls.UClient(tcpConn, &tls.Config{
+	tlsConn, err := tls.UClient(tcpConn, &tls.Config{
 		ServerName: strings.Split(serverAddr, ":")[0],
 		// NextProtos:         []string{"h2", "http/1.1"},
 		ClientSessionCache: csc, // set this so session tickets will be saved
 		OmitEmptyPsk:       true,
 	}, helloID)
+	if err != nil {
+		panic(err)
+	}
 
 	if getCustomSpec != nil {
 		tlsConn.ApplyPreset(getCustomSpec())
@@ -116,11 +119,14 @@ func runResumptionCheck(helloID tls.ClientHelloID, getCustomSpec func() *tls.Cli
 			panic(err)
 		}
 
-		tlsConnPSK := tls.UClient(tcpConnPSK, &tls.Config{
+		tlsConnPSK, err := tls.UClient(tcpConnPSK, &tls.Config{
 			ServerName:         strings.Split(serverAddr, ":")[0],
 			ClientSessionCache: csc,
 			OmitEmptyPsk:       true,
 		}, helloID)
+		if err != nil {
+			panic(err)
+		}
 
 		if getCustomSpec != nil {
 			tlsConnPSK.ApplyPreset(getCustomSpec())

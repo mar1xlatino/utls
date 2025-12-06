@@ -37,8 +37,10 @@ type TransportParameters []TransportParameter
 func (tps TransportParameters) Marshal() []byte {
 	var b []byte
 	for _, tp := range tps {
-		b = quicvarint.Append(b, tp.ID())
-		b = quicvarint.Append(b, uint64(len(tp.Value())))
+		// ID and Value length are always valid QUIC varints (< 2^62-1)
+		// so errors can be safely ignored
+		b, _ = quicvarint.Append(b, tp.ID())
+		b, _ = quicvarint.Append(b, uint64(len(tp.Value())))
 		b = append(b, tp.Value()...)
 	}
 	return b
@@ -96,11 +98,20 @@ func (g *GREASETransportParameter) ID() uint64 {
 	return g.IdOverride
 }
 
+// Value returns the GREASE transport parameter value.
+// If ValueOverride is empty, generates random bytes of the configured Length.
+// NOTE: If crypto/rand.Read fails (extremely rare, e.g., system entropy exhaustion),
+// the buffer will be zero-filled. This is a security trade-off: zero-filled GREASE
+// values are detectable as anomalous but prevent application crashes.
+// In high-security environments, consider pre-populating ValueOverride with
+// verified random data, or monitoring for entropy exhaustion.
 func (g *GREASETransportParameter) Value() []byte {
 	if len(g.ValueOverride) == 0 {
 		g.ValueOverride = make([]byte, g.Length)
-		// If crypto/rand fails, use zero-filled buffer as fallback
-		// This is extremely rare (system entropy exhaustion) but shouldn't crash
+		// Error deliberately ignored: crypto/rand failure is extremely rare
+		// (system entropy exhaustion), and panicking would be worse than
+		// using zero-filled data. The interface cannot return error without
+		// breaking the TransportParameter contract.
 		_, _ = rand.Read(g.ValueOverride)
 	}
 	return g.ValueOverride
@@ -113,7 +124,9 @@ func (MaxIdleTimeout) ID() uint64 {
 }
 
 func (m MaxIdleTimeout) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(m))
+	// MaxIdleTimeout is always < 2^62-1 so error can be safely ignored
+	b, _ := quicvarint.Append([]byte{}, uint64(m))
+	return b
 }
 
 type MaxUDPPayloadSize uint64
@@ -123,7 +136,8 @@ func (MaxUDPPayloadSize) ID() uint64 {
 }
 
 func (m MaxUDPPayloadSize) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(m))
+	b, _ := quicvarint.Append([]byte{}, uint64(m))
+	return b
 }
 
 type InitialMaxData uint64
@@ -133,7 +147,8 @@ func (InitialMaxData) ID() uint64 {
 }
 
 func (i InitialMaxData) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type InitialMaxStreamDataBidiLocal uint64
@@ -143,7 +158,8 @@ func (InitialMaxStreamDataBidiLocal) ID() uint64 {
 }
 
 func (i InitialMaxStreamDataBidiLocal) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type InitialMaxStreamDataBidiRemote uint64
@@ -153,7 +169,8 @@ func (InitialMaxStreamDataBidiRemote) ID() uint64 {
 }
 
 func (i InitialMaxStreamDataBidiRemote) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type InitialMaxStreamDataUni uint64
@@ -163,7 +180,8 @@ func (InitialMaxStreamDataUni) ID() uint64 {
 }
 
 func (i InitialMaxStreamDataUni) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type InitialMaxStreamsBidi uint64
@@ -173,7 +191,8 @@ func (InitialMaxStreamsBidi) ID() uint64 {
 }
 
 func (i InitialMaxStreamsBidi) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type InitialMaxStreamsUni uint64
@@ -183,7 +202,8 @@ func (InitialMaxStreamsUni) ID() uint64 {
 }
 
 func (i InitialMaxStreamsUni) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(i))
+	b, _ := quicvarint.Append([]byte{}, uint64(i))
+	return b
 }
 
 type MaxAckDelay uint64
@@ -193,7 +213,8 @@ func (MaxAckDelay) ID() uint64 {
 }
 
 func (m MaxAckDelay) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(m))
+	b, _ := quicvarint.Append([]byte{}, uint64(m))
+	return b
 }
 
 type DisableActiveMigration struct{}
@@ -214,7 +235,8 @@ func (ActiveConnectionIDLimit) ID() uint64 {
 }
 
 func (a ActiveConnectionIDLimit) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(a))
+	b, _ := quicvarint.Append([]byte{}, uint64(a))
+	return b
 }
 
 type InitialSourceConnectionID []byte // if empty, will be set to the Connection ID used for the Initial packet.
@@ -290,7 +312,8 @@ func (MaxDatagramFrameSize) ID() uint64 {
 }
 
 func (m MaxDatagramFrameSize) Value() []byte {
-	return quicvarint.Append([]byte{}, uint64(m))
+	b, _ := quicvarint.Append([]byte{}, uint64(m))
+	return b
 }
 
 type GREASEQUICBit struct{}

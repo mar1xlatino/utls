@@ -56,6 +56,9 @@ func (m *utlsCompressedCertificateMsg) unmarshal(data []byte) bool {
 type utlsEncryptedExtensionsMsgExtraFields struct {
 	applicationSettings          []byte
 	applicationSettingsCodepoint uint16
+	// recordSizeLimit is the server's record size limit from RFC 8449.
+	// When non-zero, this is the maximum plaintext size we can send to the server.
+	recordSizeLimit uint16
 }
 
 func (m *encryptedExtensionsMsg) utlsUnmarshal(extension uint16, extData cryptobyte.String) bool {
@@ -65,6 +68,18 @@ func (m *encryptedExtensionsMsg) utlsUnmarshal(extension uint16, extData cryptob
 	case utlsExtensionApplicationSettingsNew:
 		m.utls.applicationSettingsCodepoint = extension
 		m.utls.applicationSettings = []byte(extData)
+	case extensionRecordSizeLimit:
+		// RFC 8449: Server sends its record_size_limit in EncryptedExtensions.
+		// This tells us the maximum plaintext size we can send to the server.
+		var limit uint16
+		if !extData.ReadUint16(&limit) {
+			return false
+		}
+		// RFC 8449: Valid range is 64-16385
+		if limit < 64 || limit > 16385 {
+			return false
+		}
+		m.utls.recordSizeLimit = limit
 	}
 	return true // success/unknown extension
 }

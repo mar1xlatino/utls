@@ -609,12 +609,12 @@ func (fc *FingerprintController) buildExtensionByType(extType uint16) (TLSExtens
 			SupportedSignatureAlgorithms: ch.SignatureAlgorithms,
 		}, nil
 
-	case fakeRecordSizeLimit: // 28 (0x001c) - Firefox
+	case extensionRecordSizeLimit: // 28 (0x001c) - Firefox
 		limit := ch.RecordSizeLimit
 		if limit == 0 {
 			limit = 16385 // Default Firefox record size limit
 		}
-		return &FakeRecordSizeLimitExtension{Limit: limit}, nil
+		return &RecordSizeLimitExtension{Limit: limit}, nil
 
 	case extensionPreSharedKey: // 41 (0x0029) - Firefox for session resumption
 		// PSK extension is only added during session resumption when there's actual PSK data.
@@ -867,12 +867,12 @@ func (fc *FingerprintController) buildExtension(entry ExtensionEntry) (TLSExtens
 			SupportedSignatureAlgorithms: ch.SignatureAlgorithms,
 		}, nil
 
-	case fakeRecordSizeLimit: // 28 (0x001c) - Firefox
+	case extensionRecordSizeLimit: // 28 (0x001c) - Firefox
 		limit := ch.RecordSizeLimit
 		if limit == 0 {
 			limit = 16385 // Default Firefox record size limit
 		}
-		return &FakeRecordSizeLimitExtension{Limit: limit}, nil
+		return &RecordSizeLimitExtension{Limit: limit}, nil
 
 	case extensionPreSharedKey: // 41 (0x0029) - Firefox session resumption
 		// PSK extension requires session data - omit when no session to resume
@@ -1053,7 +1053,10 @@ func (fpc *fingerprintedConn) GetFingerprintController() *FingerprintController 
 // This is a convenience function that combines UClient and FingerprintController.
 func NewFingerprintedConn(conn net.Conn, config *Config, profileID string) (*UConn, *FingerprintController, error) {
 	// Create UConn with custom ClientHelloID
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Create and apply fingerprint controller
 	controller := NewFingerprintController()
@@ -1068,7 +1071,10 @@ func NewFingerprintedConn(conn net.Conn, config *Config, profileID string) (*UCo
 // This is the simplest way to create a connection with a specific browser fingerprint.
 func QuickFingerprintedConn(conn net.Conn, serverName string, profileID string) (*UConn, error) {
 	config := &Config{ServerName: serverName}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		return nil, err
+	}
 
 	controller := NewFingerprintController()
 	if err := controller.ApplyProfile(uconn, profileID); err != nil {

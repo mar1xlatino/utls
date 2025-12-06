@@ -45,8 +45,8 @@ func ExtensionFromID(id uint16) TLSExtension {
 		return &FakeTokenBindingExtension{}
 	case utlsExtensionCompressCertificate:
 		return &UtlsCompressCertExtension{}
-	case fakeRecordSizeLimit:
-		return &FakeRecordSizeLimitExtension{}
+	case extensionRecordSizeLimit:
+		return &RecordSizeLimitExtension{}
 	case fakeExtensionDelegatedCredentials:
 		return &FakeDelegatedCredentialsExtension{}
 	case extensionSessionTicket:
@@ -57,8 +57,8 @@ func ExtensionFromID(id uint16) TLSExtension {
 	// 	return &EarlyDataExtension{}
 	case extensionSupportedVersions:
 		return &SupportedVersionsExtension{}
-	// case extensionCookie:
-	// 	return &CookieExtension{}
+	case extensionCookie:
+		return &CookieExtension{}
 	case extensionPSKModes:
 		return &PSKKeyExchangeModesExtension{}
 	// case extensionCertificateAuthorities:
@@ -127,20 +127,10 @@ type SNIExtension struct {
 }
 
 // validateSNIHostname validates hostname per RFC 6066 Section 3.
-// Returns error if hostname contains invalid characters.
+// This is a legacy wrapper that calls the comprehensive ValidateSNI function.
+// Returns error if hostname is invalid.
 func validateSNIHostname(hostname string) error {
-	if len(hostname) == 0 {
-		return errors.New("tls: SNI hostname is empty")
-	}
-	// RFC 6066 Section 3: hostname must use ASCII encoding.
-	// Control characters and non-ASCII bytes are not permitted.
-	for i := 0; i < len(hostname); i++ {
-		c := hostname[i]
-		if c < 0x20 || c >= 0x7F {
-			return errors.New("tls: SNI hostname contains invalid character")
-		}
-	}
-	return nil
+	return ValidateSNI(hostname)
 }
 
 func (e *SNIExtension) Len() int {
@@ -160,15 +150,23 @@ func (e *SNIExtension) Read(b []byte) (int, error) {
 	if len(hostName) == 0 {
 		return 0, io.EOF
 	}
-	// Validate hostname characters per RFC 6066.
-	if err := validateSNIHostname(hostName); err != nil {
+
+	// Validate hostname format per RFC 6066/RFC 1035 to match browser behavior.
+	// This helps prevent DPI detection via malformed SNI probing.
+	if err := ValidateSNI(hostName); err != nil {
 		return 0, err
 	}
-	// SNI extension data length is 5 + len(hostName), must fit in uint16.
-	// Maximum hostname length is 65530 bytes (65535 - 5 byte overhead).
-	if len(hostName) > 65530 {
-		return 0, errors.New("tls: server name too long for SNI extension")
+
+	// RFC 1035 limits: 253 chars total, 63 chars per label.
+	// The TLS protocol limit (65535 - 5 bytes overhead) is much higher,
+	// but browsers enforce RFC 1035 limits for fingerprint consistency.
+	if len(hostName) > MaxSNIHostnameLength {
+		return 0, &SNIValidationError{
+			Hostname: hostName,
+			Reason:   fmt.Sprintf("hostname exceeds RFC 1035 maximum of %d characters", MaxSNIHostnameLength),
+		}
 	}
+
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -1182,10 +1180,47 @@ const (
 	ssl_grease_last_index = ssl_grease_ticket_extension
 )
 
-// it is responsibility of user not to generate multiple grease extensions with same value
+// UtlsGREASEExtension implements a GREASE (Generate Random Extensions And Sustain
+// Extensibility) extension as defined in RFC 8701.
+//
+// GREASE values must follow the pattern 0x?a?a where both bytes are identical and
+// have 0xa as their low nibble. Valid values are:
+// 0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+// 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa
+//
+// Usage:
+//   - Use SetGREASEValue() to safely set the Value with validation
+//   - If Value is set directly without validation, Read() will return an error
+//     for invalid values, or use GREASE_PLACEHOLDER if Value is zero
+//   - Use IsValidGREASEValue() to validate a value before setting
+//
+// Note: It is the user's responsibility not to generate multiple GREASE extensions
+// with the same value in a single ClientHello.
 type UtlsGREASEExtension struct {
+	// Value is the GREASE extension type identifier. Must be a valid GREASE value
+	// (pattern 0x?a?a per RFC 8701). If zero, GREASE_PLACEHOLDER (0x0a0a) is used.
+	// WARNING: Setting this directly bypasses validation. Use SetGREASEValue() instead.
 	Value uint16
-	Body  []byte // in Chrome first grease has empty body, second grease has a single zero byte
+
+	// Body is the extension data. In Chrome, the first GREASE extension has an empty
+	// body, while the second GREASE extension has a single zero byte.
+	Body []byte
+}
+
+// SetGREASEValue sets the GREASE extension Value with validation.
+// Returns an error if v is not a valid GREASE value per RFC 8701.
+// Valid GREASE values follow the pattern 0x?a?a where both bytes are identical.
+func (e *UtlsGREASEExtension) SetGREASEValue(v uint16) error {
+	if v == 0 {
+		// Zero is acceptable - Read() will use GREASE_PLACEHOLDER
+		e.Value = 0
+		return nil
+	}
+	if !IsValidGREASEValue(v) {
+		return fmt.Errorf("tls: invalid extension value 0x%04x", v)
+	}
+	e.Value = v
+	return nil
 }
 
 func (e *UtlsGREASEExtension) writeToUConn(uc *UConn) error {
@@ -1218,9 +1253,10 @@ func (e *UtlsGREASEExtension) Read(b []byte) (int, error) {
 		value = GREASE_PLACEHOLDER
 	}
 
-	// Validate that Value is a valid GREASE value per RFC 8701
-	if !isGREASEUint16(value) {
-		return 0, fmt.Errorf("invalid GREASE extension ID 0x%04x: must follow 0x?a?a pattern per RFC 8701", value)
+	// Validate that Value is a valid GREASE value per RFC 8701.
+	// GREASE values must follow the pattern 0x?a?a where both bytes are identical.
+	if !IsValidGREASEValue(value) {
+		return 0, fmt.Errorf("tls: invalid extension value 0x%04x", value)
 	}
 
 	b[0] = byte(value >> 8)
@@ -1256,17 +1292,17 @@ func (e *UtlsGREASEExtension) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 
-	if isGREASEUint16(jsonObj.Id) {
-		if jsonObj.KeepID {
-			e.Value = jsonObj.Id
-		}
-		if jsonObj.KeepData {
-			e.Body = jsonObj.Data
-		}
-		return nil
-	} else {
-		return errors.New("GREASE extension id must be a GREASE value")
+	if !IsValidGREASEValue(jsonObj.Id) {
+		return fmt.Errorf("tls: invalid extension value 0x%04x", jsonObj.Id)
 	}
+
+	if jsonObj.KeepID {
+		e.Value = jsonObj.Id
+	}
+	if jsonObj.KeepData {
+		e.Body = jsonObj.Data
+	}
+	return nil
 }
 
 // UtlsPaddingExtension implements padding (21)
@@ -1602,13 +1638,14 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 // expectedKeyShareSize returns the expected public key size for a given curve ID.
 // Returns -1 if the curve ID is unknown or variable-length (GREASE).
 //
-// Key sizes per RFC 8446 Section 4.2.8.2 and RFC 7748/SEC1:
+// Key sizes per RFC 8446 Section 4.2.8.2 and RFC 7748/SEC1/RFC 7919:
 //   - X25519: 32 bytes (RFC 7748)
 //   - P-256: 65 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+32+32)
 //   - P-384: 97 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+48+48)
 //   - P-521: 133 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+66+66)
 //   - X25519MLKEM768: 1216 bytes (MLKEM768 encapsulation key (1184) + X25519 (32))
 //   - X25519Kyber768Draft00: 1216 bytes (X25519 (32) + MLKEM768 encapsulation key (1184))
+//   - FFDHE groups: prime size in bytes (RFC 7919)
 func expectedKeyShareSize(group CurveID) int {
 	switch group {
 	case X25519:
@@ -1622,6 +1659,16 @@ func expectedKeyShareSize(group CurveID) int {
 	case X25519MLKEM768, X25519Kyber768Draft00:
 		// MLKEM768 encapsulation key size (1184) + X25519 public key size (32)
 		return 1184 + 32
+	case CurveFFDHE2048:
+		return 256 // 2048 bits = 256 bytes
+	case CurveFFDHE3072:
+		return 384 // 3072 bits = 384 bytes
+	case CurveFFDHE4096:
+		return 512 // 4096 bits = 512 bytes
+	case CurveFFDHE6144:
+		return 768 // 6144 bits = 768 bytes
+	case CurveFFDHE8192:
+		return 1024 // 8192 bits = 1024 bytes
 	default:
 		// GREASE or unknown curves return -1 (variable/unknown size)
 		return -1
@@ -1629,12 +1676,14 @@ func expectedKeyShareSize(group CurveID) int {
 }
 
 // isValidKeyShareGroup returns true if the CurveID is a valid group for key shares.
-// Valid groups are: standard ECDH curves, X25519, post-quantum hybrids, and GREASE.
+// Valid groups are: standard ECDH curves, X25519, post-quantum hybrids, FFDHE groups, and GREASE.
 func isValidKeyShareGroup(group CurveID) bool {
 	switch group {
 	case X25519, CurveP256, CurveP384, CurveP521:
 		return true
 	case X25519MLKEM768, X25519Kyber768Draft00:
+		return true
+	case CurveFFDHE2048, CurveFFDHE3072, CurveFFDHE4096, CurveFFDHE6144, CurveFFDHE8192:
 		return true
 	case GREASE_PLACEHOLDER:
 		return true
@@ -1729,18 +1778,33 @@ func (e *KeyShareExtension) UnmarshalJSON(b []byte) error {
 
 // QUICTransportParametersExtension implements quic_transport_parameters (57).
 //
-// Currently, it works as a fake extension and does not support parsing, since
-// the QUICConn provided by this package does not really understand these
-// parameters.
+// For QUIC connections using UQUICConn, transport parameters set via
+// SetTransportParameters() are automatically copied to this extension
+// during writeToUConn(). For custom extensions, you can either:
+//   - Set TransportParameters with structured TransportParameter objects
+//   - Set TransportParametersExtData with raw pre-marshaled bytes
 type QUICTransportParametersExtension struct {
 	TransportParameters TransportParameters
 
-	marshalResult []byte // TransportParameters will be marshaled into this slice
+	// TransportParametersExtData holds raw transport parameter bytes.
+	// If set, this takes priority over TransportParameters during marshaling.
+	// This is populated automatically from UConn.quic.transportParams during
+	// writeToUConn() for QUIC connections.
+	TransportParametersExtData []byte
+
+	marshalResult []byte // cached marshal result for Len()/Read()
 }
 
 func (e *QUICTransportParametersExtension) Len() int {
 	if e.marshalResult == nil {
-		e.marshalResult = e.TransportParameters.Marshal()
+		// Use raw bytes if explicitly set (even if empty), otherwise marshal TransportParameters.
+		// This distinction is important: nil means "not set, use TransportParameters",
+		// while []byte{} means "explicitly set to empty" (e.g., from SetTransportParameters(nil)).
+		if e.TransportParametersExtData != nil {
+			e.marshalResult = e.TransportParametersExtData
+		} else {
+			e.marshalResult = e.TransportParameters.Marshal()
+		}
 	}
 	return 4 + len(e.marshalResult)
 }
@@ -1750,7 +1814,7 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
-	// e.Len() is called above, which sets e.marshalResult via Marshal()
+	// e.Len() is called above, which sets e.marshalResult
 	// TLS extension data length is encoded as uint16, so max 65535 bytes
 	if len(e.marshalResult) > 65535 {
 		return 0, errors.New("tls: QUIC transport parameters too large for TLS extension (max 65535 bytes)")
@@ -1765,8 +1829,21 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 	return e.Len(), io.EOF
 }
 
-func (e *QUICTransportParametersExtension) writeToUConn(*UConn) error {
-	// no need to set *UConn.quic.transportParams, since it is unused
+func (e *QUICTransportParametersExtension) writeToUConn(uconn *UConn) error {
+	// For QUIC connections, get transport parameters from the QUIC layer.
+	// This will emit QUICTransportParametersRequired event and wait if params
+	// haven't been set yet, matching standard library QUIC behavior.
+	if uconn.quic != nil {
+		params, err := uconn.QUICGetTransportParameters()
+		if err != nil {
+			return err
+		}
+		// Always use params from QUIC layer for QUIC connections.
+		// params may be empty (if user explicitly set nil), but never nil.
+		e.TransportParametersExtData = params
+		// Clear cached marshal result to force re-computation with new data
+		e.marshalResult = nil
+	}
 	return nil
 }
 
@@ -1975,7 +2052,25 @@ func (e *SupportedVersionsExtension) UnmarshalJSON(b []byte) error {
 }
 
 // CookieExtension implements cookie (44).
-// MUST NOT be part of initial ClientHello
+//
+// This extension supports two modes:
+//
+// 1. Placeholder mode: When Cookie is nil/empty, Len() returns 0 and the extension
+//    is not serialized. This allows including a CookieExtension in ClientHelloSpec
+//    to reserve the position for HRR scenarios without affecting the initial ClientHello.
+//
+// 2. Active mode: When Cookie is set (typically after receiving HelloRetryRequest),
+//    the extension is serialized normally.
+//
+// Using placeholder mode ensures that ClientHello2 (after HRR) maintains the same
+// extension ORDER as ClientHello1, which is important for fingerprint consistency.
+// Without placeholder mode, the cookie would be inserted at a deterministic position
+// that differs from real browser behavior.
+//
+// Browser-specific cookie positions:
+//   - Chrome: after PSKKeyExchangeModesExtension
+//   - Firefox: after SupportedVersionsExtension
+//   - Safari/iOS: after PSKKeyExchangeModesExtension
 type CookieExtension struct {
 	Cookie []byte
 }
@@ -1985,19 +2080,29 @@ func (e *CookieExtension) writeToUConn(uc *UConn) error {
 }
 
 func (e *CookieExtension) Len() int {
-	// The total length of the Cookie extension is:
+	// Placeholder mode: when Cookie is empty, return 0 to not serialize
+	// This allows the extension to exist in the Extensions slice as a placeholder
+	// for HRR scenarios without affecting the initial ClientHello structure.
+	if len(e.Cookie) == 0 {
+		return 0
+	}
+	// Active mode: return full extension length
 	// 2 bytes for ExtensionType (extensionCookie)
 	// 2 bytes for OuterExtensionDataLength
 	// 2 bytes for InnerCookieLength (len(e.Cookie))
 	// N bytes for the Cookie data itself (e.Cookie)
-	// So, total = 6 + len(e.Cookie)
+	// Total = 6 + len(e.Cookie)
 	return 6 + len(e.Cookie)
 }
 
 func (e *CookieExtension) Read(b []byte) (int, error) {
+	// Placeholder mode: return 0 bytes when cookie is empty
+	// This allows the extension to be skipped during serialization while
+	// maintaining its position in the Extensions slice for later HRR update.
 	if len(e.Cookie) == 0 {
-		return 0, errors.New("tls: cookie extension cannot have empty cookie")
+		return 0, io.EOF
 	}
+
 	if len(e.Cookie) > 65531 {
 		return 0, errors.New("tls: cookie too long")
 	}
@@ -2252,21 +2357,43 @@ func (e *FakeEncryptThenMACExtension) UnmarshalJSON(_ []byte) error {
 	return nil
 }
 
-// FakeRecordSizeLimitExtension implements record_size_limit (28)
-// but with no support.
-type FakeRecordSizeLimitExtension struct {
+// RecordSizeLimitExtension implements record_size_limit (28) per RFC 8449.
+// This extension allows negotiating a smaller maximum record size to reduce
+// memory usage and latency. The Limit specifies the maximum plaintext size
+// this endpoint can receive (64-16385 bytes).
+//
+// Per RFC 8449:
+// - Client sends the max record size it can RECEIVE
+// - Server responds with its own max (must be <= client's if it implements the extension)
+// - Both sides must respect the negotiated limit when SENDING
+// - The limit applies to the inner plaintext (before encryption overhead)
+// - In TLS 1.3, the limit includes the content type byte (so actual data is limit-1)
+type RecordSizeLimitExtension struct {
+	// Limit is the maximum plaintext record size this endpoint can receive.
+	// Valid range: 64-16385 (2^14+1 to allow for content type in TLS 1.3).
+	// Common values: 16385 (max), 4096 (reduced memory), 1024 (low latency).
 	Limit uint16
 }
 
-func (e *FakeRecordSizeLimitExtension) writeToUConn(uc *UConn) error {
+// writeToUConn stores the advertised record size limit in the UConn.
+// This value represents what we advertised to the server (our receive limit).
+// The actual negotiated limit for sending will be set when we receive the
+// server's EncryptedExtensions containing their record_size_limit.
+func (e *RecordSizeLimitExtension) writeToUConn(uc *UConn) error {
+	// Validate the limit before storing
+	if e.Limit < 64 || e.Limit > 16385 {
+		return errors.New("tls: record_size_limit must be between 64 and 16385")
+	}
+	// Store our advertised limit - the server's response will be processed
+	// separately in utlsReadServerParameters() and stored as negotiatedRecordSizeLimit
 	return nil
 }
 
-func (e *FakeRecordSizeLimitExtension) Len() int {
-	return 6
+func (e *RecordSizeLimitExtension) Len() int {
+	return 6 // 2 bytes type + 2 bytes length + 2 bytes limit value
 }
 
-func (e *FakeRecordSizeLimitExtension) Read(b []byte) (int, error) {
+func (e *RecordSizeLimitExtension) Read(b []byte) (int, error) {
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
@@ -2274,8 +2401,9 @@ func (e *FakeRecordSizeLimitExtension) Read(b []byte) (int, error) {
 	if e.Limit < 64 || e.Limit > 16385 {
 		return 0, errors.New("tls: record_size_limit must be between 64 and 16385")
 	}
-	b[0] = byte(fakeRecordSizeLimit >> 8)
-	b[1] = byte(fakeRecordSizeLimit & 0xff)
+	// Use the standard extension constant
+	b[0] = byte(extensionRecordSizeLimit >> 8)
+	b[1] = byte(extensionRecordSizeLimit & 0xff)
 
 	b[2] = byte(0)
 	b[3] = byte(2)
@@ -2285,7 +2413,7 @@ func (e *FakeRecordSizeLimitExtension) Read(b []byte) (int, error) {
 	return e.Len(), io.EOF
 }
 
-func (e *FakeRecordSizeLimitExtension) Write(b []byte) (int, error) {
+func (e *RecordSizeLimitExtension) Write(b []byte) (int, error) {
 	fullLen := len(b)
 	extData := cryptobyte.String(b)
 	if !extData.ReadUint16(&e.Limit) {
@@ -2298,7 +2426,7 @@ func (e *FakeRecordSizeLimitExtension) Write(b []byte) (int, error) {
 	return fullLen, nil
 }
 
-func (e *FakeRecordSizeLimitExtension) UnmarshalJSON(data []byte) error {
+func (e *RecordSizeLimitExtension) UnmarshalJSON(data []byte) error {
 	var limitAccepter struct {
 		Limit uint16 `json:"record_size_limit"`
 	}
@@ -2309,6 +2437,11 @@ func (e *FakeRecordSizeLimitExtension) UnmarshalJSON(data []byte) error {
 	e.Limit = limitAccepter.Limit
 	return nil
 }
+
+// FakeRecordSizeLimitExtension is a deprecated alias for RecordSizeLimitExtension.
+// The extension is now fully functional per RFC 8449.
+// Deprecated: Use RecordSizeLimitExtension instead.
+type FakeRecordSizeLimitExtension = RecordSizeLimitExtension
 
 type DelegatedCredentialsExtension = FakeDelegatedCredentialsExtension
 

@@ -118,10 +118,13 @@ func TestDefaultFingerprintControllerOptions_DefaultValues(t *testing.T) {
 func TestApplyProfile_WithValidProfileID(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 
 	if err != nil {
 		t.Fatalf("ApplyProfile failed for valid profile: %v", err)
@@ -142,10 +145,13 @@ func TestApplyProfile_WithValidProfileID(t *testing.T) {
 func TestApplyProfile_WithInvalidProfileID(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "nonexistent_profile_xyz")
+	err = ctrl.ApplyProfile(uconn, "nonexistent_profile_xyz")
 
 	if err == nil {
 		t.Fatal("ApplyProfile should return error for invalid profile ID")
@@ -177,10 +183,13 @@ func TestApplyProfile_WithNilUConn(t *testing.T) {
 func TestApplyProfile_ProfileIsStoredCorrectly(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "firefox_145_windows_11")
+	err = ctrl.ApplyProfile(uconn, "firefox_145_windows_11")
 
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
@@ -203,10 +212,13 @@ func TestApplyProfile_ProfileIsStoredCorrectly(t *testing.T) {
 func TestApplyProfile_SessionStateIsCreated(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
@@ -226,10 +238,13 @@ func TestApplyProfile_SessionStateIsCreated(t *testing.T) {
 func TestApplyFingerprintProfile_WithNilProfile(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyFingerprintProfile(uconn, nil)
+	err = ctrl.ApplyFingerprintProfile(uconn, nil)
 
 	if err == nil {
 		t.Fatal("ApplyFingerprintProfile should return error for nil profile")
@@ -246,7 +261,10 @@ func TestApplyFingerprintProfile_WithNilProfile(t *testing.T) {
 func TestApplyProfile_ValidatorIsInitialized(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -261,7 +279,10 @@ func TestApplyProfile_ValidatorIsInitialized(t *testing.T) {
 func TestApplyProfile_TimingControllerIsInitialized(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -280,10 +301,13 @@ func TestApplyProfile_TimingControllerIsInitialized(t *testing.T) {
 func TestApplyFrozenGREASE_GreaseSeedArraySetCorrectly(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -326,10 +350,13 @@ func TestApplyFrozenGREASE_GreaseSeedArraySetCorrectly(t *testing.T) {
 func TestApplyFrozenGREASE_CipherSuitesHasGREASE(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -357,10 +384,13 @@ func TestApplyFrozenGREASE_CipherSuitesHasGREASE(t *testing.T) {
 func TestApplyFrozenGREASE_SupportedVersionsHasGREASE(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -388,10 +418,13 @@ func TestApplyFrozenGREASE_SupportedVersionsHasGREASE(t *testing.T) {
 func TestApplyFrozenGREASE_SupportedVersionsExtensionMatches(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -426,10 +459,13 @@ func TestApplyFrozenGREASE_SupportedVersionsExtensionMatches(t *testing.T) {
 func TestApplyFrozenGREASE_SupportedCurvesHasGREASE(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -456,10 +492,13 @@ func TestApplyFrozenGREASE_SupportedCurvesHasGREASE(t *testing.T) {
 func TestApplyFrozenGREASE_SupportedCurvesExtensionMatches(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -490,10 +529,13 @@ func TestApplyFrozenGREASE_SupportedCurvesExtensionMatches(t *testing.T) {
 func TestApplyFrozenGREASE_KeySharesHasGREASE(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -524,10 +566,13 @@ func TestApplyFrozenGREASE_KeySharesHasGREASE(t *testing.T) {
 func TestApplyFrozenGREASE_KeyShareExtensionMatches(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -558,10 +603,13 @@ func TestApplyFrozenGREASE_KeyShareExtensionMatches(t *testing.T) {
 func TestApplyFrozenGREASE_UtlsGREASEExtensionValues(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -599,10 +647,13 @@ func TestApplyFrozenGREASE_UtlsGREASEExtensionValues(t *testing.T) {
 func TestApplyFrozenGREASE_NoGREASEForFirefox(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "firefox_145_windows_11")
+	err = ctrl.ApplyProfile(uconn, "firefox_145_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -626,10 +677,13 @@ func TestApplyFrozenGREASE_GREASEConsistencyAcrossMultipleConnections(t *testing
 
 	for i := 0; i < 5; i++ {
 		conn := &net.TCPConn{}
-		uconn := UClient(conn, config, HelloCustom)
+		uconn, err := UClient(conn, config, HelloCustom)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient error: %v", i, err)
+		}
 
 		ctrl := NewFingerprintController()
-		err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+		err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 		if err != nil {
 			t.Fatalf("iteration %d: ApplyProfile failed: %v", i, err)
 		}
@@ -1189,7 +1243,10 @@ func TestNewFingerprintedConn_ReturnsErrorForInvalidProfile(t *testing.T) {
 func TestFingerprintController_GetExpectedJA4_ReturnsCorrectValue(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -1204,7 +1261,10 @@ func TestFingerprintController_GetExpectedJA4_ReturnsCorrectValue(t *testing.T) 
 func TestFingerprintController_GetExpectedJA3_ReturnsCorrectValue(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -1253,7 +1313,10 @@ func TestFingerprintController_GetRecordDelay_ReturnsZeroWhenNoController(t *tes
 func TestFingerprintController_GetRecordDelay_AfterApplyProfile(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -1284,7 +1347,10 @@ func TestFingerprintController_RecordController_NilBeforeApply(t *testing.T) {
 func TestFingerprintController_RecordController_SetAfterApplyWithPadding(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 	_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
@@ -1314,12 +1380,15 @@ func TestFingerprintController_Validator_NilBeforeApply(t *testing.T) {
 func TestApplyProfile_MultipleProfiles_OverwritesPrevious(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 
 	// Apply first profile
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("first ApplyProfile failed: %v", err)
 	}
@@ -1347,7 +1416,10 @@ func TestApplyProfile_MultipleProfiles_OverwritesPrevious(t *testing.T) {
 func TestApplyProfile_ProfileCloning(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	// Get original profile from registry
 	originalProfile, err := DefaultRegistry.Get("chrome_133_windows_11")
@@ -1389,7 +1461,7 @@ func TestFingerprintController_ThreadSafety_ConcurrentAccess(t *testing.T) {
 		defer wg.Done()
 		conn := &net.TCPConn{}
 		config := &Config{ServerName: "example.com"}
-		uconn := UClient(conn, config, HelloCustom)
+		uconn, _ := UClient(conn, config, HelloCustom)
 		_ = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	}()
 
@@ -1421,7 +1493,10 @@ func TestApplyProfile_HooksCalledInOrder(t *testing.T) {
 
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: uniqueOrigin}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 
@@ -1444,7 +1519,7 @@ func TestApplyProfile_HooksCalledInOrder(t *testing.T) {
 
 	ctrl.AddHook(hook)
 
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err != nil {
 		t.Fatalf("ApplyProfile failed: %v", err)
 	}
@@ -1470,7 +1545,10 @@ func TestApplyProfile_HooksCalledInOrder(t *testing.T) {
 func TestApplyProfile_HookError_AbortsOperation(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
 
@@ -1483,7 +1561,7 @@ func TestApplyProfile_HookError_AbortsOperation(t *testing.T) {
 
 	ctrl.AddHook(hook)
 
-	err := ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
+	err = ctrl.ApplyProfile(uconn, "chrome_133_windows_11")
 	if err == nil {
 		t.Fatal("ApplyProfile should return error when hook fails")
 	}
@@ -1502,13 +1580,13 @@ func TestSessionStateCache_DifferentOrigins(t *testing.T) {
 
 	// Connection 1
 	conn1 := &net.TCPConn{}
-	uconn1 := UClient(conn1, config1, HelloCustom)
+	uconn1, _ := UClient(conn1, config1, HelloCustom)
 	ctrl1 := NewFingerprintController()
 	_ = ctrl1.ApplyProfile(uconn1, "chrome_133_windows_11")
 
 	// Connection 2
 	conn2 := &net.TCPConn{}
-	uconn2 := UClient(conn2, config2, HelloCustom)
+	uconn2, _ := UClient(conn2, config2, HelloCustom)
 	ctrl2 := NewFingerprintController()
 	_ = ctrl2.ApplyProfile(uconn2, "chrome_133_windows_11")
 
@@ -1524,10 +1602,13 @@ func TestSessionStateCache_DifferentOrigins(t *testing.T) {
 func TestApplyProfile_SafariProfile(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	ctrl := NewFingerprintController()
-	err := ctrl.ApplyProfile(uconn, "safari_18_macos_14")
+	err = ctrl.ApplyProfile(uconn, "safari_18_macos_14")
 
 	if err != nil {
 		t.Fatalf("ApplyProfile for Safari failed: %v", err)
@@ -1544,7 +1625,10 @@ func TestApplyProfile_SafariProfile(t *testing.T) {
 func TestFingerprintController_getOrigin_UsesSessionCacheKey(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, err := UClient(conn, config, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 
 	opts := FingerprintControllerOptions{
 		UseSessionCache: true,
@@ -1572,13 +1656,13 @@ func TestFingerprintController_SessionStateNotCached_WhenDisabled(t *testing.T) 
 
 	// First connection
 	conn1 := &net.TCPConn{}
-	uconn1 := UClient(conn1, config, HelloCustom)
+	uconn1, _ := UClient(conn1, config, HelloCustom)
 	ctrl1 := NewFingerprintControllerWithOptions(opts)
 	_ = ctrl1.ApplyProfile(uconn1, "chrome_133_windows_11")
 
 	// Second connection
 	conn2 := &net.TCPConn{}
-	uconn2 := UClient(conn2, config, HelloCustom)
+	uconn2, _ := UClient(conn2, config, HelloCustom)
 	ctrl2 := NewFingerprintControllerWithOptions(opts)
 	_ = ctrl2.ApplyProfile(uconn2, "chrome_133_windows_11")
 
@@ -1596,7 +1680,7 @@ func TestFingerprintController_SessionStateNotCached_WhenDisabled(t *testing.T) 
 func TestFingerprintedConn_ImplementsInterface(t *testing.T) {
 	conn := &net.TCPConn{}
 	config := &Config{ServerName: "example.com"}
-	uconn := UClient(conn, config, HelloCustom)
+	uconn, _ := UClient(conn, config, HelloCustom)
 	ctrl := NewFingerprintController()
 
 	fpc := &fingerprintedConn{

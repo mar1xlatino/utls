@@ -14,7 +14,10 @@ import (
 
 func TestUTLSMarshalNoOp(t *testing.T) {
 	str := "We rely on clientHelloMsg.marshal() not doing anything if clientHelloMsg.raw is set"
-	uconn := UClient(&net.TCPConn{}, &Config{ServerName: "foobar"}, HelloGolang)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "foobar"}, HelloGolang)
+	if err != nil {
+		t.Fatalf("UClient error: %v", err)
+	}
 	msg, _, _, err := uconn.makeClientHello()
 	if err != nil {
 		t.Errorf("Got error: %s; expected to succeed", err)
@@ -298,7 +301,10 @@ func TestDuplicateExtensionDetection(t *testing.T) {
 			config := &Config{
 				ServerName: "example.com",
 			}
-			uconn := UClient(&net.TCPConn{}, config, HelloCustom)
+			uconn, err := UClient(&net.TCPConn{}, config, HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient error: %v", err)
+			}
 
 			// Set extensions directly on UConn to bypass ApplyPreset validation
 			// This tests MarshalClientHelloNoECH's duplicate detection specifically
@@ -313,7 +319,7 @@ func TestDuplicateExtensionDetection(t *testing.T) {
 			uconn.HandshakeState.Hello.Vers = VersionTLS12
 
 			// Try to marshal the ClientHello
-			err := uconn.MarshalClientHelloNoECH()
+			err = uconn.MarshalClientHelloNoECH()
 
 			if tt.expectError {
 				if err == nil {

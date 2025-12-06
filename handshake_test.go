@@ -42,11 +42,9 @@ import (
 // reference connection will always change.
 
 var (
-	update       = flag.Bool("update", false, "update golden files on failure")
-	keyFile      = flag.String("keylog", "", "destination file for KeyLogWriter")
-	bogoMode     = flag.Bool("bogo-mode", false, "Enabled bogo shim mode, ignore everything else")
-	bogoFilter   = flag.String("bogo-filter", "", "BoGo test filter")
-	bogoLocalDir = flag.String("bogo-local-dir", "", "Local BoGo to use, instead of fetching from source")
+	update   = flag.Bool("update", false, "update golden files on failure")
+	keyFile  = flag.String("keylog", "", "destination file for KeyLogWriter")
+	bogoMode = flag.Bool("bogo-mode", false, "Enabled bogo shim mode, ignore everything else")
 )
 
 func runTestAndUpdateIfNeeded(t *testing.T, name string, run func(t *testing.T, update bool), wait bool) {
@@ -493,9 +491,14 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 			io.Reader
 		}
 		if spec != nil {
-			ucli := UClient(c, clientConfig, HelloCustom)
+			ucli, err := UClient(c, clientConfig, HelloCustom)
+			if err != nil {
+				errChan <- fmt.Errorf("client: UClient: %w", err)
+				c.Close()
+				return
+			}
 			if applyErr := ucli.ApplyPreset(spec); applyErr != nil {
-				errChan <- fmt.Errorf("client: ApplyPreset: %v", applyErr)
+				errChan <- fmt.Errorf("client: ApplyPreset: %w", applyErr)
 				c.Close()
 				return
 			}
@@ -506,7 +509,7 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 		// [uTLS SECTION END]
 		hsErr := cli.Handshake()
 		if hsErr != nil {
-			errChan <- fmt.Errorf("client: %v", hsErr)
+			errChan <- fmt.Errorf("client: %w", hsErr)
 			c.Close()
 			return
 		}
@@ -535,7 +538,7 @@ func testUtlsHandshake(t *testing.T, clientConfig, serverConfig *Config, spec *C
 			t.Errorf("failed to call server.Close: %v", err)
 		}
 	} else {
-		err = fmt.Errorf("server: %v", err)
+		err = fmt.Errorf("server: %w", err)
 		s.Close()
 	}
 	err = errors.Join(err, <-errChan)

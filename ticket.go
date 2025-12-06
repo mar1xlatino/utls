@@ -309,6 +309,16 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	if !s.ReadUint64(&ss.useBy) || !s.ReadUint32(&ss.ageAdd) || !s.Empty() {
 		return nil, errors.New("tls: invalid session encoding")
 	}
+
+	// RFC 8446 Section 4.6.1: "Servers MUST NOT use any value greater than
+	// 604800 seconds (7 days)." Validate that the ticket lifetime does not
+	// exceed this maximum to reject malformed or malicious session data.
+	// maxSessionTicketLifetime is 7 * 24 * time.Hour = 604800 seconds.
+	const maxLifetimeSeconds = uint64(7 * 24 * 60 * 60) // 604800 seconds
+	if ss.useBy > ss.createdAt && (ss.useBy-ss.createdAt) > maxLifetimeSeconds {
+		return nil, errors.New("tls: session ticket lifetime exceeds maximum allowed by RFC 8446")
+	}
+
 	return ss, nil
 }
 
@@ -394,7 +404,7 @@ func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionSta
 		// This is unexpected and may indicate data corruption, a bug in
 		// ticket generation, or a sophisticated attack. Return error so
 		// callers can log/monitor this condition.
-		return nil, fmt.Errorf("%w: %v", ErrTicketParsingFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrTicketParsingFailed, err)
 	}
 	return s, nil
 }
@@ -409,26 +419,78 @@ func (c *Config) decryptTicket(encrypted []byte, ticketKeys []ticketKey) []byte 
 	authenticated := encrypted[:len(encrypted)-sha256.Size]
 	macBytes := encrypted[len(encrypted)-sha256.Size:]
 
-	for _, key := range ticketKeys {
+	// SECURITY: Fully constant-time implementation to prevent timing attacks
+	// that could reveal which key in the rotation pool was used.
+	//
+	// Strategy: Decrypt with ALL keys, then use constant-time selection to
+	// pick the result from the matching key. This ensures identical timing
+	// regardless of which key (if any) matches.
+
+	numKeys := len(ticketKeys)
+	if numKeys == 0 {
+		return nil
+	}
+
+	// Pre-allocate decryption results for all keys
+	decrypted := make([][]byte, numKeys)
+	matchResults := make([]int, numKeys)
+
+	// Process ALL keys unconditionally - same operations for each
+	for i, key := range ticketKeys {
+		// Compute MAC
 		mac := hmac.New(sha256.New, key.hmacKey[:])
 		mac.Write(authenticated)
 		expected := mac.Sum(nil)
 
-		if subtle.ConstantTimeCompare(macBytes, expected) != 1 {
-			continue
-		}
+		// Constant-time compare - result is 1 for match, 0 for mismatch
+		matchResults[i] = subtle.ConstantTimeCompare(macBytes, expected)
 
+		// ALWAYS decrypt for every key to ensure constant timing
+		// This prevents timing leaks about which key matched
 		block, err := aes.NewCipher(key.aesKey[:])
 		if err != nil {
-			return nil
+			// Create dummy plaintext on error to maintain constant timing
+			decrypted[i] = make([]byte, len(ciphertext))
+			matchResults[i] = 0 // Mark as non-match on cipher error
+			continue
 		}
 		plaintext := make([]byte, len(ciphertext))
 		cipher.NewCTR(block, iv).XORKeyStream(plaintext, ciphertext)
-
-		return plaintext
+		decrypted[i] = plaintext
 	}
 
-	return nil
+	// Constant-time selection: find the matching result
+	// If multiple keys match (shouldn't happen), use the first one
+	var result []byte
+	foundMask := 0
+	for i := 0; i < numKeys; i++ {
+		// selectMask is all 1s if this key matched AND we haven't found one yet
+		// subtle.ConstantTimeSelect needs int, so we use bit manipulation
+		isMatch := matchResults[i]
+		notYetFound := 1 - foundMask
+
+		// shouldSelect is 1 only if isMatch==1 AND foundMask==0
+		shouldSelect := isMatch & notYetFound
+
+		// Update foundMask: once we find a match, foundMask stays 1
+		foundMask |= isMatch
+
+		// Constant-time conditional copy: if shouldSelect==1, copy this result
+		if result == nil {
+			result = make([]byte, len(ciphertext))
+		}
+		for j := 0; j < len(result); j++ {
+			// For each byte: result[j] = shouldSelect ? decrypted[i][j] : result[j]
+			result[j] = byte(subtle.ConstantTimeSelect(shouldSelect, int(decrypted[i][j]), int(result[j])))
+		}
+	}
+
+	// Return nil if no key matched (foundMask == 0)
+	// Use constant-time check to avoid branch timing leak
+	if foundMask == 0 {
+		return nil
+	}
+	return result
 }
 
 // ClientSessionState contains the state needed by a client to

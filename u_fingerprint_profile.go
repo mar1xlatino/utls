@@ -525,18 +525,9 @@ func (p *FingerprintProfile) Validate() []error {
 		cipherSeen[cs] = true
 	}
 
-	// Check for duplicate signature algorithms
-	sigSeen := make(map[SignatureScheme]bool)
-	for _, sig := range p.ClientHello.SignatureAlgorithms {
-		if sigSeen[sig] {
-			errs = append(errs, &ProfileValidationError{
-				Field:   "SignatureAlgorithms",
-				Message: "contains duplicate signature algorithm",
-			})
-			break
-		}
-		sigSeen[sig] = true
-	}
+	// Note: Duplicate signature algorithms are allowed because real browsers
+	// like Safari intentionally send duplicates (e.g., 0x0805, 0x0805).
+	// This is valid TLS behavior even if unusual.
 
 	// Validate GREASE configuration
 	if p.ClientHello.GREASE.Enabled {

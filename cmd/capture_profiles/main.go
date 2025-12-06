@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/big"
@@ -102,6 +103,9 @@ type CapturedProfile struct {
 	JA4r  string `json:"ja4_raw"`
 	JA4o  string `json:"ja4_original"`     // Original order
 	JA4ro string `json:"ja4_original_raw"`
+
+	// Parse warnings (non-fatal issues during parsing)
+	ParseWarnings []string `json:"parse_warnings,omitempty"`
 }
 
 // KeyShareEntry holds key share group and key length
@@ -126,6 +130,11 @@ type GREASEInfo struct {
 	SupportedVersionPos int   `json:"supported_version_pos"`
 	KeySharePos         int   `json:"key_share_pos"`
 }
+
+const (
+	maxCaptures = 10000 // Limit memory growth
+	maxSeenJA4  = 50000 // Limit deduplication map size
+)
 
 var (
 	captures      []CapturedProfile
@@ -215,6 +224,9 @@ func main() {
 
 func handleConnection(conn net.Conn, tlsCert tls.Certificate) {
 	defer conn.Close()
+
+	// Set overall connection deadline to prevent slowloris attacks
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
 
 	// Set read deadline for ClientHello
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -409,6 +421,8 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		extData = extData[4:]
 
 		if len(extData) < extDataLen {
+			profile.ParseWarnings = append(profile.ParseWarnings,
+				fmt.Sprintf("extension 0x%04x truncated: need %d bytes, have %d", extType, extDataLen, len(extData)))
 			break
 		}
 
@@ -473,6 +487,8 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 					for len(alpnData) > 0 {
 						protoLen := int(alpnData[0])
 						if len(alpnData) < 1+protoLen {
+							profile.ParseWarnings = append(profile.ParseWarnings,
+								fmt.Sprintf("ALPN protocol truncated: need %d bytes, have %d", 1+protoLen, len(alpnData)))
 							break
 						}
 						profile.ALPNProtocols = append(profile.ALPNProtocols, string(alpnData[1:1+protoLen]))
@@ -493,7 +509,9 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		case 0x001b: // compress_certificate
 			if len(extPayload) >= 1 {
 				algLen := int(extPayload[0])
-				for i := 1; i < 1+algLen && i+1 < len(extPayload); i += 2 {
+				// Ensure we have enough data and only read complete uint16 values
+				// algLen is byte count, so we need pairs of bytes (algLen should be even)
+				for i := 1; i+1 < 1+algLen && i+1 < len(extPayload); i += 2 {
 					profile.CertCompressAlgs = append(profile.CertCompressAlgs, uint16(extPayload[i])<<8|uint16(extPayload[i+1]))
 				}
 			}
@@ -544,13 +562,16 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 					for len(ksData) >= 4 {
 						group := uint16(ksData[0])<<8 | uint16(ksData[1])
 						keyLen := int(ksData[2])<<8 | int(ksData[3])
+						// Validate bounds BEFORE appending to avoid partial entries
+						if len(ksData) < 4+keyLen {
+							profile.ParseWarnings = append(profile.ParseWarnings,
+								fmt.Sprintf("key_share entry truncated: group 0x%04x needs %d bytes, have %d", group, 4+keyLen, len(ksData)))
+							break
+						}
 						profile.KeyShares = append(profile.KeyShares, KeyShareEntry{Group: group, KeyLength: keyLen})
 						if isGREASE(group) && profile.GREASE.KeyShare == 0 {
 							profile.GREASE.KeyShare = group
 							profile.GREASE.KeySharePos = ksIdx
-						}
-						if len(ksData) < 4+keyLen {
-							break
 						}
 						ksData = ksData[4+keyLen:]
 						ksIdx++
@@ -795,6 +816,7 @@ func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
 	}
 
 	// Send response with proper CRLF per HTTP/1.1 RFC 2616
+	// Escape User-Agent to prevent XSS attacks
 	body := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head><title>TLS Fingerprint Captured</title></head>
@@ -805,7 +827,7 @@ func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
 <p>User-Agent: %s</p>
 <p>Check server console for full profile.</p>
 </body>
-</html>`, profile.JA3, profile.JA4, profile.UserAgent)
+</html>`, html.EscapeString(profile.JA3), html.EscapeString(profile.JA4), html.EscapeString(profile.UserAgent))
 
 	response := "HTTP/1.1 200 OK\r\n" +
 		"Content-Type: text/html\r\n" +
@@ -816,8 +838,12 @@ func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
 
 	conn.Write([]byte(response))
 
-	// Store and output
+	// Store and output (with memory limit)
 	capturesMu.Lock()
+	if len(captures) >= maxCaptures {
+		// Discard oldest 10% to avoid frequent reallocations
+		captures = captures[maxCaptures/10:]
+	}
 	captures = append(captures, *profile)
 	capturesMu.Unlock()
 
@@ -843,8 +869,18 @@ func outputProfile(profile *CapturedProfile) {
 		key := fmt.Sprintf("%s_%s_%s_%s", profile.JA4, browser, version, platform)
 		if seenJA4[key] {
 			seenJA4Mu.Unlock()
-			log.Printf("SKIPPED duplicate: %s %s on %s (JA4: %s...)", browser, version, platform, profile.JA4[:20])
+			ja4Preview := profile.JA4
+			if len(ja4Preview) > 20 {
+				ja4Preview = ja4Preview[:20] + "..."
+			}
+			log.Printf("SKIPPED duplicate: %s %s on %s (JA4: %s)", browser, version, platform, ja4Preview)
 			return
+		}
+		// Limit map size to prevent memory exhaustion
+		if len(seenJA4) >= maxSeenJA4 {
+			// Clear oldest entries (simple reset - could use LRU for production)
+			seenJA4 = make(map[string]bool)
+			log.Printf("INFO: Cleared deduplication cache (reached %d entries)", maxSeenJA4)
 		}
 		seenJA4[key] = true
 		seenJA4Mu.Unlock()
@@ -859,6 +895,12 @@ func outputProfile(profile *CapturedProfile) {
 	}
 	if profile.ECHEnabled {
 		fmt.Println("ECH: Yes")
+	}
+	if len(profile.ParseWarnings) > 0 {
+		fmt.Printf("WARNINGS: %d parse issues\n", len(profile.ParseWarnings))
+		for _, w := range profile.ParseWarnings {
+			fmt.Printf("  - %s\n", w)
+		}
 	}
 	fmt.Println(strings.Repeat("=", 80))
 
@@ -1048,6 +1090,17 @@ func isChromiumBrowser(browser string) bool {
 	return false
 }
 
+// dedentOne removes one level of indentation (tab or 4 spaces)
+func dedentOne(indent string) string {
+	if strings.HasSuffix(indent, "\t") {
+		return strings.TrimSuffix(indent, "\t")
+	}
+	if len(indent) >= 4 {
+		return indent[:len(indent)-4]
+	}
+	return ""
+}
+
 // formatUint16SliceCurveID formats as tls.CurveID type
 func formatUint16SliceCurveID(indent string, values []uint16) string {
 	if len(values) == 0 {
@@ -1067,7 +1120,7 @@ func formatUint16SliceCurveID(indent string, values []uint16) string {
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(indent[:len(indent)-4] + "}")
+	sb.WriteString(dedentOne(indent) + "}")
 	return sb.String()
 }
 
@@ -1090,7 +1143,7 @@ func formatUint16SliceSigScheme(indent string, values []uint16) string {
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(indent[:len(indent)-4] + "}")
+	sb.WriteString(dedentOne(indent) + "}")
 	return sb.String()
 }
 
@@ -1113,7 +1166,7 @@ func formatUint16SliceCertComp(indent string, values []uint16) string {
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(indent[:len(indent)-4] + "}")
+	sb.WriteString(dedentOne(indent) + "}")
 	return sb.String()
 }
 
@@ -1501,6 +1554,7 @@ func extractMajorVersion(versionFull string) int {
 	return v
 }
 
+// extractVersionAfter extracts a full version string (e.g., "142.0.6935.85") after a prefix
 func extractVersionAfter(s, prefix string) string {
 	idx := strings.Index(s, prefix)
 	if idx == -1 {
@@ -1509,16 +1563,19 @@ func extractVersionAfter(s, prefix string) string {
 	s = s[idx+len(prefix):]
 	var ver strings.Builder
 	for _, c := range s {
-		if c >= '0' && c <= '9' {
+		if c >= '0' && c <= '9' || c == '.' {
 			ver.WriteRune(c)
-		} else if c == '.' || c == ' ' || c == ')' {
+		} else if c == ' ' || c == ')' || c == ';' {
 			break
 		}
 	}
-	if ver.Len() == 0 {
+	result := ver.String()
+	// Trim trailing dots
+	result = strings.TrimRight(result, ".")
+	if result == "" {
 		return "0"
 	}
-	return ver.String()
+	return result
 }
 
 func formatUint16Slice(indent string, values []uint16) string {
@@ -1539,7 +1596,7 @@ func formatUint16Slice(indent string, values []uint16) string {
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(indent[:len(indent)-4] + "}")
+	sb.WriteString(dedentOne(indent) + "}")
 	return sb.String()
 }
 
@@ -1568,10 +1625,13 @@ func formatStringSlice(values []string) string {
 func generateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
 	}
 
-	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("generate serial: %w", err)
+	}
 
 	template := x509.Certificate{
 		SerialNumber: serialNumber,

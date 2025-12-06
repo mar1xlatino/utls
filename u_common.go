@@ -79,11 +79,41 @@ const (
 	CurveSECP521R1 CurveID = 0x0019
 	CurveX25519    CurveID = 0x001d
 
-	FakeCurveFFDHE2048 CurveID = 0x0100
-	FakeCurveFFDHE3072 CurveID = 0x0101
-	FakeCurveFFDHE4096 CurveID = 0x0102
-	FakeCurveFFDHE6144 CurveID = 0x0103
-	FakeCurveFFDHE8192 CurveID = 0x0104
+	// ===================================================================================
+	// FFDHE (Finite Field Diffie-Hellman Ephemeral) Groups - RFC 7919
+	// ===================================================================================
+	//
+	// CurveFFDHE* are group IDs for RFC 7919 finite field key exchange.
+	// uTLS now implements actual FFDHE key exchange, eliminating the previous detection vector.
+	//
+	// These groups are used by Firefox for compatibility with legacy servers.
+	// The groups use standardized safe primes from RFC 7919 Appendix A.
+	//
+	// Security levels:
+	//   - CurveFFDHE2048: ~112 bits of security (256 bytes)
+	//   - CurveFFDHE3072: ~128 bits of security (384 bytes)
+	//   - CurveFFDHE4096: ~150 bits of security (512 bytes)
+	//   - CurveFFDHE6144: ~175 bits of security (768 bytes)
+	//   - CurveFFDHE8192: ~192 bits of security (1024 bytes)
+	//
+	// Note: FFDHE is computationally more expensive than ECDHE. Most modern servers
+	// prefer ECDHE, but FFDHE support ensures compatibility and eliminates detection
+	// vectors from fingerprint-aware servers.
+	//
+	// See also: IsFFDHEGroup() and (*ClientHelloSpec).RemoveFFDHEGroups()
+	// ===================================================================================
+	CurveFFDHE2048 CurveID = 0x0100
+	CurveFFDHE3072 CurveID = 0x0101
+	CurveFFDHE4096 CurveID = 0x0102
+	CurveFFDHE6144 CurveID = 0x0103
+	CurveFFDHE8192 CurveID = 0x0104
+
+	// Deprecated: Use CurveFFDHE* constants directly. These aliases exist for backward compatibility.
+	FakeCurveFFDHE2048 = CurveFFDHE2048
+	FakeCurveFFDHE3072 = CurveFFDHE3072
+	FakeCurveFFDHE4096 = CurveFFDHE4096
+	FakeCurveFFDHE6144 = CurveFFDHE6144
+	FakeCurveFFDHE8192 = CurveFFDHE8192
 )
 
 const (
@@ -98,11 +128,6 @@ const (
 	P256Kyber768Draft00      CurveID = FakeCurveP256Kyber768Draft00
 )
 
-// Other things
-const (
-	fakeRecordSizeLimit uint16 = 0x001c
-)
-
 // newest signatures
 var (
 	FakePKCS1WithSHA224 SignatureScheme = 0x0301
@@ -115,10 +140,12 @@ var (
 	// fakeEd448 = SignatureAndHash{0x08, 0x08}
 )
 
-// fake curves(groups)
+// Deprecated FFDHE group constants as uint16.
+// Use CurveFFDHE2048 and CurveFFDHE3072 CurveID constants instead.
+// These variables exist for backward compatibility.
 var (
-	FakeFFDHE2048 = uint16(0x0100)
-	FakeFFDHE3072 = uint16(0x0101)
+	FakeFFDHE2048 = uint16(CurveFFDHE2048)
+	FakeFFDHE3072 = uint16(CurveFFDHE3072)
 )
 
 // https://tools.ietf.org/html/draft-ietf-tls-certificate-compression-04
@@ -135,7 +162,89 @@ const (
 	PskModeDHE   uint8 = pskModeDHE
 )
 
+// SessionIDLength constants for ClientHelloSpec.SessionIDLength field.
+// These control how the session ID is generated in the ClientHello message.
+const (
+	// SessionIDLengthAuto uses default behavior (32 bytes) for backward compatibility.
+	// This is the zero value, so existing specs without SessionIDLength set will use 32 bytes.
+	SessionIDLengthAuto = 0
+
+	// SessionIDLengthNone generates an empty session ID (0 bytes).
+	// Used by Firefox and Safari for fresh TLS 1.3 connections.
+	SessionIDLengthNone = -1
+)
+
+// CipherSuiteOrderHint controls how cipher suites are ordered in the ClientHello.
+// Real browsers reorder cipher suites based on hardware capabilities (AES-NI availability).
+// This field allows uTLS to mimic this behavior for better fingerprint accuracy.
+type CipherSuiteOrderHint string
+
+const (
+	// CipherSuiteOrderAuto detects hardware capabilities and orders accordingly.
+	// On systems with AES-NI (x86/amd64 with AES-NI, ARM64 with AES): AES-GCM first.
+	// On systems without AES-NI (older ARM, MIPS, etc.): ChaCha20 first.
+	// This is the recommended setting for Chrome/Edge profiles.
+	CipherSuiteOrderAuto CipherSuiteOrderHint = "auto"
+
+	// CipherSuiteOrderAESFirst forces AES-GCM cipher suites before ChaCha20.
+	// Use this to mimic a client running on x86/AMD64 with AES-NI support.
+	CipherSuiteOrderAESFirst CipherSuiteOrderHint = "aes-first"
+
+	// CipherSuiteOrderChaChaFirst forces ChaCha20 cipher suites before AES-GCM.
+	// Use this to mimic a client running on ARM (mobile) without AES hardware.
+	CipherSuiteOrderChaChaFirst CipherSuiteOrderHint = "chacha-first"
+
+	// CipherSuiteOrderStatic uses the profile's exact cipher suite order without modification.
+	// This is the current/legacy behavior - cipher order is fixed within each profile.
+	// Use this for maximum fingerprint accuracy when targeting specific browser builds.
+	CipherSuiteOrderStatic CipherSuiteOrderHint = "static"
+)
+
+// CurveOrderStrategy controls how supported curves (groups) are ordered in the ClientHello.
+// Real browsers show subtle variation in curve order based on hardware curve support
+// and configuration. Static ordering across all connections is a DPI detection vector.
+type CurveOrderStrategy string
+
+const (
+	// CurveOrderStatic uses the exact curve order specified in the profile.
+	// This is the legacy behavior - use for deterministic fingerprints in testing.
+	// WARNING: Identical curve order across all connections is detectable by DPI.
+	CurveOrderStatic CurveOrderStrategy = "static"
+
+	// CurveOrderAutoVariation enables automatic variation of P256/P384 order.
+	// This mimics real Chrome behavior where hardware support affects curve preference.
+	//
+	// Implementation:
+	//   - GREASE position is preserved (typically first)
+	//   - X25519, X25519MLKEM768, or X25519Kyber768Draft00 stays first among real curves
+	//   - P256 and P384 order is randomly swapped (~20% chance for P384 first)
+	//   - key_share extension first curve matches supported_groups first ECDHE curve
+	//
+	// This is the RECOMMENDED setting for Chrome/Edge profiles to avoid
+	// detection by DPI systems that correlate identical curve orders.
+	CurveOrderAutoVariation CurveOrderStrategy = "auto"
+
+	// CurveOrderP384First forces P384 before P256 in supported curves.
+	// Use this to simulate a client that prefers stronger ECDHE curves
+	// (e.g., enterprise environment with NIST P-384 requirement).
+	CurveOrderP384First CurveOrderStrategy = "p384-first"
+
+	// CurveOrderP256First forces P256 before P384 in supported curves.
+	// This is the typical default order for most browsers.
+	CurveOrderP256First CurveOrderStrategy = "p256-first"
+)
+
+// ClientHelloID identifies which TLS fingerprint to mimic. It specifies the browser
+// client and version whose ClientHello message format uTLS should replicate.
+//
+// Use predefined IDs like HelloChrome_120, HelloFirefox_145, or HelloSafari_18 for
+// browser mimicry. Use HelloCustom with manual Extensions configuration for custom
+// fingerprints, or HelloGolang to use standard Go TLS behavior.
+//
+// For randomized fingerprints, use HelloRandomized and optionally provide a Seed
+// for reproducibility.
 type ClientHelloID struct {
+	// Client specifies the browser or client type (e.g., "Chrome", "Firefox", "Safari").
 	Client string
 
 	// Version specifies version of a mimicked clients (e.g. browsers).
@@ -151,12 +260,17 @@ type ClientHelloID struct {
 	Weights *Weights
 }
 
+// Str returns a string representation of the ClientHelloID in the format "Client-Version".
+// For example, "Chrome-120" or "Firefox-145". This is useful for logging and debugging.
 func (p *ClientHelloID) Str() string {
 	return fmt.Sprintf("%s-%s", p.Client, p.Version)
 }
 
+// IsSet reports whether the ClientHelloID has been configured with a client or version.
+// Returns true if either Client or Version is non-empty.
+// This is useful for checking if a ClientHelloID has been initialized.
 func (p *ClientHelloID) IsSet() bool {
-	return (p.Client == "") && (p.Version == "")
+	return (p.Client != "") || (p.Version != "")
 }
 
 const (
@@ -179,6 +293,19 @@ const (
 	helloAutoVers = "0"
 )
 
+// ClientHelloSpec defines the complete specification for a TLS ClientHello message.
+// It contains all the parameters needed to construct a ClientHello that matches
+// a specific browser or client fingerprint.
+//
+// Use UTLSIdToSpec() to get a ClientHelloSpec from a ClientHelloID, or construct
+// one manually for custom fingerprints. Apply it to a UConn using ApplyPreset().
+//
+// Example:
+//
+//	spec, _ := tls.UTLSIdToSpec(tls.HelloChrome_120)
+//	spec.CipherSuites = append(spec.CipherSuites, tls.TLS_AES_128_CCM_SHA256)
+//	uconn, _ := tls.UClient(conn, config, tls.HelloCustom)
+//	uconn.ApplyPreset(&spec)
 type ClientHelloSpec struct {
 	CipherSuites       []uint16       // nil => default
 	CompressionMethods []uint8        // nil => no compression
@@ -190,6 +317,66 @@ type ClientHelloSpec struct {
 	// GreaseStyle: currently only random
 	// sessionID may or may not depend on ticket; nil => random
 	GetSessionID func(ticket []byte) [32]byte
+
+	// SessionIDLength specifies the length of the session ID in bytes.
+	// This field allows mimicking browser-specific session ID behavior:
+	//
+	// Real browser behavior varies:
+	//   - Chrome: 32 bytes (uses TLS 1.3 middlebox compatibility mode)
+	//   - Firefox: 0 bytes for fresh TLS 1.3 connections
+	//   - Safari: 0 bytes for fresh TLS 1.3 connections
+	//   - iOS: 0 bytes for fresh TLS 1.3 connections
+	//
+	// Valid values:
+	//   - SessionIDLengthAuto (0): Use default 32 bytes (backward compatible)
+	//   - SessionIDLengthNone (-1): Empty session ID (Firefox/Safari TLS 1.3 behavior)
+	//   - 1-32: Explicit session ID length
+	//
+	// Note: When resuming TLS 1.2 sessions, session ID handling is managed
+	// separately by the session resumption logic. This field only affects
+	// fresh TLS 1.3 connections.
+	SessionIDLength int
+
+	// CipherSuiteOrder controls how cipher suites are reordered based on hardware capabilities.
+	// Real browsers (Chrome, Edge) reorder cipher suites based on AES-NI availability:
+	//   - With AES-NI: AES-GCM ciphers first (better performance with hardware acceleration)
+	//   - Without AES-NI: ChaCha20 ciphers first (faster in software on ARM/mobile)
+	//
+	// This affects TLS fingerprinting because cipher suite order is part of the JA3/JA4
+	// fingerprint. Static ordering across all connections from "the same browser" can be
+	// a detection vector since real browsers show variation based on hardware.
+	//
+	// Valid values:
+	//   - CipherSuiteOrderAuto (default for Chrome/Edge): Detect hardware, order accordingly
+	//   - CipherSuiteOrderAESFirst: Force AES-GCM before ChaCha20
+	//   - CipherSuiteOrderChaChaFirst: Force ChaCha20 before AES-GCM
+	//   - CipherSuiteOrderStatic or "": Use profile's exact order (legacy behavior)
+	//
+	// Note: Firefox has a different static order (ChaCha20 between AES-128 and AES-256)
+	// and doesn't dynamically reorder like Chrome. Firefox profiles ignore this field.
+	CipherSuiteOrder CipherSuiteOrderHint
+
+	// CurveOrder controls how supported curves (groups) are ordered in the ClientHello.
+	// Real browsers show subtle variation in curve order based on hardware support.
+	//
+	// Chrome hardcodes curve order as: GREASE, X25519, P256, P384
+	// But real Chrome may vary P256/P384 order based on hardware curve support.
+	// Identical curve order across all connections is a DPI detection vector.
+	//
+	// Valid values:
+	//   - CurveOrderStatic or "": Use profile's exact order (legacy behavior)
+	//   - CurveOrderAutoVariation: Randomly swap P256/P384 (~20% chance)
+	//   - CurveOrderP384First: Force P384 before P256
+	//   - CurveOrderP256First: Force P256 before P384
+	//
+	// When using CurveOrderAutoVariation:
+	//   - GREASE position is preserved
+	//   - X25519/X25519MLKEM768 stays first among real curves
+	//   - key_share first curve will match supported_groups order
+	//
+	// Note: This primarily affects Chrome/Edge profiles. Firefox/Safari have
+	// different curve ordering behavior and may ignore this field.
+	CurveOrder CurveOrderStrategy
 
 	// TLSFingerprintLink string // ?? link to tlsfingerprint.io for informational purposes
 }
@@ -265,6 +452,16 @@ func (chs *ClientHelloSpec) ReadTLSExtensions(b []byte, allowBluntMimicry bool, 
 	return nil
 }
 
+// AlwaysAddPadding ensures the ClientHelloSpec has a padding extension.
+// If no UtlsPaddingExtension exists in the Extensions slice, one is added
+// using the BoringPaddingStyle which pads to at least 512 bytes.
+//
+// The padding extension is placed:
+//   - At the end of extensions if no PSK extension exists
+//   - Before the PSK extension if one exists (PSK must be last per RFC 8446)
+//
+// If a padding extension already exists, this method does nothing.
+// This is useful for ensuring fingerprint consistency across connections.
 func (chs *ClientHelloSpec) AlwaysAddPadding() {
 	alreadyHasPadding := false
 	for idx, ext := range chs.Extensions {
@@ -282,6 +479,108 @@ func (chs *ClientHelloSpec) AlwaysAddPadding() {
 	if !alreadyHasPadding {
 		chs.Extensions = append(chs.Extensions, &UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle})
 	}
+}
+
+// IsFFDHEGroup reports whether the CurveID represents a Finite Field Diffie-Hellman
+// Ephemeral (FFDHE) group as defined in RFC 7919.
+//
+// FFDHE groups use finite field cryptography instead of elliptic curves.
+// These are computationally more expensive than ECDHE but provide compatibility
+// with legacy systems.
+//
+// FFDHE groups (0x0100-0x0104):
+//   - CurveFFDHE2048 (0x0100) - 2048-bit FFDHE (~112 bits security)
+//   - CurveFFDHE3072 (0x0101) - 3072-bit FFDHE (~128 bits security)
+//   - CurveFFDHE4096 (0x0102) - 4096-bit FFDHE (~150 bits security)
+//   - CurveFFDHE6144 (0x0103) - 6144-bit FFDHE (~175 bits security)
+//   - CurveFFDHE8192 (0x0104) - 8192-bit FFDHE (~192 bits security)
+func IsFFDHEGroup(group CurveID) bool {
+	return group >= CurveFFDHE2048 && group <= CurveFFDHE8192
+}
+
+// RemoveFFDHEGroups removes all FFDHE (Finite Field Diffie-Hellman Ephemeral) groups
+// from the ClientHelloSpec's supported_groups and key_share extensions.
+//
+// WHEN TO USE:
+// This method is useful if you want to reduce key exchange overhead or avoid FFDHE
+// for performance reasons. FFDHE is computationally more expensive than ECDHE.
+//
+// Note: With uTLS now supporting full FFDHE key exchange, there is no longer a
+// detection vector from advertising FFDHE groups. However, you may still want to
+// remove them for performance optimization or fingerprint customization.
+//
+// WHAT IT DOES:
+//   - Removes CurveFFDHE* (0x0100-0x0104) from SupportedCurvesExtension
+//   - Removes any FFDHE key shares from KeyShareExtension (if present)
+//
+// TRADE-OFF:
+// Removing FFDHE groups causes the TLS fingerprint to deviate from real Firefox
+// (which advertises FFDHE for legacy compatibility), but this may be acceptable
+// for performance optimization.
+//
+// USAGE EXAMPLE:
+//
+//	spec, _ := UTLSIdToSpec(HelloFirefox_145)
+//	spec.RemoveFFDHEGroups()  // Removes FFDHE for performance
+//	uconn := UClient(conn, config, HelloCustom)
+//	uconn.ApplyPreset(&spec)
+//
+// Returns the number of FFDHE groups that were removed (from both extensions combined).
+func (chs *ClientHelloSpec) RemoveFFDHEGroups() int {
+	removed := 0
+
+	for _, ext := range chs.Extensions {
+		// Remove FFDHE groups from supported_groups extension
+		if sce, ok := ext.(*SupportedCurvesExtension); ok {
+			newCurves := make([]CurveID, 0, len(sce.Curves))
+			for _, curve := range sce.Curves {
+				if IsFFDHEGroup(curve) {
+					removed++
+				} else {
+					newCurves = append(newCurves, curve)
+				}
+			}
+			sce.Curves = newCurves
+		}
+
+		// Remove FFDHE key shares from key_share extension
+		if kse, ok := ext.(*KeyShareExtension); ok {
+			newKeyShares := make([]KeyShare, 0, len(kse.KeyShares))
+			for _, ks := range kse.KeyShares {
+				if IsFFDHEGroup(ks.Group) {
+					removed++
+				} else {
+					newKeyShares = append(newKeyShares, ks)
+				}
+			}
+			kse.KeyShares = newKeyShares
+		}
+	}
+
+	return removed
+}
+
+// RemoveFFDHEGroups is a standalone helper function that removes FFDHE groups from
+// a ClientHelloSpec. It is equivalent to calling spec.RemoveFFDHEGroups().
+//
+// This function exists for convenience when you prefer a functional style or when
+// working with specs that might be nil (this function handles nil safely).
+//
+// CRITICAL SECURITY CONTEXT:
+// Firefox profiles advertise FFDHE groups (FakeCurveFFDHE2048-8192) for fingerprint
+// accuracy. However, uTLS cannot perform actual FFDHE key exchange. If a server
+// selects FFDHE via HelloRetryRequest, the handshake FAILS with 100% certainty.
+// This creates a trivial detection vector for fingerprint-aware servers.
+//
+// Use this function or the safer profile variants (HelloFirefox_*_NoFFDHE) when
+// connecting to servers that might intentionally probe for fake TLS fingerprints.
+//
+// Returns the number of FFDHE groups removed, or 0 if spec is nil.
+func RemoveFFDHEGroups(spec *ClientHelloSpec) int {
+	if spec == nil {
+		return 0
+	}
+	return spec.RemoveFFDHEGroups()
 }
 
 // Import TLS ClientHello data from client.tlsfingerprint.io:8443
@@ -399,10 +698,29 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				if len(keyShareData)%4 != 0 {
 					return errors.New("key_share data length must be divisible by 4")
 				}
+
+				// Maximum reasonable key share length (ML-KEM + ECDHE hybrid is ~1216 bytes)
+				const maxKeyShareLength = 2048
+				// Maximum total key share data to prevent memory exhaustion
+				const maxTotalKeyShareData = 65536
+
 				fixedData := make([]byte, 0)
 				for i := 0; i+4 <= len(keyShareData); i += 4 {
+					// Read length as uint16 (big-endian) for proper TLS key share format
+					length := int(keyShareData[i+2])<<8 | int(keyShareData[i+3])
+
+					// Validate individual key share length
+					if length > maxKeyShareLength {
+						return fmt.Errorf("key_share entry length %d exceeds maximum allowed %d", length, maxKeyShareLength)
+					}
+
+					// Check total size to prevent memory exhaustion
+					if len(fixedData)+4+length > maxTotalKeyShareData {
+						return fmt.Errorf("total key_share data exceeds maximum allowed %d bytes", maxTotalKeyShareData)
+					}
+
 					fixedData = append(fixedData, keyShareData[i:i+4]...)
-					for j := 0; j < int(keyShareData[i+3]); j++ {
+					for j := 0; j < length; j++ {
 						fixedData = append(fixedData, 0)
 					}
 				}
@@ -439,7 +757,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				if err != nil {
 					return err
 				}
-			case fakeRecordSizeLimit:
+			case extensionRecordSizeLimit:
 				if data["record_size_limit"] == nil {
 					return errors.New("record_size_limit is required")
 				}
@@ -450,9 +768,13 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case utlsExtensionApplicationSettings:
 				// TODO: tlsfingerprint.io should record/provide application settings data
-				extWriter.(*ApplicationSettingsExtension).SupportedProtocols = []string{"h2"}
+				if ext, ok := extWriter.(*ApplicationSettingsExtension); ok {
+					ext.SupportedProtocols = []string{"h2"}
+				}
 			case utlsExtensionApplicationSettingsNew:
-				extWriter.(*ApplicationSettingsExtensionNew).SupportedProtocols = []string{"h2"}
+				if ext, ok := extWriter.(*ApplicationSettingsExtensionNew); ok {
+					ext.SupportedProtocols = []string{"h2"}
+				}
 			case extensionPreSharedKey:
 				log.Printf("[Warning] PSK extension added without data")
 			default:
@@ -526,10 +848,19 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 	chs.TLSVersMin = recordVersion
 	chs.TLSVersMax = handshakeVersion
 
-	var ignoredSessionID cryptobyte.String
-	if !s.ReadUint8LengthPrefixed(&ignoredSessionID) {
+	// Parse session ID and preserve its length for fingerprint accuracy.
+	// Firefox/Safari use empty session ID for fresh TLS 1.3 connections.
+	var sessionID cryptobyte.String
+	if !s.ReadUint8LengthPrefixed(&sessionID) {
 		return errors.New("unable to read session id")
 	}
+	sessionIDLen := len(sessionID)
+	if sessionIDLen == 0 {
+		chs.SessionIDLength = SessionIDLengthNone
+	} else if sessionIDLen <= 32 {
+		chs.SessionIDLength = sessionIDLen
+	}
+	// else: invalid session ID length, leave as default (auto)
 
 	// CipherSuites
 	var cipherSuitesBytes cryptobyte.String
@@ -568,8 +899,8 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 	// if extension list includes padding, we update the padding-to-len according to
 	// the raw ClientHello length
 	for _, ext := range chs.Extensions {
-		if _, ok := ext.(*UtlsPaddingExtension); ok {
-			ext.(*UtlsPaddingExtension).GetPaddingLen = AlwaysPadToLen(len(raw) - 5)
+		if paddingExt, ok := ext.(*UtlsPaddingExtension); ok {
+			paddingExt.GetPaddingLen = AlwaysPadToLen(len(raw) - 5)
 			break
 		}
 	}
@@ -612,6 +943,13 @@ var (
 	HelloFirefox_Auto = HelloFirefox_145
 	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
 	HelloFirefox_145  = ClientHelloID{helloFirefox, "145", nil, nil} // Extension shuffling (NSS 3.84+)
+
+	// Firefox profiles WITHOUT FFDHE groups (safer variants)
+	// These profiles are identical to their counterparts but with FFDHE groups removed.
+	// Use these if you are concerned about detection by servers that probe for FFDHE support.
+	// Trade-off: fingerprint deviates from real Firefox, but avoids 100% detection via FFDHE HRR.
+	HelloFirefox_120_NoFFDHE = ClientHelloID{helloFirefox, "120_NoFFDHE", nil, nil}
+	HelloFirefox_145_NoFFDHE = ClientHelloID{helloFirefox, "145_NoFFDHE", nil, nil}
 
 	// Chrome profiles (106+ have extension shuffling)
 	HelloChrome_Auto        = HelloChrome_142
@@ -696,14 +1034,35 @@ var DefaultWeights = Weights{
 // https://tools.ietf.org/html/draft-ietf-tls-grease-01
 const GREASE_PLACEHOLDER = 0x0a0a
 
-// isGREASEUint16 validates if a uint16 value is a valid GREASE value per RFC 8701.
+// greaseNibbleMask is used to extract the low nibbles from a uint16 value
+// for GREASE validation. GREASE values follow the pattern 0x?a?a where both
+// bytes have 0xa in their low nibble.
+const greaseNibbleMask uint16 = 0x0f0f
+
+// IsValidGREASEValue validates if a uint16 value is a valid GREASE value per RFC 8701.
 // Valid GREASE values follow the pattern 0x?a?a where ? is the same nibble (0-15):
 // 0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
 // 0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa
-func isGREASEUint16(v uint16) bool {
+//
+// The GREASE mechanism (Generate Random Extensions And Sustain Extensibility) is
+// defined in RFC 8701 to prevent protocol ossification. GREASE values are reserved
+// codepoints that clients include in their handshakes to ensure servers properly
+// ignore unknown values.
+//
+// Pattern explanation:
+//   - The low nibble of each byte must be 0xa
+//   - Both bytes must be identical (e.g., 0x1a1a, not 0x1a2a)
+//   - This means (v & 0x0f0f) == 0x0a0a AND high byte == low byte
+func IsValidGREASEValue(v uint16) bool {
 	// Check that both low nibbles are 0xa (the GREASE pattern)
 	// and that both bytes are identical
-	return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0xff)
+	return (v&greaseNibbleMask) == GREASE_PLACEHOLDER && (v>>8) == (v&0xff)
+}
+
+// isGREASEUint16 is the internal unexported version for backward compatibility.
+// Use IsValidGREASEValue for exported validation.
+func isGREASEUint16(v uint16) bool {
+	return IsValidGREASEValue(v)
 }
 
 func unGREASEUint16(v uint16) uint16 {

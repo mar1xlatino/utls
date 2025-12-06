@@ -243,8 +243,16 @@ func (hs *serverHandshakeState) processClientHello() error {
 		return err
 	}
 
+	// RFC 5746 Section 3.4: In an initial handshake, the renegotiated_connection
+	// field must be empty. Section 3.6: For TLS, reject with handshake_failure.
+	// RFC 5746 Section 3.7: In a renegotiation, verify_data should be present,
+	// but Go TLS server does not support renegotiation.
 	if len(hs.clientHello.secureRenegotiation) != 0 {
 		c.sendAlert(alertHandshakeFailure)
+		if c.handshakes > 0 {
+			// Client is attempting renegotiation, which is not supported
+			return errors.New("tls: renegotiation not supported")
+		}
 		return errors.New("tls: initial handshake had non-empty renegotiation extension")
 	}
 
@@ -315,11 +323,15 @@ func (hs *serverHandshakeState) processClientHello() error {
 
 // negotiateALPN picks a shared ALPN protocol that both sides support in server
 // preference order. If ALPN is not configured or the peer doesn't support it,
-// it returns "" and no error.
+// it returns "" and no error (except for QUIC where ALPN is mandatory per RFC 9001).
 func negotiateALPN(serverProtos, clientProtos []string, quic bool) (string, error) {
 	if len(serverProtos) == 0 || len(clientProtos) == 0 {
-		if quic && len(serverProtos) != 0 {
-			// RFC 9001, Section 8.1
+		// RFC 9001 Section 8.1: QUIC connections MUST negotiate ALPN.
+		// Both server and client must provide ALPN protocols.
+		if quic {
+			if len(serverProtos) == 0 {
+				return "", fmt.Errorf("tls: server must configure ALPN for QUIC connections")
+			}
 			return "", fmt.Errorf("tls: client did not request an application protocol")
 		}
 		return "", nil
@@ -339,7 +351,8 @@ func negotiateALPN(serverProtos, clientProtos []string, quic bool) (string, erro
 	// didn't support ALPN. We used not to enforce protocol overlap, so over
 	// time a number of HTTP servers were configured with only "h2", but
 	// expected to accept connections from "http/1.1" clients. See Issue 46310.
-	if http11fallback {
+	// This fallback does NOT apply to QUIC per RFC 9001 Section 8.1.
+	if http11fallback && !quic {
 		return "", nil
 	}
 	return "", fmt.Errorf("tls: client requested unsupported application protocols (%s)", clientProtos)
@@ -617,6 +630,9 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 	}
 
 	keyAgreement := hs.suite.ka(c.vers)
+	// Ensure key material is zeroed even on error paths
+	defer keyAgreement.cleanup()
+
 	skx, err := keyAgreement.generateServerKeyExchange(c.config, hs.cert, hs.clientHello, hs.hello)
 	if err != nil {
 		c.sendAlert(alertHandshakeFailure)
@@ -798,8 +814,14 @@ func (hs *serverHandshakeState) establishKeys() error {
 
 	if hs.suite.aead == nil {
 		clientCipher = hs.suite.cipher(clientKey, clientIV, true /* for reading */)
+		if clientCipher == nil {
+			return errors.New("tls: failed to create client cipher")
+		}
 		clientHash = hs.suite.mac(clientMAC)
 		serverCipher = hs.suite.cipher(serverKey, serverIV, false /* not for reading */)
+		if serverCipher == nil {
+			return errors.New("tls: failed to create server cipher")
+		}
 		serverHash = hs.suite.mac(serverMAC)
 	} else {
 		clientCipher = hs.suite.aead(clientKey, clientIV)
@@ -919,7 +941,12 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 			return errors.New("tls: failed to parse client certificate: " + err.Error())
 		}
 		if certs[i].PublicKeyAlgorithm == x509.RSA {
-			n := certs[i].PublicKey.(*rsa.PublicKey).N.BitLen()
+			rsaKey, ok := certs[i].PublicKey.(*rsa.PublicKey)
+			if !ok {
+				c.sendAlert(alertBadCertificate)
+				return errors.New("tls: client certificate has RSA algorithm but non-RSA public key")
+			}
+			n := rsaKey.N.BitLen()
 			if max, ok := checkKeySize(n); !ok {
 				c.sendAlert(alertBadCertificate)
 				return fmt.Errorf("tls: client sent certificate containing RSA key larger than %d bits", max)

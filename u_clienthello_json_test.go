@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -40,25 +41,12 @@ func testClientHelloSpecJSONUnmarshaler(
 		t.Errorf("JSONUnmarshaler %s: got %#v, want %#v", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.CompressionMethods, truthSpec.CompressionMethods)
 	}
 
-	// Compare Extensions
+	// Compare Extensions - use unordered comparison since modern profiles use extension shuffling
 	if len(jsonSpec.Extensions) != len(truthSpec.Extensions) {
 		t.Errorf("JSONUnmarshaler %s: len(jsonExtensions) = %d != %d = len(truthExtensions)", clientHelloSpecJSONTestIdentifier(truthClientHelloID), len(jsonSpec.Extensions), len(truthSpec.Extensions))
 	}
 
-	for i := range jsonSpec.Extensions {
-		if !reflect.DeepEqual(jsonSpec.Extensions[i], truthSpec.Extensions[i]) {
-			if _, ok := jsonSpec.Extensions[i].(*UtlsPaddingExtension); ok {
-				testedPaddingExt := jsonSpec.Extensions[i].(*UtlsPaddingExtension)
-				savedPaddingExt := truthSpec.Extensions[i].(*UtlsPaddingExtension)
-				if testedPaddingExt.PaddingLen != savedPaddingExt.PaddingLen || testedPaddingExt.WillPad != savedPaddingExt.WillPad {
-					t.Errorf("got %#v, want %#v", testedPaddingExt, savedPaddingExt)
-				} else {
-					continue // UtlsPaddingExtension has non-nil function member
-				}
-			}
-			t.Errorf("JSONUnmarshaler %s: got %#v, want %#v", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.Extensions[i], truthSpec.Extensions[i])
-		}
-	}
+	compareExtensionSets(t, "JSONUnmarshaler", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.Extensions, truthSpec.Extensions)
 }
 
 func TestClientHelloSpecUnmarshalJSON(t *testing.T) {
@@ -93,27 +81,72 @@ func testClientHelloSpecUnmarshalJSON(
 		t.Errorf("UnmarshalJSON %s: got %#v, want %#v", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.CompressionMethods, truthSpec.CompressionMethods)
 	}
 
-	// Compare Extensions
+	// Compare Extensions - use unordered comparison since modern profiles use extension shuffling
 	if len(jsonSpec.Extensions) != len(truthSpec.Extensions) {
 		t.Errorf("UnmarshalJSON %s: len(jsonExtensions) = %d != %d = len(truthExtensions)", jsonFilepath, len(jsonSpec.Extensions), len(truthSpec.Extensions))
 	}
 
-	for i := range jsonSpec.Extensions {
-		if !reflect.DeepEqual(jsonSpec.Extensions[i], truthSpec.Extensions[i]) {
-			if _, ok := jsonSpec.Extensions[i].(*UtlsPaddingExtension); ok {
-				testedPaddingExt := jsonSpec.Extensions[i].(*UtlsPaddingExtension)
-				savedPaddingExt := truthSpec.Extensions[i].(*UtlsPaddingExtension)
-				if testedPaddingExt.PaddingLen != savedPaddingExt.PaddingLen || testedPaddingExt.WillPad != savedPaddingExt.WillPad {
-					t.Errorf("got %#v, want %#v", testedPaddingExt, savedPaddingExt)
-				} else {
-					continue // UtlsPaddingExtension has non-nil function member
-				}
-			}
-			t.Errorf("UnmarshalJSON %s: got %#v, want %#v", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.Extensions[i], truthSpec.Extensions[i])
-		}
-	}
+	compareExtensionSets(t, "UnmarshalJSON", clientHelloSpecJSONTestIdentifier(truthClientHelloID), jsonSpec.Extensions, truthSpec.Extensions)
 }
 
 func clientHelloSpecJSONTestIdentifier(id ClientHelloID) string {
 	return id.Client + id.Version
+}
+
+// extensionKey returns a unique key for an extension based on its type and values.
+// For extensions that can appear multiple times (like GREASE), we append an index.
+func extensionKey(ext TLSExtension) string {
+	return reflect.TypeOf(ext).String()
+}
+
+// compareExtensionSets compares two extension slices as unordered sets.
+// This is needed because modern browser profiles shuffle extension order for fingerprint resistance.
+func compareExtensionSets(t *testing.T, testName, profileName string, jsonExts, truthExts []TLSExtension) {
+	// Sort both slices by extension type for deterministic comparison
+	sortedJSON := make([]TLSExtension, len(jsonExts))
+	sortedTruth := make([]TLSExtension, len(truthExts))
+	copy(sortedJSON, jsonExts)
+	copy(sortedTruth, truthExts)
+
+	sortByType := func(exts []TLSExtension) {
+		sort.Slice(exts, func(i, j int) bool {
+			return extensionKey(exts[i]) < extensionKey(exts[j])
+		})
+	}
+	sortByType(sortedJSON)
+	sortByType(sortedTruth)
+
+	// Compare sorted extensions
+	minLen := len(sortedJSON)
+	if len(sortedTruth) < minLen {
+		minLen = len(sortedTruth)
+	}
+
+	for i := 0; i < minLen; i++ {
+		jsonExt := sortedJSON[i]
+		truthExt := sortedTruth[i]
+
+		// Check same type
+		if extensionKey(jsonExt) != extensionKey(truthExt) {
+			t.Errorf("%s %s: extension type mismatch at sorted index %d: got %s, want %s",
+				testName, profileName, i, extensionKey(jsonExt), extensionKey(truthExt))
+			continue
+		}
+
+		// Special handling for UtlsPaddingExtension (has function member that cannot be compared)
+		if padJSON, ok := jsonExt.(*UtlsPaddingExtension); ok {
+			padTruth := truthExt.(*UtlsPaddingExtension)
+			if padJSON.PaddingLen != padTruth.PaddingLen || padJSON.WillPad != padTruth.WillPad {
+				t.Errorf("%s %s: padding mismatch: got PaddingLen=%d WillPad=%v, want PaddingLen=%d WillPad=%v",
+					testName, profileName, padJSON.PaddingLen, padJSON.WillPad, padTruth.PaddingLen, padTruth.WillPad)
+			}
+			continue
+		}
+
+		// Compare extension values
+		if !reflect.DeepEqual(jsonExt, truthExt) {
+			t.Errorf("%s %s: extension value mismatch for %s: got %#v, want %#v",
+				testName, profileName, extensionKey(jsonExt), jsonExt, truthExt)
+		}
+	}
 }

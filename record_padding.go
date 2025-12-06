@@ -57,6 +57,9 @@ type RecordPaddingConfig struct {
 
 // DefaultRecordPaddingConfig returns a Chrome-like padding configuration.
 // This mimics Chrome's TLS 1.3 record padding behavior based on traffic analysis.
+//
+// This is now the default for all TLS 1.3 connections to prevent fingerprinting.
+// Real browsers add random padding to records, so uTLS does the same by default.
 func DefaultRecordPaddingConfig() *RecordPaddingConfig {
 	return &RecordPaddingConfig{
 		Enabled:      true,
@@ -64,6 +67,22 @@ func DefaultRecordPaddingConfig() *RecordPaddingConfig {
 		MaxPadding:   255,
 		Distribution: "chrome",
 		Lambda:       3.0,
+	}
+}
+
+// DisabledRecordPaddingConfig returns a configuration that explicitly disables
+// record padding. Use this when you need to disable the default padding behavior.
+//
+// Example:
+//
+//	config.RecordPadding = DisabledRecordPaddingConfig()
+//
+// WARNING: Disabling padding makes TLS 1.3 records trivially distinguishable
+// from real browsers which add random 0-255 bytes per record. Only disable
+// if you have a specific reason (e.g., bandwidth constraints, compatibility).
+func DisabledRecordPaddingConfig() *RecordPaddingConfig {
+	return &RecordPaddingConfig{
+		Enabled: false,
 	}
 }
 

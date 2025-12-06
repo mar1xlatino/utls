@@ -16,18 +16,56 @@ import (
 	"io"
 	"net"
 	"slices"
-	"strconv"
+	"sync"
+	"sync/atomic"
+
+	"github.com/refraction-networking/utls/memcontrol"
 )
 
+// ClientHelloBuildStatus tracks whether and how the ClientHello has been built.
+// This is used internally to prevent double-building and to track the building method.
 type ClientHelloBuildStatus int
 
-const NotBuilt ClientHelloBuildStatus = 0
-const BuildByUtls ClientHelloBuildStatus = 1
-const BuildByGoTLS ClientHelloBuildStatus = 2
+const (
+	// NotBuilt indicates the ClientHello has not yet been built.
+	NotBuilt ClientHelloBuildStatus = 0
+	// BuildByUtls indicates the ClientHello was built using uTLS extension mechanism.
+	BuildByUtls ClientHelloBuildStatus = 1
+	// BuildByGoTLS indicates the ClientHello was built using standard Go TLS.
+	BuildByGoTLS ClientHelloBuildStatus = 2
+)
 
+// ErrExtensionsLocked is returned when attempting to modify Extensions after
+// BuildHandshakeState() has been called. This prevents race conditions between
+// user code modifying Extensions and the handshake goroutine iterating over it.
+var ErrExtensionsLocked = errors.New("tls: cannot modify extensions after BuildHandshakeState() has been called")
+
+// UConn is the main uTLS connection type, embedding the standard crypto/tls Conn
+// with additional fingerprinting capabilities. It allows mimicking the TLS fingerprint
+// of various browsers and clients.
+//
+// Create a UConn using UClient() for regular TCP connections or UQUICClient() for QUIC.
+// Configure the fingerprint by selecting a ClientHelloID (e.g., HelloChrome_120,
+// HelloFirefox_145) or by manually configuring Extensions for HelloCustom.
+//
+// Example:
+//
+//	conn, _ := net.Dial("tcp", "example.com:443")
+//	uconn, err := tls.UClient(conn, &tls.Config{ServerName: "example.com"}, tls.HelloChrome_120)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	if err := uconn.Handshake(); err != nil {
+//	    log.Fatal(err)
+//	}
 type UConn struct {
 	*Conn
 
+	// Extensions contains the TLS extensions to be sent in the ClientHello.
+	// WARNING: Do not modify Extensions after BuildHandshakeState() or Handshake()
+	// has been called. Doing so will result in ErrExtensionsLocked being returned
+	// from methods like SetSNI(). Use ExtensionsLocked() to check if modifications
+	// are still allowed.
 	Extensions        []TLSExtension
 	ClientHelloID     ClientHelloID
 	sessionController *sessionController
@@ -54,23 +92,86 @@ type UConn struct {
 	// ech extension is a shortcut to the ECH extension in the Extensions slice if there is one.
 	ech ECHExtension
 
-	// echCtx is the echContex returned by makeClientHello()
-	echCtx *echClientContext
+	// stateMu protects rawServerHello from concurrent access.
+	// This field is written during handshake and read after handshake completes.
+	// Using RWMutex allows concurrent reads while ensuring exclusive writes.
+	stateMu sync.RWMutex
+
+	// echCtx is the echContext returned by makeClientHello()
+	// Protected by atomic.Pointer for lock-free thread-safe access.
+	// Use echCtx.Load() to read and echCtx.Store() to write.
+	echCtx atomic.Pointer[echClientContext]
 
 	// rawServerHello stores the raw ServerHello bytes for JA4S calculation.
 	// Captured during handshake when serverHello is received.
+	// Protected by stateMu - use setRawServerHello/getRawServerHello for access.
 	rawServerHello []byte
 
 	// earlyData tracks 0-RTT early data state for this connection.
 	earlyData *EarlyDataState
+
+	// extensionsLocked prevents modification of Extensions after BuildHandshakeState()
+	// has been called. This prevents race conditions between user code modifying
+	// Extensions and the handshake goroutine iterating over it.
+	// Protected by extensionsMu for thread-safe access.
+	extensionsLocked bool
+	extensionsMu     sync.RWMutex
+
+	// handshakeTimingConfig controls timing jitter during handshakes to resist
+	// timing-based fingerprinting. When nil, no timing jitter is applied.
+	// See HandshakeTimingConfig for configuration options.
+	handshakeTimingConfig *HandshakeTimingConfig
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
-// Config CAN be nil, but make sure to eventually specify ServerName.
-func UClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) *UConn {
+//
+// The conn parameter must be non-nil for regular TLS usage. Passing nil will
+// return an error. For QUIC usage where the connection is managed by the QUIC
+// layer, use UQUICClient() instead.
+//
+// Config can be nil but then ServerName must be set before handshake, or
+// InsecureSkipVerify must be true. If config is provided with empty ServerName
+// and InsecureSkipVerify=false, an error is returned immediately.
+//
+// Returns an error if:
+//   - conn is nil (for non-QUIC usage)
+//   - config has empty ServerName and InsecureSkipVerify is false
+func UClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) (*UConn, error) {
+	if conn == nil {
+		return nil, errors.New("tls: UClient requires non-nil connection for non-QUIC usage; for QUIC, use UQUICClient instead")
+	}
+	// Validate config requirements early to provide clear error messages.
+	// Either ServerName must be set for hostname verification, or InsecureSkipVerify
+	// must be true to skip verification entirely. InsecureServerNameToVerify is also
+	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
+	// Note: nil config is allowed and will be initialized later, with validation
+	// occurring during handshake when ServerName could be set via SetSNI().
+	if config != nil && len(config.ServerName) == 0 && !config.InsecureSkipVerify && len(config.InsecureServerNameToVerify) == 0 {
+		return nil, errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
+	}
+	return uClient(conn, config, clientHelloID), nil
+}
+
+// uClient is the internal constructor that allows nil conn for QUIC usage.
+// This is used by UQUICClient where the connection is managed by the QUIC layer.
+func uClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) *UConn {
 	if config == nil {
 		config = &Config{}
 	}
+
+	// [uTLS] Enable TLS 1.3 record padding by default for fingerprint resistance.
+	// Real browsers add 0-255 bytes of random padding per record (RFC 8446 Section 5.4).
+	// This matches Chrome-like exponential distribution (~70% 0-72 bytes, ~25% 72-150, ~5% 150-255).
+	// Users can disable with: config.RecordPadding = DisabledRecordPaddingConfig()
+	if config.RecordPadding == nil {
+		config.RecordPadding = DefaultRecordPaddingConfig()
+	}
+
+	// Optionally wrap connection with memcontrol for memory-aware tracking
+	if config.EnableMemoryTracking && conn != nil {
+		conn = memcontrol.WrapOrPassthrough(conn, "utls-client")
+	}
+
 	tlsConn := Conn{conn: conn, config: config, isClient: true}
 	handshakeState := PubClientHandshakeState{C: &tlsConn, Hello: &PubClientHelloMsg{}}
 	uconn := UConn{Conn: &tlsConn, ClientHelloID: clientHelloID, HandshakeState: handshakeState}
@@ -80,6 +181,26 @@ func UClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) *UConn 
 	uconn.utls.sessionController = uconn.sessionController
 	uconn.skipResumptionOnNilExtension = config.PreferSkipResumptionOnNilExtension || clientHelloID.Client != helloCustom
 	return &uconn
+}
+
+// lockExtensions marks the Extensions slice as locked, preventing further
+// modifications. This is called automatically by BuildHandshakeState().
+// Internal use only.
+func (uconn *UConn) lockExtensions() {
+	uconn.extensionsMu.Lock()
+	uconn.extensionsLocked = true
+	uconn.extensionsMu.Unlock()
+}
+
+// ExtensionsLocked returns true if the Extensions slice has been locked
+// by BuildHandshakeState(). Once locked, methods that modify Extensions
+// (like SetSNI) will return ErrExtensionsLocked.
+// Thread-safe.
+func (uconn *UConn) ExtensionsLocked() bool {
+	uconn.extensionsMu.RLock()
+	locked := uconn.extensionsLocked
+	uconn.extensionsMu.RUnlock()
+	return locked
 }
 
 // BuildHandshakeState behavior varies based on ClientHelloID and
@@ -112,12 +233,16 @@ func (uconn *UConn) BuildHandshakeStateWithoutSession() error {
 }
 
 func (uconn *UConn) buildHandshakeState(loadSession bool) error {
+	// Lock extensions to prevent race conditions with user code modifying Extensions
+	// while we iterate over it during handshake.
+	uconn.lockExtensions()
+
 	if uconn.ClientHelloID == HelloGolang {
 		if uconn.clientHelloBuildStatus == BuildByGoTLS {
 			return nil
 		}
 		if uconn.clientHelloBuildStatus != NotBuilt {
-			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built by utls")
+			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built previously")
 		}
 
 		// use default Golang ClientHello.
@@ -129,7 +254,7 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		uconn.HandshakeState.Hello = hello.getPublicPtr()
 		uconn.HandshakeState.State13.KeyShareKeys = keySharePrivate.ToPublic()
 		uconn.HandshakeState.C = uconn.Conn
-		uconn.echCtx = ech
+		uconn.echCtx.Store(ech)
 		uconn.clientHelloBuildStatus = BuildByGoTLS
 	} else {
 		if !(uconn.clientHelloBuildStatus == BuildByUtls || uconn.clientHelloBuildStatus == NotBuilt) {
@@ -192,6 +317,9 @@ func (uconn *UConn) uLoadSession() error {
 		}
 	case shouldLoad:
 		hello := uconn.HandshakeState.Hello.getPrivatePtr()
+		if hello == nil {
+			return errors.New("tls: cannot load session - ClientHello is nil")
+		}
 		if err := uconn.sessionController.utlsAboutToLoadSession(); err != nil {
 			return err
 		}
@@ -233,6 +361,12 @@ func (uconn *UConn) uApplyPatch() error {
 	return nil
 }
 
+// DidTls12Resume reports whether the connection was established using TLS 1.2
+// session resumption. This returns true if a session ticket was successfully
+// used to resume a previous session, avoiding a full handshake.
+//
+// Note: For TLS 1.3 connections, check ConnectionState().DidResume instead,
+// as TLS 1.3 uses PSK-based resumption which is tracked differently.
 func (uconn *UConn) DidTls12Resume() bool {
 	return uconn.didResume
 }
@@ -289,7 +423,7 @@ func (uconn *UConn) SetSessionCache(cache ClientSessionCache) {
 // r must to be 32 bytes long.
 func (uconn *UConn) SetClientRandom(r []byte) error {
 	if len(r) != 32 {
-		return errors.New("Incorrect client random length! Expected: 32, got: " + strconv.Itoa(len(r)))
+		return errors.New("tls: invalid client random length")
 	} else {
 		uconn.HandshakeState.Hello.Random = make([]byte, 32)
 		copy(uconn.HandshakeState.Hello.Random, r)
@@ -297,7 +431,122 @@ func (uconn *UConn) SetClientRandom(r []byte) error {
 	}
 }
 
-func (uconn *UConn) SetSNI(sni string) {
+// applyCurveOrderVariation applies curve order variation based on the CurveOrderStrategy.
+// This modifies supported_groups and key_share extensions to match the specified strategy.
+// Called during ApplyPreset before key share generation to ensure consistency.
+//
+// Detection Vector Addressed:
+// Report Section 1.1.8 identifies that Chrome profiles hardcode exact curve order:
+// GREASE, X25519, P256, P384. Real Chrome varies order based on hardware curve support.
+// Identical curve order across all connections is detectable by DPI systems.
+func (uconn *UConn) applyCurveOrderVariation(strategy CurveOrderStrategy) error {
+	// Skip if strategy is empty (legacy behavior) or explicitly static
+	if strategy == "" || strategy == CurveOrderStatic {
+		return nil
+	}
+
+	// Find SupportedCurvesExtension and KeyShareExtension
+	var supportedCurves *SupportedCurvesExtension
+	var keyShare *KeyShareExtension
+	for _, ext := range uconn.Extensions {
+		switch e := ext.(type) {
+		case *SupportedCurvesExtension:
+			supportedCurves = e
+		case *KeyShareExtension:
+			keyShare = e
+		}
+	}
+
+	// If no supported curves extension, nothing to vary
+	if supportedCurves == nil {
+		return nil
+	}
+
+	// Determine whether to swap P256/P384
+	swapP256P384 := false
+	switch strategy {
+	case CurveOrderAutoVariation:
+		// Random swap with ~20% probability (like real Chrome hardware variation)
+		var randomByte [1]byte
+		if _, err := uconn.config.rand().Read(randomByte[:]); err != nil {
+			return err
+		}
+		// 20% chance: values 0-50 out of 0-255 (approximately 20%)
+		swapP256P384 = randomByte[0] < 51
+	case CurveOrderP384First:
+		swapP256P384 = true
+	case CurveOrderP256First:
+		swapP256P384 = false
+	default:
+		// Unknown strategy, use static behavior
+		return nil
+	}
+
+	// If no swap needed, return early
+	if !swapP256P384 {
+		return nil
+	}
+
+	// Find and swap P256/P384 in supported curves
+	p256Idx := -1
+	p384Idx := -1
+	for i, curve := range supportedCurves.Curves {
+		if curve == CurveP256 {
+			p256Idx = i
+		} else if curve == CurveP384 {
+			p384Idx = i
+		}
+	}
+
+	// Only swap if both P256 and P384 are present and P256 comes before P384
+	if p256Idx >= 0 && p384Idx >= 0 && p256Idx < p384Idx {
+		supportedCurves.Curves[p256Idx], supportedCurves.Curves[p384Idx] =
+			supportedCurves.Curves[p384Idx], supportedCurves.Curves[p256Idx]
+	}
+
+	// Ensure KeyShare extension matches the new curve order
+	if keyShare != nil {
+		p256KsIdx := -1
+		p384KsIdx := -1
+		for i, ks := range keyShare.KeyShares {
+			if ks.Group == CurveP256 {
+				p256KsIdx = i
+			} else if ks.Group == CurveP384 {
+				p384KsIdx = i
+			}
+		}
+
+		// Only swap in key_shares if both are present and P256 comes before P384
+		if p256KsIdx >= 0 && p384KsIdx >= 0 && p256KsIdx < p384KsIdx {
+			keyShare.KeyShares[p256KsIdx], keyShare.KeyShares[p384KsIdx] =
+				keyShare.KeyShares[p384KsIdx], keyShare.KeyShares[p256KsIdx]
+		}
+	}
+
+	return nil
+}
+
+// SetSNI sets the Server Name Indication extension to the specified hostname.
+// This must be called before BuildHandshakeState() or Handshake().
+// Returns ErrExtensionsLocked if called after BuildHandshakeState().
+//
+// Thread-safe: Uses extensionsMu to prevent TOCTOU race conditions between
+// the lock check and modification. The mutex is held for the entire operation
+// to ensure atomicity with respect to lockExtensions() calls from handshake.
+//
+// Note: This method does not validate the hostname format. For browser-compliant
+// validation, use SetSNIWithValidation instead.
+func (uconn *UConn) SetSNI(sni string) error {
+	// Hold lock for entire operation to prevent TOCTOU race:
+	// Without this, another goroutine could call lockExtensions() between
+	// our check and modification, allowing us to modify Extensions while
+	// the handshake iterates over it.
+	uconn.extensionsMu.Lock()
+	defer uconn.extensionsMu.Unlock()
+
+	if uconn.extensionsLocked {
+		return ErrExtensionsLocked
+	}
 	hname := hostnameInSNI(sni)
 	uconn.config.ServerName = hname
 	for _, ext := range uconn.Extensions {
@@ -306,6 +555,61 @@ func (uconn *UConn) SetSNI(sni string) {
 			sniExt.ServerName = hname
 		}
 	}
+	return nil
+}
+
+// SetSNIWithValidation sets the SNI after validating and normalizing the hostname.
+// This matches browser behavior for hostname validation, which helps prevent
+// DPI detection via malformed SNI probing.
+//
+// Validation includes:
+//   - Maximum 253 characters total
+//   - Maximum 63 characters per label
+//   - Valid characters: a-z, A-Z, 0-9, hyphen
+//   - No hyphen at start/end of labels
+//   - No trailing dot (stripped automatically)
+//   - IP addresses rejected
+//   - IDN domains converted to Punycode
+//
+// Thread-safe: Uses extensionsMu to prevent TOCTOU race conditions between
+// the lock check and modification. The mutex is held for the entire modification
+// operation to ensure atomicity with respect to lockExtensions() calls from handshake.
+//
+// Returns ErrExtensionsLocked if called after BuildHandshakeState().
+// Returns SNIValidationError if the hostname is invalid.
+func (uconn *UConn) SetSNIWithValidation(sni string) error {
+	// Validate and normalize the hostname BEFORE acquiring lock
+	// (validation doesn't access Extensions, so no need to hold lock)
+	normalized, err := ValidateAndNormalizeSNI(sni)
+	if err != nil {
+		return err
+	}
+
+	// Use hostnameInSNI for final processing (handles IP check, trailing dots)
+	hname := hostnameInSNI(normalized)
+	if len(hname) == 0 {
+		return &SNIValidationError{Hostname: sni, Reason: "hostname resolved to empty after processing"}
+	}
+
+	// Hold lock for check and modification to prevent TOCTOU race:
+	// Without this, another goroutine could call lockExtensions() between
+	// our check and modification, allowing us to modify Extensions while
+	// the handshake iterates over it.
+	uconn.extensionsMu.Lock()
+	defer uconn.extensionsMu.Unlock()
+
+	if uconn.extensionsLocked {
+		return ErrExtensionsLocked
+	}
+
+	uconn.config.ServerName = hname
+	for _, ext := range uconn.Extensions {
+		sniExt, ok := ext.(*SNIExtension)
+		if ok {
+			sniExt.ServerName = hname
+		}
+	}
+	return nil
 }
 
 // RemoveSNIExtension removes SNI from the list of extensions sent in ClientHello
@@ -415,6 +719,18 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	c.handshakeErr = c.handshakeFn(handshakeCtx)
 	if c.handshakeErr == nil {
 		c.handshakes++
+
+		// [uTLS section begins]
+		// Send any buffered early data after successful handshake.
+		// This implements "silent fallback" for 0-RTT: data written via WriteEarlyData()
+		// before handshake is automatically sent as regular data after handshake.
+		// Skip for QUIC connections as they handle early data at the transport layer.
+		if c.quic == nil {
+			if err := c.sendBufferedEarlyData(); err != nil {
+				c.handshakeErr = err
+			}
+		}
+		// [uTLS section ends]
 	} else {
 		// If an error occurred during the hadshake try to flush the
 		// alert that might be left in the buffer.
@@ -514,6 +830,14 @@ func (c *UConn) Write(b []byte) (int, error) {
 	return n + m, c.out.setErrorLocked(err)
 }
 
+// ApplyConfig writes the configuration from each TLS extension in uconn.Extensions
+// to the internal UConn state. This is called automatically during BuildHandshakeState()
+// and generally should not be called directly by user code.
+//
+// Each extension's writeToUConn method is invoked to transfer its settings
+// (such as SNI hostname, supported curves, ALPN protocols, etc.) to the connection.
+//
+// Returns an error if any extension fails to apply its configuration.
 func (uconn *UConn) ApplyConfig() error {
 	for _, ext := range uconn.Extensions {
 		err := ext.writeToUConn(uconn)
@@ -545,16 +869,26 @@ func (uconn *UConn) SetRecordPadding(cfg *RecordPaddingConfig) {
 	uconn.config.RecordPadding = cfg
 }
 
-// SetRecordPaddingMode is a convenience method to enable padding with a specific mode.
-// Valid modes: "chrome" (default), "exponential", "uniform", "none".
+// SetRecordPaddingMode is a convenience method to configure padding mode.
+// Valid modes:
+//   - "chrome" (default when nil): Chrome-like exponential distribution
+//   - "exponential": Standard exponential distribution
+//   - "uniform": Uniform random distribution
+//   - "none": Explicitly disable padding (NOT RECOMMENDED - breaks fingerprint)
+//   - "" (empty): Use default (Chrome-like padding)
+//
+// Note: Padding is ENABLED BY DEFAULT for TLS 1.3 fingerprint resistance.
+// Only use "none" if you have specific requirements.
 func (uconn *UConn) SetRecordPaddingMode(mode string) {
 	if uconn.config == nil {
 		return
 	}
 	switch mode {
-	case "none", "":
-		uconn.config.RecordPadding = nil
-	case "chrome":
+	case "none":
+		// Explicitly disable padding (user's explicit choice)
+		uconn.config.RecordPadding = DisabledRecordPaddingConfig()
+	case "", "chrome":
+		// Empty or "chrome" uses the default Chrome-like distribution
 		uconn.config.RecordPadding = DefaultRecordPaddingConfig()
 	case "exponential":
 		uconn.config.RecordPadding = &RecordPaddingConfig{
@@ -575,6 +909,64 @@ func (uconn *UConn) SetRecordPaddingMode(mode string) {
 	}
 }
 
+// SetHandshakeTiming configures handshake timing jitter for fingerprint resistance.
+// When enabled, introduces realistic delays between handshake messages to simulate
+// real browser behavior (certificate validation, key computation, etc.).
+//
+// Use nil to disable timing jitter, or DefaultHandshakeTimingConfig() for recommended settings.
+//
+// Example:
+//
+//	uconn.SetHandshakeTiming(tls.DefaultHandshakeTimingConfig())  // Enable with defaults
+//	uconn.SetHandshakeTiming(nil)                                  // Disable timing jitter
+//	uconn.SetHandshakeTiming(tls.ChromeHandshakeTimingConfig())   // Chrome-like timing
+func (uconn *UConn) SetHandshakeTiming(cfg *HandshakeTimingConfig) {
+	uconn.handshakeTimingConfig = cfg
+}
+
+// HandshakeTimingConfig returns the current handshake timing configuration.
+// Returns nil if timing jitter is disabled.
+func (uconn *UConn) HandshakeTimingConfig() *HandshakeTimingConfig {
+	return uconn.handshakeTimingConfig
+}
+
+// getHandshakeTimingController creates a timing controller for the current handshake.
+// Returns nil if timing is not configured.
+func (uconn *UConn) getHandshakeTimingController() *handshakeTimingController {
+	if uconn.handshakeTimingConfig == nil {
+		return nil
+	}
+	return newHandshakeTimingController(uconn.handshakeTimingConfig)
+}
+
+// SetCloseNotifyJitter configures close_notify timing jitter for fingerprint resistance.
+// When enabled, introduces realistic timing variability in sending close_notify alerts,
+// mimicking real browser connection shutdown behavior.
+//
+// Use nil to disable jitter (default), or DefaultCloseNotifyConfig() for browser-like behavior.
+//
+// Example:
+//
+//	uconn.SetCloseNotifyJitter(tls.DefaultCloseNotifyConfig())  // Enable with defaults
+//	uconn.SetCloseNotifyJitter(tls.ChromeCloseNotifyConfig())   // Chrome-like
+//	uconn.SetCloseNotifyJitter(tls.FirefoxCloseNotifyConfig())  // Firefox-like
+//	uconn.SetCloseNotifyJitter(nil)                              // Disable (default)
+func (uconn *UConn) SetCloseNotifyJitter(cfg *CloseNotifyConfig) {
+	if uconn.config == nil {
+		return
+	}
+	uconn.config.CloseNotifyJitter = cfg
+}
+
+// CloseNotifyJitter returns the current close_notify jitter configuration.
+// Returns nil if jitter is disabled (default).
+func (uconn *UConn) CloseNotifyJitter() *CloseNotifyConfig {
+	if uconn.config == nil {
+		return nil
+	}
+	return uconn.config.CloseNotifyJitter
+}
+
 // GreaseSeed returns a copy of the GREASE seed array.
 // Used for frozen GREASE restoration in session consistency.
 // The array indices correspond to ssl_grease_cipher (0), ssl_grease_group (1),
@@ -592,7 +984,7 @@ func (uconn *UConn) GreaseSeed() [ssl_grease_last_index]uint16 {
 // has only 5 elements (indices 0-4). Returns error if index is out of bounds.
 func (uconn *UConn) SetGreaseSeedAt(index int, value uint16) error {
 	if index < 0 || index >= ssl_grease_last_index {
-		return fmt.Errorf("invalid GREASE index: %d (valid range: 0-%d)", index, ssl_grease_last_index-1)
+		return fmt.Errorf("tls: invalid seed index: %d", index)
 	}
 	uconn.greaseSeed[index] = value
 	return nil
@@ -621,19 +1013,28 @@ func (uconn *UConn) SetGreaseSeedFromFrozen(frozen *FrozenGREASEValues) {
 // RawServerHello returns captured ServerHello bytes for JA4S calculation.
 // Returns nil if ServerHello hasn't been received yet.
 // The returned slice is a copy to prevent modification of internal state.
+// Thread-safe: Protected by stateMu RWMutex.
 func (uconn *UConn) RawServerHello() []byte {
-	if uconn.rawServerHello == nil {
+	uconn.stateMu.RLock()
+	raw := uconn.rawServerHello
+	uconn.stateMu.RUnlock()
+
+	if raw == nil {
 		return nil
 	}
 	// Return copy to prevent modification
-	result := make([]byte, len(uconn.rawServerHello))
-	copy(result, uconn.rawServerHello)
+	result := make([]byte, len(raw))
+	copy(result, raw)
 	return result
 }
 
 // SetRawServerHello stores raw ServerHello bytes.
 // This is primarily used for testing and ServerHello replay scenarios.
+// Thread-safe: Protected by stateMu RWMutex.
 func (uconn *UConn) SetRawServerHello(raw []byte) {
+	uconn.stateMu.Lock()
+	defer uconn.stateMu.Unlock()
+
 	if raw == nil {
 		uconn.rawServerHello = nil
 		return
@@ -673,6 +1074,14 @@ func (uconn *UConn) SetCertCompressionAlgs(algs []CertCompressionAlgo) {
 	copy(uconn.certCompressionAlgs, algs)
 }
 
+// NegotiatedRecordSizeLimit returns the negotiated record size limit (RFC 8449).
+// Returns 0 if the extension was not negotiated.
+// This is the maximum plaintext record size we can send to the server.
+// In TLS 1.3, the limit includes the content type byte, so actual data capacity is limit-1.
+func (uconn *UConn) NegotiatedRecordSizeLimit() uint16 {
+	return uconn.Conn.utls.negotiatedRecordSizeLimit
+}
+
 // EchContextInfo provides read-only access to ECH context state.
 type EchContextInfo struct {
 	Enabled         bool   // Whether ECH is configured
@@ -685,20 +1094,20 @@ type EchContextInfo struct {
 
 // EchContext returns information about the ECH (Encrypted Client Hello) context.
 // Returns nil if ECH is not configured for this connection.
-// Thread-safety: Takes local copy to avoid TOCTOU race.
+// Thread-safe: Uses atomic.Pointer for lock-free access.
 func (uconn *UConn) EchContext() *EchContextInfo {
-	// Take local copy to avoid TOCTOU race
-	echCtx := uconn.echCtx
+	echCtx := uconn.echCtx.Load()
 	if echCtx == nil {
 		return nil
 	}
+	// echCtx fields are set during handshake and immutable after,
+	// so safe to read without holding the lock
 	info := &EchContextInfo{
 		Enabled:  true,
 		KdfID:    echCtx.kdfID,
 		AeadID:   echCtx.aeadID,
 		Rejected: echCtx.echRejected,
 	}
-	// Take local copy of config to avoid race
 	config := echCtx.config
 	if config != nil {
 		info.ConfigID = config.ConfigID
@@ -709,14 +1118,14 @@ func (uconn *UConn) EchContext() *EchContextInfo {
 
 // EchRetryConfigs returns the ECH retry configs provided by the server.
 // Returns nil if ECH was not rejected or no retry configs were provided.
-// Thread-safety: Takes local copy to avoid TOCTOU race.
+// Thread-safe: Uses atomic.Pointer for lock-free access.
 func (uconn *UConn) EchRetryConfigs() []byte {
-	// Take local copy to avoid TOCTOU race
-	echCtx := uconn.echCtx
+	echCtx := uconn.echCtx.Load()
 	if echCtx == nil {
 		return nil
 	}
-	// Take local copy of slice header
+	// echCtx fields are set during handshake and immutable after,
+	// so safe to read without holding the lock
 	retryConfigs := echCtx.retryConfigs
 	if len(retryConfigs) == 0 {
 		return nil
@@ -815,6 +1224,20 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 
 }
 
+// MarshalClientHello serializes the ClientHello message into the Raw field
+// of HandshakeState.Hello. If ECH (Encrypted Client Hello) is configured,
+// this method also computes and includes the ECH extension.
+//
+// This is called automatically during BuildHandshakeState() and typically
+// should not be called directly unless you need to re-marshal after modifying
+// extensions.
+//
+// For ECH connections, this method:
+//   - Creates the inner ClientHello
+//   - Computes the encrypted ECH extension
+//   - Stores the ECH context for later use during handshake
+//
+// Returns an error if marshaling or ECH computation fails.
 func (uconn *UConn) MarshalClientHello() error {
 	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
 		inner, _, ech, err := uconn.makeClientHello()
@@ -834,7 +1257,7 @@ func (uconn *UConn) MarshalClientHello() error {
 			return fmt.Errorf("tls: failed to compute ECH extension: %w", err)
 		}
 
-		uconn.echCtx = ech
+		uconn.echCtx.Store(ech)
 		return nil
 	}
 
@@ -859,7 +1282,9 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 
 	// Check for duplicate extension types (RFC 8446 forbids duplicates)
 	seenExts := make(map[uint16]bool)
-	var extBuf []byte // reusable buffer for reading extension type
+	// Initialize with minimal capacity to avoid nil slice panic when resizing
+	// Most extensions are small (< 64 bytes), buffer grows as needed
+	extBuf := make([]byte, 0, 64)
 
 	for _, ext := range uconn.Extensions {
 		if pe, ok := ext.(*UtlsPaddingExtension); !ok {
@@ -877,7 +1302,9 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 				// Read() is idempotent - safe to call multiple times
 				if n, err := ext.Read(extBuf); n >= 2 && (err == nil || err == io.EOF) {
 					extType := uint16(extBuf[0])<<8 | uint16(extBuf[1])
-					if seenExts[extType] {
+					// Allow multiple GREASE extensions (real browsers have ~6.25% collision rate)
+					// RFC 8701 allows GREASE values to appear multiple times
+					if seenExts[extType] && !isGREASEUint16(extType) {
 						return fmt.Errorf("tls: duplicate extension type %d", extType)
 					}
 					seenExts[extType] = true
@@ -955,8 +1382,7 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 	}
 
 	if helloBuffer.Len() != 4+helloLen {
-		return errors.New("utls: unexpected ClientHello length. Expected: " + strconv.Itoa(4+helloLen) +
-			". Got: " + strconv.Itoa(helloBuffer.Len()))
+		return errors.New("tls: invalid ClientHello length")
 	}
 
 	hello.Raw = helloBuffer.Bytes()
@@ -1021,17 +1447,16 @@ func (uconn *UConn) SetTLSVers(minTLSVers, maxTLSVers uint16, specExtensions []T
 			maxTLSVers = VersionTLS12
 		case 1:
 		default:
-			return fmt.Errorf("uconn.Extensions contains %v separate SupportedVersions extensions",
-				supportedVersionsExtensionsPresent)
+			return fmt.Errorf("tls: duplicate supported_versions extension")
 		}
 	}
 
 	if minTLSVers < VersionTLS10 || minTLSVers > VersionTLS13 {
-		return fmt.Errorf("uTLS does not support 0x%X as min version", minTLSVers)
+		return fmt.Errorf("tls: unsupported protocol version 0x%X", minTLSVers)
 	}
 
 	if maxTLSVers < VersionTLS10 || maxTLSVers > VersionTLS13 {
-		return fmt.Errorf("uTLS does not support 0x%X as max version", maxTLSVers)
+		return fmt.Errorf("tls: unsupported protocol version 0x%X", maxTLSVers)
 	}
 
 	uconn.HandshakeState.Hello.SupportedVersions = makeSupportedVersions(minTLSVers, maxTLSVers)
@@ -1043,10 +1468,20 @@ func (uconn *UConn) SetTLSVers(minTLSVers, maxTLSVers uint16, specExtensions []T
 	return nil
 }
 
+// SetUnderlyingConn replaces the underlying network connection.
+// This can be used to swap the connection after initial setup,
+// for example when wrapping with a proxy connection.
+//
+// WARNING: This should only be called before the handshake begins.
+// Replacing the connection during or after handshake will cause
+// undefined behavior and likely connection failures.
 func (uconn *UConn) SetUnderlyingConn(c net.Conn) {
 	uconn.Conn.conn = c
 }
 
+// GetUnderlyingConn returns the underlying network connection.
+// This can be used to access the raw TCP connection for operations
+// like setting deadlines or reading connection metadata.
 func (uconn *UConn) GetUnderlyingConn() net.Conn {
 	return uconn.Conn.conn
 }
@@ -1066,8 +1501,16 @@ func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite
 		var clientHash, serverHash hash.Hash
 		if cs.cipher != nil {
 			clientCipher = cs.cipher(clientKey, clientIV, true /* for reading */)
+			if clientCipher == nil {
+				// Cipher creation failed (invalid key length)
+				return nil
+			}
 			clientHash = cs.mac(clientMAC)
 			serverCipher = cs.cipher(serverKey, serverIV, false /* not for reading */)
+			if serverCipher == nil {
+				// Cipher creation failed (invalid key length)
+				return nil
+			}
 			serverHash = cs.mac(serverMAC)
 		} else {
 			clientCipher = cs.aead(clientKey, clientIV)
@@ -1093,8 +1536,14 @@ func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite
 		tlsConn.in.changeCipherSpec()
 		tlsConn.out.changeCipherSpec()
 
-		tlsConn.in.incSeq()
-		tlsConn.out.incSeq()
+		// Increment sequence numbers - errors are effectively impossible here
+		// since we just initialized (seq starts at 0), but handle gracefully.
+		if err := tlsConn.in.incSeq(); err != nil {
+			return nil
+		}
+		if err := tlsConn.out.incSeq(); err != nil {
+			return nil
+		}
 
 		return tlsConn
 	} else {
@@ -1139,6 +1588,12 @@ type utlsConnExtraFields struct {
 	applicationSettingsCodepoint uint16
 
 	sessionController *sessionController
+
+	// negotiatedRecordSizeLimit stores the record size limit negotiated via
+	// the record_size_limit extension (RFC 8449). When non-zero, this limits
+	// the maximum plaintext size of TLS records sent to the peer.
+	// This is stored in Conn (not UConn) so maxPayloadSizeForWrite can access it.
+	negotiatedRecordSizeLimit uint16
 }
 
 // Read reads data from the connection.

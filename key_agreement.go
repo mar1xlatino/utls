@@ -33,6 +33,11 @@ type keyAgreement interface {
 	// ServerKeyExchange message.
 	processServerKeyExchange(*Config, *clientHelloMsg, *serverHelloMsg, *x509.Certificate, *serverKeyExchangeMsg) error
 	generateClientKeyExchange(*Config, *clientHelloMsg, *x509.Certificate) ([]byte, *clientKeyExchangeMsg, error)
+
+	// cleanup securely zeros any key material stored in the key agreement
+	// structure. This should be called via defer after creating the key
+	// agreement object to ensure secrets are zeroed even on error paths.
+	cleanup()
 }
 
 var errClientKeyExchange = errors.New("tls: invalid ClientKeyExchange message")
@@ -102,6 +107,10 @@ func (ka rsaKeyAgreement) generateClientKeyExchange(config *Config, clientHello 
 	copy(ckx.ciphertext[2:], encrypted)
 	return preMasterSecret, ckx, nil
 }
+
+// cleanup is a no-op for rsaKeyAgreement since it doesn't store any
+// persistent key material - all secrets are returned directly to the caller.
+func (ka rsaKeyAgreement) cleanup() {}
 
 // sha1Hash calculates a SHA1 hash over the given byte slices.
 func sha1Hash(slices [][]byte) []byte {
@@ -363,4 +372,25 @@ func (ka *ecdheKeyAgreement) generateClientKeyExchange(config *Config, clientHel
 	}
 
 	return ka.preMasterSecret, ka.ckx, nil
+}
+
+// cleanup securely zeros and releases key material to minimize the window
+// for memory disclosure attacks. This should be called via defer after creating
+// the key agreement object to ensure secrets are zeroed even on error paths.
+//
+// SECURITY NOTE: While Go's garbage collector will eventually reclaim this
+// memory, explicitly zeroing secrets reduces the window during which they
+// could be extracted via memory dumps, cold boot attacks, or similar.
+func (ka *ecdheKeyAgreement) cleanup() {
+	if ka.preMasterSecret != nil {
+		// Zero the pre-master secret before releasing.
+		// zeroSlice includes runtime.KeepAlive to prevent optimization.
+		zeroSlice(ka.preMasterSecret)
+		ka.preMasterSecret = nil
+	}
+	// Note: ka.key (*ecdh.PrivateKey) is managed by the ecdh package
+	// and does not expose a way to zero the private key bytes directly.
+	// Setting to nil allows GC to reclaim it.
+	ka.key = nil
+	ka.ckx = nil
 }

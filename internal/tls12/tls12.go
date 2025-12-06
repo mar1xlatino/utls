@@ -57,7 +57,7 @@ func MasterSecret(hash func() hash.Hash, preMasterSecret, transcript []byte) []b
 	// 		fips140.RecordNonApproved()
 	// 	}
 	// case *sha512.Digest:
-	// 	if h.Size() != 46 && h.Size() != 64 {
+	// 	if h.Size() != 48 && h.Size() != 64 {  // SHA-384 = 48 bytes, SHA-512 = 64 bytes
 	// 		fips140.RecordNonApproved()
 	// 	}
 	// default:

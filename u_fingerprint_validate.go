@@ -405,12 +405,16 @@ func getCachedRegex(pattern string) *regexp.Regexp {
 
 // clearPatternCache clears the pattern cache and resets the size counter.
 // This is called when the cache exceeds patternCacheMaxSize.
+//
+// IMPORTANT: We use Range+Delete pattern instead of reassigning sync.Map{}
+// because reassigning the global variable is NOT atomic. Other goroutines
+// could be accessing the old map while reassignment occurs, causing a data race.
+// The Range+Delete pattern uses only the thread-safe methods of sync.Map.
 func clearPatternCache() {
-	// Create a new empty sync.Map by resetting the global variable.
-	// Note: This is safe because sync.Map handles concurrent access internally.
-	// Existing goroutines may still see some old entries during the transition,
-	// which is acceptable for a cache.
-	patternCache = sync.Map{}
+	patternCache.Range(func(key, value interface{}) bool {
+		patternCache.Delete(key)
+		return true
+	})
 	atomic.StoreInt64(&patternCacheSize, 0)
 }
 

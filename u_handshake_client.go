@@ -178,6 +178,33 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 		}
 	}
 
+	// RFC 8449: Process record_size_limit from server's EncryptedExtensions.
+	// The server's limit tells us the maximum plaintext size we can SEND to the server.
+	// We only honor this if we advertised record_size_limit in our ClientHello.
+	if encryptedExtensions.utls.recordSizeLimit > 0 {
+		// Verify we actually advertised record_size_limit extension
+		advertisedLimit := uint16(0)
+		for _, ext := range hs.uconn.Extensions {
+			if rsl, ok := ext.(*RecordSizeLimitExtension); ok {
+				advertisedLimit = rsl.Limit
+				break
+			}
+		}
+		if advertisedLimit > 0 {
+			// Server responded with its limit - this is what we must respect when sending.
+			// Per RFC 8449 Section 4: The server MUST NOT send a value larger than
+			// the value the client offered. If it does, we should use our advertised value.
+			serverLimit := encryptedExtensions.utls.recordSizeLimit
+			if serverLimit > advertisedLimit {
+				// Server violated RFC 8449 by sending larger limit than we offered.
+				// Use our advertised limit as a safety measure.
+				serverLimit = advertisedLimit
+			}
+			// Store in Conn.utls so maxPayloadSizeForWrite can access it
+			hs.c.utls.negotiatedRecordSizeLimit = serverLimit
+		}
+	}
+
 	return nil
 }
 
@@ -185,8 +212,12 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 	config := c.config
 
 	// [UTLS SECTION START]
+	// Validate that the config has enough information for certificate verification.
+	// Either ServerName must be set for hostname verification, or InsecureSkipVerify
+	// must be true to skip verification entirely. InsecureServerNameToVerify is also
+	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
 	if len(config.ServerName) == 0 && !config.InsecureSkipVerify && len(config.InsecureServerNameToVerify) == 0 {
-		return nil, nil, nil, errors.New("tls: at least one of ServerName, InsecureSkipVerify or InsecureServerNameToVerify must be specified in the tls.Config")
+		return nil, nil, nil, errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
 	}
 	// [UTLS SECTION END]
 
@@ -397,7 +428,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// [uTLS section begins]
 	hello := c.HandshakeState.Hello.getPrivatePtr()
-	ech := c.echCtx
+	ech := c.echCtx.Load()
 	defer func() { c.HandshakeState.Hello = hello.getPublicPtr() }()
 
 	sessionIsLocked := c.utls.sessionController.isSessionLocked()
@@ -417,8 +448,12 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// [uTLS section begins]
 	// don't make new ClientHello, use hs.hello
 	// preserve the checks from beginning and end of makeClientHello()
+	// Validate that the config has enough information for certificate verification.
+	// Either ServerName must be set for hostname verification, or InsecureSkipVerify
+	// must be true to skip verification entirely. InsecureServerNameToVerify is also
+	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
 	if len(c.config.ServerName) == 0 && !c.config.InsecureSkipVerify && len(c.config.InsecureServerNameToVerify) == 0 {
-		return errors.New("tls: at least one of ServerName, InsecureSkipVerify or InsecureServerNameToVerify must be specified in the tls.Config")
+		return errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
 	}
 
 	nextProtosLength := 0
@@ -454,7 +489,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 
 		if c.HandshakeState.State13.EarlySecret != nil && session != nil {
 			cipherSuite := cipherSuiteTLS13ByID(session.cipherSuite)
-			earlySecret = tls13.NewEarlySecretFromSecret(cipherSuite.hash.New, c.HandshakeState.State13.EarlySecret)
+			var esErr error
+			earlySecret, esErr = tls13.NewEarlySecretFromSecret(cipherSuite.hash.New, c.HandshakeState.State13.EarlySecret)
+			if esErr != nil {
+				return esErr
+			}
 		}
 
 		binderKey = c.HandshakeState.State13.BinderKey
@@ -514,7 +553,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		if err := transcriptMsg(hello, transcript); err != nil {
 			return err
 		}
-		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
+		earlyTrafficSecret, err := earlySecret.ClientEarlyTrafficSecret(transcript)
+		if err != nil {
+			c.sendAlert(alertInternalError)
+			return err
+		}
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
 	}
 
@@ -532,8 +575,10 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 
 	// [uTLS] Capture raw ServerHello for JA4S calculation
 	if serverHello.original != nil {
+		c.stateMu.Lock()
 		c.rawServerHello = make([]byte, len(serverHello.original))
 		copy(c.rawServerHello, serverHello.original)
+		c.stateMu.Unlock()
 	}
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
@@ -560,10 +605,18 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		hs13.hello = hello
 		hs13.echContext = ech
 		if c.HandshakeState.State13.EarlySecret != nil && session.cipherSuite != 0 {
-			hs13.earlySecret = tls13.NewEarlySecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.State13.EarlySecret)
+			var esErr error
+			hs13.earlySecret, esErr = tls13.NewEarlySecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.State13.EarlySecret)
+			if esErr != nil {
+				return esErr
+			}
 		}
 		if c.HandshakeState.MasterSecret != nil && session.cipherSuite != 0 {
-			hs13.masterSecret = tls13.NewMasterSecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.MasterSecret)
+			var msErr error
+			hs13.masterSecret, msErr = tls13.NewMasterSecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.MasterSecret)
+			if msErr != nil {
+				return msErr
+			}
 		}
 		if !sessionIsLocked {
 			hs13.earlySecret = earlySecret

@@ -715,6 +715,30 @@ func (m *clientHelloMsg) originalBytes() []byte {
 }
 
 func (m *clientHelloMsg) clone() *clientHelloMsg {
+	// Deep clone keyShares - each keyShare contains a []byte data field
+	clonedKeyShares := make([]keyShare, len(m.keyShares))
+	for i, ks := range m.keyShares {
+		clonedKeyShares[i] = keyShare{
+			group: ks.group,
+			data:  slices.Clone(ks.data),
+		}
+	}
+
+	// Deep clone pskIdentities - each pskIdentity contains a []byte label field
+	clonedPskIdentities := make([]pskIdentity, len(m.pskIdentities))
+	for i, id := range m.pskIdentities {
+		clonedPskIdentities[i] = pskIdentity{
+			label:               slices.Clone(id.label),
+			obfuscatedTicketAge: id.obfuscatedTicketAge,
+		}
+	}
+
+	// Deep clone pskBinders - it's [][]byte, need to clone each inner slice
+	clonedPskBinders := make([][]byte, len(m.pskBinders))
+	for i, binder := range m.pskBinders {
+		clonedPskBinders[i] = slices.Clone(binder)
+	}
+
 	return &clientHelloMsg{
 		original:                         slices.Clone(m.original),
 		vers:                             m.vers,
@@ -737,13 +761,15 @@ func (m *clientHelloMsg) clone() *clientHelloMsg {
 		scts:                             m.scts,
 		supportedVersions:                slices.Clone(m.supportedVersions),
 		cookie:                           slices.Clone(m.cookie),
-		keyShares:                        slices.Clone(m.keyShares),
+		keyShares:                        clonedKeyShares,
 		earlyData:                        m.earlyData,
 		pskModes:                         slices.Clone(m.pskModes),
-		pskIdentities:                    slices.Clone(m.pskIdentities),
-		pskBinders:                       slices.Clone(m.pskBinders),
+		pskIdentities:                    clonedPskIdentities,
+		pskBinders:                       clonedPskBinders,
 		quicTransportParameters:          slices.Clone(m.quicTransportParameters),
 		encryptedClientHello:             slices.Clone(m.encryptedClientHello),
+		extensions:                       slices.Clone(m.extensions),
+		nextProtoNeg:                     m.nextProtoNeg,
 	}
 }
 
@@ -1501,6 +1527,12 @@ type certificateMsgTLS13 struct {
 	certificate  Certificate
 	ocspStapling bool
 	scts         bool
+
+	// delegatedCredential contains the raw delegated credential from the
+	// leaf certificate's delegated_credentials extension, if present.
+	// This is only populated when the server sends a DC and must be
+	// verified before use. See RFC 9345.
+	delegatedCredential []byte // [uTLS]
 }
 
 func (m *certificateMsgTLS13) marshal() ([]byte, error) {
@@ -1564,9 +1596,10 @@ func (m *certificateMsgTLS13) unmarshal(data []byte) bool {
 	s := cryptobyte.String(data)
 
 	var context cryptobyte.String
+	// [uTLS] Modified to capture delegated credential
 	if !s.Skip(4) || // message type and uint24 length field
 		!s.ReadUint8LengthPrefixed(&context) || !context.Empty() ||
-		!unmarshalCertificate(&s, &m.certificate) ||
+		!unmarshalCertificateWithDC(&s, &m.certificate, &m.delegatedCredential) ||
 		!s.Empty() {
 		return false
 	}
@@ -1578,6 +1611,14 @@ func (m *certificateMsgTLS13) unmarshal(data []byte) bool {
 }
 
 func unmarshalCertificate(s *cryptobyte.String, certificate *Certificate) bool {
+	// Call the DC-aware version, discarding the DC
+	return unmarshalCertificateWithDC(s, certificate, nil)
+}
+
+// unmarshalCertificateWithDC parses a TLS 1.3 Certificate message and optionally
+// extracts the delegated_credentials extension from the leaf certificate.
+// [uTLS] This function extends unmarshalCertificate to support RFC 9345 Delegated Credentials.
+func unmarshalCertificateWithDC(s *cryptobyte.String, certificate *Certificate, delegatedCredential *[]byte) bool {
 	var certList cryptobyte.String
 	if !s.ReadUint24LengthPrefixed(&certList) {
 		return false
@@ -1598,7 +1639,7 @@ func unmarshalCertificate(s *cryptobyte.String, certificate *Certificate) bool {
 				return false
 			}
 			if len(certificate.Certificate) > 1 {
-				// This library only supports OCSP and SCT for leaf certificates.
+				// This library only supports OCSP, SCT, and DC for leaf certificates.
 				continue
 			}
 
@@ -1623,6 +1664,17 @@ func unmarshalCertificate(s *cryptobyte.String, certificate *Certificate) bool {
 					}
 					certificate.SignedCertificateTimestamps = append(
 						certificate.SignedCertificateTimestamps, sct)
+				}
+			case extensionDelegatedCredentials:
+				// [uTLS] RFC 9345: Parse delegated_credentials extension from leaf certificate.
+				// The extension data contains the raw DelegatedCredential structure.
+				if delegatedCredential != nil && len(extData) > 0 {
+					dc := make([]byte, len(extData))
+					if !extData.CopyBytes(dc) {
+						return false
+					}
+					*delegatedCredential = dc
+					continue // Don't check extData.Empty() as we consumed it
 				}
 			default:
 				// Ignore unknown extensions.

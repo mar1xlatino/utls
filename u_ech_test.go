@@ -45,8 +45,11 @@ func TestGREASEECHWrite(t *testing.T) {
 			t.Fatalf("GREASE ECH Read encapsulated key length mismatch")
 		}
 
-		if len(gech.CandidatePayloadLens) != 1 || gech.CandidatePayloadLens[0] != testsuite.payloadLength {
-			t.Fatalf("GREASE ECH Read payload length mismatch")
+		// After Write(), the extension should preserve the exact wire format size.
+		// The payload is now stored directly (not via CandidatePayloadLens) to ensure
+		// fingerprint accuracy during round-trips. Verify that Len() matches the original.
+		if gech.Len() != len(testsuite.raw) {
+			t.Fatalf("GREASE ECH Len() mismatch: got %d, want %d", gech.Len(), len(testsuite.raw))
 		}
 	}
 }

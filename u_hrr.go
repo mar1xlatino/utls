@@ -14,6 +14,44 @@ import (
 	"time"
 )
 
+// maxHRRCookieSize is the maximum allowed size for HRR cookies.
+// RFC 8446 does not specify a limit, but practical limits prevent DoS.
+// 16KB is generous for any legitimate use case.
+const maxHRRCookieSize = 16384
+
+// HRR FINGERPRINT CONSISTENCY NOTES:
+//
+// Per RFC 8446 Section 4.1.2, ClientHello2 (after HRR) must be largely identical
+// to ClientHello1, with only specific allowed changes. uTLS preserves:
+//
+// - GREASE values: Stored in UConn.greaseSeed during ApplyPreset, used consistently
+//   for both ClientHello1 and ClientHello2. Extension GREASE values are set in
+//   UtlsGREASEExtension.Value and preserved during remarshalling.
+//
+// - Extension ordering: Generally preserved.
+//
+// - PSK binders: Properly recalculated after HRR using the correct transcript
+//   (MessageHash(CH1) + HRR) per RFC 8446 Section 4.2.11. This works for both
+//   standard library and custom ClientHelloSpecs.
+//
+// KNOWN LIMITATION - FINGERPRINT DETECTION VECTOR:
+//
+// When a cookie extension must be added after HRR (because the spec did not
+// include a CookieExtension placeholder), the cookie is inserted at a
+// DETERMINISTIC position: immediately after the key_share extension.
+//
+// This deterministic placement may be detectable by sophisticated TLS
+// fingerprinting systems, as real browsers may place the cookie extension
+// at different positions depending on their implementation.
+//
+// To mitigate this fingerprint detection vector, include an empty
+// CookieExtension placeholder at the appropriate position in your
+// ClientHelloSpec when HRR might occur. This allows the cookie data
+// to be inserted in-place without changing extension order.
+//
+// Example: Add &CookieExtension{} to your extensions list at the position
+// where real browsers place their cookie extension.
+
 // HRRInfo contains information about a HelloRetryRequest.
 type HRRInfo struct {
 	// CipherSuite is the selected cipher suite.
@@ -97,7 +135,7 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 
 	// RFC 8446: legacy_session_id must be 0-32 bytes
 	if sessionIDLen > 32 {
-		return nil, errors.New("tls: HRR session ID exceeds maximum length (32 bytes)")
+		return nil, errors.New("tls: invalid session ID length")
 	}
 
 	if offset+sessionIDLen > len(raw) {
@@ -163,6 +201,10 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 		case extensionCookie:
 			if extDataLen >= 2 {
 				cookieLen := int(binary.BigEndian.Uint16(raw[offset:]))
+				// Security: Enforce maximum cookie size to prevent DoS attacks
+				if cookieLen > maxHRRCookieSize {
+					return nil, fmt.Errorf("tls: HRR cookie exceeds maximum size (%d > %d)", cookieLen, maxHRRCookieSize)
+				}
 				// Security: Validate bounds before copying
 				if 2+cookieLen <= extDataLen && offset+2+cookieLen <= len(raw) {
 					info.Cookie = make([]byte, cookieLen)
@@ -228,7 +270,7 @@ func (b *HRRBuilder) Build() ([]byte, error) {
 
 	// RFC 8446: legacy_session_id must be 0-32 bytes
 	if len(b.sessionID) > 32 {
-		return nil, errors.New("tls: HRR session ID exceeds maximum length (32 bytes)")
+		return nil, errors.New("tls: invalid session ID length")
 	}
 
 	// Calculate extensions length
@@ -239,10 +281,14 @@ func (b *HRRBuilder) Build() ([]byte, error) {
 	extLen += 6
 	// cookie if present: type(2) + len(2) + cookie_len(2) + cookie
 	if len(b.cookie) > 0 {
+		// Security: Enforce maximum cookie size to prevent DoS attacks
+		if len(b.cookie) > maxHRRCookieSize {
+			return nil, fmt.Errorf("tls: HRR cookie exceeds maximum size (%d > %d)", len(b.cookie), maxHRRCookieSize)
+		}
 		// Security: Prevent integer overflow
 		cookieExtLen := 6 + len(b.cookie)
 		if cookieExtLen > 65535 || extLen+cookieExtLen > 65535 {
-			return nil, errors.New("tls: HRR cookie too large")
+			return nil, errors.New("tls: HRR cookie extension too large")
 		}
 		extLen += cookieExtLen
 	}

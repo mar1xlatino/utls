@@ -20,6 +20,18 @@ import (
 	"golang.org/x/crypto/cryptobyte"
 )
 
+// TransportProtocol represents the transport layer protocol for JA4 fingerprinting.
+type TransportProtocol string
+
+const (
+	// TransportTCP indicates a TCP-based TLS connection.
+	TransportTCP TransportProtocol = "t"
+	// TransportQUIC indicates a QUIC-based TLS connection.
+	TransportQUIC TransportProtocol = "q"
+	// TransportDTLS indicates a DTLS connection.
+	TransportDTLS TransportProtocol = "d"
+)
+
 // TLSFingerprint contains all JA3 and JA4 fingerprint variants.
 type TLSFingerprint struct {
 	// JA3 fingerprints (MD5-based, widely used for TLS fingerprinting)
@@ -37,15 +49,16 @@ type TLSFingerprint struct {
 
 // clientHelloData holds parsed ClientHello fields for fingerprint calculation.
 type clientHelloData struct {
-	version             uint16   // From ClientHello version field
-	supportedVersions   []uint16 // From supported_versions extension (43)
-	cipherSuites        []uint16 // GREASE filtered, original order
-	extensions          []uint16 // GREASE filtered, original order
-	curves              []uint16 // From supported_groups (ext 10)
-	pointFormats        []uint8  // From ec_point_formats (ext 11)
-	signatureAlgorithms []uint16 // From signature_algorithms (ext 13)
+	version             uint16            // From ClientHello version field
+	supportedVersions   []uint16          // From supported_versions extension (43)
+	cipherSuites        []uint16          // GREASE filtered, original order
+	extensions          []uint16          // GREASE filtered, original order
+	curves              []uint16          // From supported_groups (ext 10)
+	pointFormats        []uint8           // From ec_point_formats (ext 11)
+	signatureAlgorithms []uint16          // From signature_algorithms (ext 13)
 	hasSNI              bool
-	alpnFirst           string // First ALPN protocol
+	alpnFirst           string            // First ALPN protocol
+	transport           TransportProtocol // Transport protocol (t=TCP, q=QUIC, d=DTLS)
 }
 
 // parseClientHelloData extracts fingerprint-relevant data from raw ClientHello.
@@ -189,25 +202,47 @@ func parseClientHelloData(raw []byte) (*clientHelloData, error) {
 }
 
 // CalculateFingerprints computes all JA3/JA4 fingerprints from raw ClientHello bytes.
+// Defaults to TCP transport. Use CalculateFingerprintsWithTransport for QUIC/DTLS.
 func CalculateFingerprints(raw []byte) (*TLSFingerprint, error) {
+	return CalculateFingerprintsWithTransport(raw, TransportTCP)
+}
+
+// CalculateFingerprintsForQUIC computes fingerprints for a QUIC connection.
+// This is a convenience wrapper that sets the transport protocol to QUIC.
+func CalculateFingerprintsForQUIC(raw []byte) (*TLSFingerprint, error) {
+	return CalculateFingerprintsWithTransport(raw, TransportQUIC)
+}
+
+// CalculateFingerprintsWithTransport computes all JA3/JA4 fingerprints with
+// explicit transport protocol specification.
+// Use TransportTCP ("t") for standard TLS over TCP.
+// Use TransportQUIC ("q") for QUIC connections.
+// Use TransportDTLS ("d") for DTLS connections.
+func CalculateFingerprintsWithTransport(raw []byte, transport TransportProtocol) (*TLSFingerprint, error) {
 	data, err := parseClientHelloData(raw)
 	if err != nil {
 		return nil, err
 	}
 
+	// Set the transport protocol for JA4 fingerprinting
+	data.transport = transport
+	if data.transport == "" {
+		data.transport = TransportTCP // Default to TCP
+	}
+
 	fp := &TLSFingerprint{}
 
-	// JA3 (original extension order)
+	// JA3 (original extension order) - transport-agnostic
 	fp.JA3r = buildJA3String(data, false)
 	hash := md5.Sum([]byte(fp.JA3r))
 	fp.JA3 = hex.EncodeToString(hash[:])
 
-	// JA3n (normalized/sorted extensions)
+	// JA3n (normalized/sorted extensions) - transport-agnostic
 	fp.JA3rn = buildJA3String(data, true)
 	hashN := md5.Sum([]byte(fp.JA3rn))
 	fp.JA3n = hex.EncodeToString(hashN[:])
 
-	// JA4 variants
+	// JA4 variants - transport-aware
 	ja4a := buildJA4a(data)
 	fp.JA4 = buildJA4(ja4a, data, true, true)
 	fp.JA4r = buildJA4(ja4a, data, true, false)
@@ -248,7 +283,11 @@ func buildJA3String(data *clientHelloData, sortExtensions bool) string {
 // Format: [protocol][version][sni][cipher_count][ext_count][alpn]
 func buildJA4a(data *clientHelloData) string {
 	// Protocol: t=TCP, q=QUIC, d=DTLS
-	protocol := "t"
+	// Use the transport from the parsed data (set by caller)
+	protocol := string(data.transport)
+	if protocol == "" {
+		protocol = "t" // Default to TCP if not specified
+	}
 
 	// TLS version (2 chars)
 	// Per JA4 spec: use highest version from supported_versions extension, else use version field
@@ -605,7 +644,18 @@ func parseServerHelloForJA4S(raw []byte) (*serverHelloData, error) {
 }
 
 // CalculateJA4S computes JA4S fingerprint from raw ServerHello bytes.
+// Defaults to TCP transport. Use CalculateJA4SWithTransport for QUIC/DTLS.
 func CalculateJA4S(raw []byte) (*ServerHelloFingerprint, error) {
+	return CalculateJA4SWithTransport(raw, TransportTCP)
+}
+
+// CalculateJA4SForQUIC computes JA4S fingerprint for a QUIC connection.
+func CalculateJA4SForQUIC(raw []byte) (*ServerHelloFingerprint, error) {
+	return CalculateJA4SWithTransport(raw, TransportQUIC)
+}
+
+// CalculateJA4SWithTransport computes JA4S fingerprint with explicit transport.
+func CalculateJA4SWithTransport(raw []byte, transport TransportProtocol) (*ServerHelloFingerprint, error) {
 	data, err := parseServerHelloForJA4S(raw)
 	if err != nil {
 		return nil, err
@@ -614,7 +664,10 @@ func CalculateJA4S(raw []byte) (*ServerHelloFingerprint, error) {
 	fp := &ServerHelloFingerprint{}
 
 	// Build JA4S_a: {protocol}{version}{ext_count}
-	protocol := "t" // TCP (QUIC would be q, DTLS would be d)
+	protocol := string(transport)
+	if protocol == "" {
+		protocol = "t" // Default to TCP
+	}
 
 	var tlsVer string
 	switch data.version {
@@ -911,6 +964,7 @@ func (uconn *UConn) ServerJA4S() (string, error) {
 // ServerJA4SFull returns the full ServerHelloFingerprint including both
 // JA4S (hashed) and JA4Sr (raw/unhashed) fingerprints.
 // Must be called after Handshake() completes.
+// Thread-safe: Uses RawServerHello() which is protected by stateMu RWMutex.
 //
 // Note: Call ClearRawServerHello() after extracting fingerprints to free memory
 // if the raw ServerHello bytes are no longer needed.
@@ -920,18 +974,23 @@ func (uconn *UConn) ServerJA4SFull() (*ServerHelloFingerprint, error) {
 		return nil, errors.New("tls: handshake not complete")
 	}
 
-	if len(uconn.rawServerHello) == 0 {
+	// Use thread-safe getter which returns a copy
+	rawServerHello := uconn.RawServerHello()
+	if len(rawServerHello) == 0 {
 		return nil, errors.New("tls: ServerHello raw bytes not captured")
 	}
 
-	return CalculateJA4S(uconn.rawServerHello)
+	return CalculateJA4S(rawServerHello)
 }
 
 // ClearRawServerHello releases the memory used by the captured raw ServerHello.
 // Call this after extracting JA4S fingerprints if you no longer need them.
 // After calling this, ServerJA4S() and ServerJA4SFull() will return an error.
+// Thread-safe: Protected by stateMu RWMutex.
 func (uconn *UConn) ClearRawServerHello() {
+	uconn.stateMu.Lock()
 	uconn.rawServerHello = nil
+	uconn.stateMu.Unlock()
 }
 
 // CertificateJA4X returns JA4X fingerprints for the server's certificate chain.

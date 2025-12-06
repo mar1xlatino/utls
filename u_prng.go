@@ -55,11 +55,24 @@ func newSaltedPRNGSeed(seed *PRNGSeed, salt string) (*PRNGSeed, error) {
 	return saltedSeed, nil
 }
 
-// prng is a seeded, unbiased PRNG based on SHAKE256. that is suitable for use
-// cases such as obfuscation. Seeding is based on crypto/rand.Read.
+// prng is a seeded, unbiased PRNG based on SHAKE256 that is suitable for use
+// cases such as obfuscation and TLS fingerprint randomization.
+// Seeding is based on crypto/rand.Read.
 //
-// This PRNG is _not_ for security use cases including production cryptographic
-// key generation.
+// SECURITY WARNING: This PRNG is NOT cryptographically secure for the following uses:
+//   - Generating cryptographic keys (use crypto/rand instead)
+//   - Generating nonces or IVs for encryption
+//   - Any security-critical random number generation
+//   - Password generation or token generation
+//
+// This PRNG IS appropriate for:
+//   - Randomizing TLS extension order for fingerprint evasion
+//   - Generating reproducible pseudo-random sequences from a seed
+//   - Non-security-critical shuffling and selection
+//
+// The underlying SHAKE256 provides statistical randomness but the deterministic
+// nature (reproducibility from seed) means an attacker who knows the seed can
+// predict all outputs. For cryptographic randomness, always use crypto/rand.
 //
 // It is safe to make concurrent calls to a PRNG instance.
 //

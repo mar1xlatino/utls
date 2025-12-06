@@ -52,7 +52,7 @@ func (r *ProfileRegistry) Register(profile *FingerprintProfile) error {
 
 	// Validate the profile
 	if errs := profile.Validate(); len(errs) > 0 {
-		return fmt.Errorf("tls: profile validation failed: %v", errs[0])
+		return fmt.Errorf("tls: profile validation failed: %w", errs[0])
 	}
 
 	r.mu.Lock()
@@ -79,7 +79,7 @@ func (r *ProfileRegistry) RegisterOrUpdate(profile *FingerprintProfile) error {
 
 	// Validate the profile (same as Register)
 	if errs := profile.Validate(); len(errs) > 0 {
-		return fmt.Errorf("tls: profile validation failed: %v", errs[0])
+		return fmt.Errorf("tls: profile validation failed: %w", errs[0])
 	}
 
 	r.mu.Lock()

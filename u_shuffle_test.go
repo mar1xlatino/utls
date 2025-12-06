@@ -645,7 +645,7 @@ func TestShuffleConcurrentSafety(t *testing.T) {
 			for i := 0; i < iterationsPerGoroutine; i++ {
 				spec, err := UTLSIdToSpec(HelloChrome_120)
 				if err != nil {
-					errors <- fmt.Errorf("goroutine %d iteration %d: %v", id, i, err)
+					errors <- fmt.Errorf("goroutine %d iteration %d: %w", id, i, err)
 					return
 				}
 				if len(spec.Extensions) == 0 {

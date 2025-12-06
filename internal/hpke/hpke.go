@@ -10,6 +10,8 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
+	_ "crypto/sha256" // Register SHA-256 hash for HKDF
+	_ "crypto/sha512" // Register SHA-384 and SHA-512 hashes for HKDF
 	"errors"
 	"math/bits"
 
@@ -17,6 +19,13 @@ import (
 	"github.com/refraction-networking/utls/internal/hkdf"
 	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// ErrMessageLimitReached is returned when the HPKE message limit has been reached.
+// Per RFC 9180, the message limit is 2^(8*Nn - 1) where Nn is the nonce size.
+// For 12-byte nonces (AES-GCM, ChaCha20-Poly1305), this is 2^95 messages.
+// This error indicates a catastrophic failure - reaching this limit means
+// continuing would result in nonce reuse and complete security compromise.
+var ErrMessageLimitReached = errors.New("hpke: message limit reached")
 
 // testingOnlyGenerateKey is only used during testing, to provide
 // a fixed test key to use when checking the RFC 9180 vectors.
@@ -26,7 +35,7 @@ type hkdfKDF struct {
 	hash crypto.Hash
 }
 
-func (kdf *hkdfKDF) LabeledExtract(sid []byte, salt []byte, label string, inputKey []byte) []byte {
+func (kdf *hkdfKDF) LabeledExtract(sid []byte, salt []byte, label string, inputKey []byte) ([]byte, error) {
 	labeledIKM := make([]byte, 0, 7+len(sid)+len(label)+len(inputKey))
 	labeledIKM = append(labeledIKM, []byte("HPKE-v1")...)
 	labeledIKM = append(labeledIKM, sid...)
@@ -35,7 +44,7 @@ func (kdf *hkdfKDF) LabeledExtract(sid []byte, salt []byte, label string, inputK
 	return hkdf.Extract(kdf.hash.New, labeledIKM, salt)
 }
 
-func (kdf *hkdfKDF) LabeledExpand(suiteID []byte, randomKey []byte, label string, info []byte, length uint16) []byte {
+func (kdf *hkdfKDF) LabeledExpand(suiteID []byte, randomKey []byte, label string, info []byte, length uint16) ([]byte, error) {
 	labeledInfo := make([]byte, 0, 2+7+len(suiteID)+len(label)+len(info))
 	labeledInfo = byteorder.BEAppendUint16(labeledInfo, length)
 	labeledInfo = append(labeledInfo, []byte("HPKE-v1")...)
@@ -56,7 +65,13 @@ type dhKEM struct {
 
 type KemID uint16
 
-const DHKEM_X25519_HKDF_SHA256 = 0x0020
+// KEM identifiers from RFC 9180 Section 7.1
+const (
+	DHKEM_P256_HKDF_SHA256   uint16 = 0x0010
+	DHKEM_P384_HKDF_SHA384   uint16 = 0x0011
+	DHKEM_P521_HKDF_SHA512   uint16 = 0x0012 // Not implemented yet
+	DHKEM_X25519_HKDF_SHA256 uint16 = 0x0020
+)
 
 var SupportedKEMs = map[uint16]struct {
 	curve   ecdh.Curve
@@ -64,6 +79,11 @@ var SupportedKEMs = map[uint16]struct {
 	nSecret uint16
 }{
 	// RFC 9180 Section 7.1
+	// P-256: 32-byte shared secret, uses SHA-256 for key derivation
+	DHKEM_P256_HKDF_SHA256: {ecdh.P256(), crypto.SHA256, 32},
+	// P-384: 48-byte shared secret, uses SHA-384 for key derivation
+	DHKEM_P384_HKDF_SHA384: {ecdh.P384(), crypto.SHA384, 48},
+	// X25519: 32-byte shared secret, uses SHA-256 for key derivation
 	DHKEM_X25519_HKDF_SHA256: {ecdh.X25519(), crypto.SHA256, 32},
 }
 
@@ -80,8 +100,11 @@ func newDHKem(kemID uint16) (*dhKEM, error) {
 	}, nil
 }
 
-func (dh *dhKEM) ExtractAndExpand(dhKey, kemContext []byte) []byte {
-	eaePRK := dh.kdf.LabeledExtract(dh.suiteID[:], nil, "eae_prk", dhKey)
+func (dh *dhKEM) ExtractAndExpand(dhKey, kemContext []byte) ([]byte, error) {
+	eaePRK, err := dh.kdf.LabeledExtract(dh.suiteID[:], nil, "eae_prk", dhKey)
+	if err != nil {
+		return nil, err
+	}
 	return dh.kdf.LabeledExpand(dh.suiteID[:], eaePRK, "shared_secret", kemContext, dh.nSecret)
 }
 
@@ -104,7 +127,11 @@ func (dh *dhKEM) Encap(pubRecipient *ecdh.PublicKey) (sharedSecret []byte, encap
 	encPubRecip := pubRecipient.Bytes()
 	kemContext := append(encPubEph, encPubRecip...)
 
-	return dh.ExtractAndExpand(dhVal, kemContext), encPubEph, nil
+	secret, err := dh.ExtractAndExpand(dhVal, kemContext)
+	if err != nil {
+		return nil, nil, err
+	}
+	return secret, encPubEph, nil
 }
 
 func (dh *dhKEM) Decap(encPubEph []byte, secRecipient *ecdh.PrivateKey) ([]byte, error) {
@@ -118,7 +145,7 @@ func (dh *dhKEM) Decap(encPubEph []byte, secRecipient *ecdh.PrivateKey) ([]byte,
 	}
 	kemContext := append(encPubEph, secRecipient.PublicKey().Bytes()...)
 
-	return dh.ExtractAndExpand(dhVal, kemContext), nil
+	return dh.ExtractAndExpand(dhVal, kemContext)
 }
 
 type context struct {
@@ -139,8 +166,22 @@ type Sender struct {
 	*context
 }
 
-type Receipient struct {
+// Overhead returns the maximum difference between the lengths of a
+// plaintext and its ciphertext for this AEAD. This value corresponds
+// to the AEAD tag length.
+func (s *Sender) Overhead() int {
+	return s.aead.Overhead()
+}
+
+type Recipient struct {
 	*context
+}
+
+// Overhead returns the maximum difference between the lengths of a
+// plaintext and its ciphertext for this AEAD. This value corresponds
+// to the AEAD tag length.
+func (r *Recipient) Overhead() int {
+	return r.aead.Overhead()
 }
 
 var aesGCMNew = func(key []byte) (cipher.AEAD, error) {
@@ -172,11 +213,17 @@ var SupportedAEADs = map[uint16]struct {
 
 type KDFID uint16
 
-const KDF_HKDF_SHA256 = 0x0001
+// KDF identifiers from RFC 9180 Section 7.2
+const (
+	KDF_HKDF_SHA256 uint16 = 0x0001
+	KDF_HKDF_SHA384 uint16 = 0x0002
+	KDF_HKDF_SHA512 uint16 = 0x0003 // Not implemented yet
+)
 
 var SupportedKDFs = map[uint16]func() *hkdfKDF{
 	// RFC 9180, Section 7.2
 	KDF_HKDF_SHA256: func() *hkdfKDF { return &hkdfKDF{crypto.SHA256} },
+	KDF_HKDF_SHA384: func() *hkdfKDF { return &hkdfKDF{crypto.SHA384} },
 }
 
 func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (*context, error) {
@@ -193,16 +240,34 @@ func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (
 		return nil, errors.New("unsupported AEAD id")
 	}
 
-	pskIDHash := kdf.LabeledExtract(sid, nil, "psk_id_hash", nil)
-	infoHash := kdf.LabeledExtract(sid, nil, "info_hash", info)
+	pskIDHash, err := kdf.LabeledExtract(sid, nil, "psk_id_hash", nil)
+	if err != nil {
+		return nil, err
+	}
+	infoHash, err := kdf.LabeledExtract(sid, nil, "info_hash", info)
+	if err != nil {
+		return nil, err
+	}
 	ksContext := append([]byte{0}, pskIDHash...)
 	ksContext = append(ksContext, infoHash...)
 
-	secret := kdf.LabeledExtract(sid, sharedSecret, "secret", nil)
+	secret, err := kdf.LabeledExtract(sid, sharedSecret, "secret", nil)
+	if err != nil {
+		return nil, err
+	}
 
-	key := kdf.LabeledExpand(sid, secret, "key", ksContext, uint16(aeadInfo.keySize) /* Nk - key size for AEAD */)
-	baseNonce := kdf.LabeledExpand(sid, secret, "base_nonce", ksContext, uint16(aeadInfo.nonceSize) /* Nn - nonce size for AEAD */)
-	exporterSecret := kdf.LabeledExpand(sid, secret, "exp", ksContext, uint16(kdf.hash.Size()) /* Nh - hash output size of the kdf*/)
+	key, err := kdf.LabeledExpand(sid, secret, "key", ksContext, uint16(aeadInfo.keySize))
+	if err != nil {
+		return nil, err
+	}
+	baseNonce, err := kdf.LabeledExpand(sid, secret, "base_nonce", ksContext, uint16(aeadInfo.nonceSize))
+	if err != nil {
+		return nil, err
+	}
+	exporterSecret, err := kdf.LabeledExpand(sid, secret, "exp", ksContext, uint16(kdf.hash.Size()))
+	if err != nil {
+		return nil, err
+	}
 
 	aead, err := aeadInfo.aead(key)
 	if err != nil {
@@ -237,7 +302,7 @@ func SetupSender(kemID, kdfID, aeadID uint16, pub *ecdh.PublicKey, info []byte) 
 	return encapsulatedKey, &Sender{context}, nil
 }
 
-func SetupReceipient(kemID, kdfID, aeadID uint16, priv *ecdh.PrivateKey, info, encPubEph []byte) (*Receipient, error) {
+func SetupRecipient(kemID, kdfID, aeadID uint16, priv *ecdh.PrivateKey, info, encPubEph []byte) (*Recipient, error) {
 	kem, err := newDHKem(kemID)
 	if err != nil {
 		return nil, err
@@ -252,7 +317,7 @@ func SetupReceipient(kemID, kdfID, aeadID uint16, priv *ecdh.PrivateKey, info, e
 		return nil, err
 	}
 
-	return &Receipient{context}, nil
+	return &Recipient{context}, nil
 }
 
 func (ctx *context) nextNonce() []byte {
@@ -263,27 +328,61 @@ func (ctx *context) nextNonce() []byte {
 	return nonce
 }
 
-func (ctx *context) incrementNonce() {
-	// Message limit is, according to the RFC, 2^95+1, which
-	// is somewhat confusing, but we do as we're told.
-	if ctx.seqNum.bitLen() >= (ctx.aead.NonceSize()*8)-1 {
-		panic("message limit reached")
+// incrementNonce increments the sequence number and returns an error if the
+// message limit has been reached.
+//
+// Message limit is, according to RFC 9180, 2^(8*Nn - 1) where Nn is the
+// nonce size. For 12-byte nonces, this is 2^95 messages - an astronomically
+// large number that cannot be reached in practice (would take longer than
+// the age of the universe at any realistic message rate).
+//
+// However, if somehow reached, continuing would lead to nonce reuse and
+// complete security loss, so we return an error rather than allowing that.
+//
+// The check is performed AFTER using the current nonce but BEFORE incrementing.
+// We allow sequence numbers from 0 to 2^(8*Nn-1) - 1, meaning 2^(8*Nn-1) messages total.
+// The error triggers when seqNum >= 2^(8*Nn-1), i.e., when bitLen >= 8*Nn.
+func (ctx *context) incrementNonce() error {
+	// Message limit: 2^(8*Nn - 1) messages allowed.
+	// After sending the last valid message (seqNum = 2^(8*Nn-1) - 1, which has bitLen = 8*Nn-1),
+	// incrementing would make seqNum = 2^(8*Nn-1), which has bitLen = 8*Nn.
+	// We must check if the NEXT seqNum would exceed the limit.
+	// Since we check BEFORE incrementing, we need to see if the incremented value would be valid.
+	// A seqNum with bitLen = 8*Nn-1 is the last valid state (value 2^(8*Nn-2) to 2^(8*Nn-1)-1).
+	// After using it and incrementing, we could reach 2^(8*Nn-1) which is invalid.
+	//
+	// To allow all 2^(8*Nn-1) messages (seqNums 0 through 2^(8*Nn-1)-1):
+	// - Error when seqNum.bitLen() >= 8*Nn (means seqNum >= 2^(8*Nn-1))
+	maxBits := ctx.aead.NonceSize() * 8 // For 12-byte nonce: 96 bits
+	messageLimitBits := maxBits - 1     // For 12-byte nonce: 95 bits (limit is 2^95)
+	// Error if seqNum >= 2^messageLimitBits, which means bitLen > messageLimitBits
+	if ctx.seqNum.bitLen() > messageLimitBits {
+		return ErrMessageLimitReached
 	}
 	ctx.seqNum = ctx.seqNum.addOne()
+	return nil
 }
 
+// Seal encrypts and authenticates plaintext with associated additional data.
+// Returns ErrMessageLimitReached if the HPKE message limit has been exceeded.
 func (s *Sender) Seal(aad, plaintext []byte) ([]byte, error) {
 	ciphertext := s.aead.Seal(nil, s.nextNonce(), plaintext, aad)
-	s.incrementNonce()
+	if err := s.incrementNonce(); err != nil {
+		return nil, err
+	}
 	return ciphertext, nil
 }
 
-func (r *Receipient) Open(aad, ciphertext []byte) ([]byte, error) {
+// Open decrypts and authenticates ciphertext with associated additional data.
+// Returns ErrMessageLimitReached if the HPKE message limit has been exceeded.
+func (r *Recipient) Open(aad, ciphertext []byte) ([]byte, error) {
 	plaintext, err := r.aead.Open(nil, r.nextNonce(), ciphertext, aad)
 	if err != nil {
 		return nil, err
 	}
-	r.incrementNonce()
+	if err := r.incrementNonce(); err != nil {
+		return nil, err
+	}
 	return plaintext, nil
 }
 
@@ -322,7 +421,14 @@ func (u uint128) addOne() uint128 {
 }
 
 func (u uint128) bitLen() int {
-	return bits.Len64(u.hi) + bits.Len64(u.lo)
+	// When hi is non-zero, the total bit length is 64 (for lo's full width)
+	// plus the significant bits in hi. When hi is zero, only count lo's bits.
+	// Previous buggy implementation returned bits.Len64(u.hi) + bits.Len64(u.lo)
+	// which gave wrong results, e.g., {hi:1, lo:0} returned 1 instead of 65.
+	if u.hi != 0 {
+		return 64 + bits.Len64(u.hi)
+	}
+	return bits.Len64(u.lo)
 }
 
 func (u uint128) bytes() []byte {

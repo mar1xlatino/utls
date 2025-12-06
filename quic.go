@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // QUICEncryptionLevel represents a QUIC encryption level used to transmit
@@ -156,7 +157,7 @@ type quicState struct {
 	cancelc  <-chan struct{} // handshake has been canceled
 	cancel   context.CancelFunc
 
-	waitingForDrain bool
+	waitingForDrain atomic.Bool
 
 	// readbuf is shared between HandleData and the handshake goroutine.
 	// HandshakeCryptoData passes ownership to the handshake goroutine by
@@ -224,8 +225,8 @@ func (q *QUICConn) NextEvent() QUICEvent {
 		// to catch callers erroniously retaining it.
 		qs.events[last].Data[0] = 0
 	}
-	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain {
-		qs.waitingForDrain = false
+	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain.Load() {
+		qs.waitingForDrain.Store(false)
 		<-qs.signalc
 		<-qs.blockedc
 	}
@@ -419,9 +420,12 @@ func (c *Conn) quicResumeSession(session *SessionState) error {
 		Kind:         QUICResumeSession,
 		SessionState: session,
 	})
-	c.quic.waitingForDrain = true
-	for c.quic.waitingForDrain {
+	c.quic.waitingForDrain.Store(true)
+	for c.quic.waitingForDrain.Load() {
 		if err := c.quicWaitForSignal(); err != nil {
+			// Reset waitingForDrain on error to prevent subsequent NextEvent() calls
+			// from incorrectly blocking on signalc/blockedc channels
+			c.quic.waitingForDrain.Store(false)
 			return err
 		}
 	}

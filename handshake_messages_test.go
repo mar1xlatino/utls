@@ -428,7 +428,10 @@ func (*SessionState) Generate(rand *rand.Rand, size int) reflect.Value {
 	}
 	if s.isClient {
 		if isTLS13 {
-			s.useBy = uint64(rand.Int63())
+			// RFC 8446 Section 4.6.1: ticket lifetime must not exceed 7 days.
+			// ParseSessionState validates this, so generate compliant values.
+			const maxLifetimeSeconds = int64(7 * 24 * 60 * 60) // 604800 seconds
+			s.useBy = s.createdAt + uint64(rand.Int63n(maxLifetimeSeconds+1))
 			s.ageAdd = uint32(rand.Int63() & math.MaxUint32)
 		}
 	}

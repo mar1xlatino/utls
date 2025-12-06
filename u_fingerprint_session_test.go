@@ -186,9 +186,10 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 	}
 }
 
-// TestFrozenGREASE_Extension1Extension2_NeverEqual verifies the collision
-// prevention logic for Extension1 and Extension2.
-func TestFrozenGREASE_Extension1Extension2_NeverEqual(t *testing.T) {
+// TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate verifies that
+// Extension1 and Extension2 have a natural ~6.25% collision rate (like Chrome).
+// Real Chrome/BoringSSL does NOT deduplicate GREASE values - collisions are allowed.
+func TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate(t *testing.T) {
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -197,18 +198,38 @@ func TestFrozenGREASE_Extension1Extension2_NeverEqual(t *testing.T) {
 		},
 	}
 
-	// Run many iterations - collision probability is 6.25% without prevention
-	for i := 0; i < 1000; i++ {
+	// Run many iterations to measure collision rate
+	const iterations = 10000
+	collisions := 0
+	for i := 0; i < iterations; i++ {
 		state := NewSessionFingerprintState(profile, "example.com:443")
 		if state == nil {
 			t.Fatal("NewSessionFingerprintState returned nil")
 		}
 
 		if state.FrozenGREASE.Extension1 == state.FrozenGREASE.Extension2 {
-			t.Errorf("Iteration %d: Extension1 (0x%04x) equals Extension2 (0x%04x) - collision prevention failed",
-				i, state.FrozenGREASE.Extension1, state.FrozenGREASE.Extension2)
+			collisions++
 		}
 	}
+
+	// Expected collision rate: 1/16 = 6.25%
+	// With 10000 iterations, expected collisions ~625, stddev ~24
+	// Allow 3-sigma range: 625 +/- 72 = [553, 697]
+	// We use a wider range [400, 850] to reduce test flakiness
+	actualRate := float64(collisions) / float64(iterations)
+
+	// Verify collision rate is approximately 6.25% (with tolerance for randomness)
+	minCollisions := 400 // ~4% minimum
+	maxCollisions := 850 // ~8.5% maximum
+
+	if collisions < minCollisions || collisions > maxCollisions {
+		t.Errorf("Collision rate out of expected range: got %d collisions (%.2f%%), expected ~625 (6.25%%)",
+			collisions, actualRate*100)
+	}
+
+	// Log actual rate for debugging
+	t.Logf("GREASE collision rate: %d/%d = %.2f%% (expected ~6.25%%)",
+		collisions, iterations, actualRate*100)
 }
 
 // TestFrozenGREASE_KeyShareMatchesSupportedGroup verifies Chrome behavior where
@@ -579,10 +600,13 @@ func TestSessionCache_CleanupExpiredEntries(t *testing.T) {
 
 // TestSessionCache_ThreadSafety_ConcurrentAccess verifies thread-safe concurrent
 // access to the session cache.
+//
+// Uses moderate concurrency to validate thread-safety without excessive memory
+// overhead from race detector instrumentation.
 func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
-	cache := NewSessionStateCache(1000, time.Hour)
+	cache := NewSessionStateCache(50, time.Hour)
 	profile := &FingerprintProfile{
-		ID:      "test_profile",
+		ID:      "test",
 		Browser: "chrome",
 		ClientHello: ClientHelloConfig{
 			GREASE: GREASEConfig{Enabled: true},
@@ -590,8 +614,8 @@ func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	goroutines := 100
-	iterations := 100
+	const goroutines = 20
+	const iterations = 20
 
 	// Run concurrent GetOrCreate operations
 	for i := 0; i < goroutines; i++ {
@@ -599,7 +623,7 @@ func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				origin := "origin" + string(rune('A'+id%26)) + ".com:443"
+				origin := "o" + string(rune('A'+id%10)) + ".com"
 				state := cache.GetOrCreate(origin, profile)
 				if state == nil {
 					t.Errorf("GetOrCreate returned nil for goroutine %d, iteration %d", id, j)
@@ -769,12 +793,15 @@ func TestSimplePRNG_ZeroSeedHandling(t *testing.T) {
 
 // TestSimplePRNG_ShuffleThreadSafe verifies that Shuffle is thread-safe
 // when called concurrently from multiple goroutines.
+//
+// Uses moderate concurrency to validate thread-safety without excessive memory
+// overhead from race detector instrumentation.
 func TestSimplePRNG_ShuffleThreadSafe(t *testing.T) {
 	prng := newPRNGFromSeed(12345)
 
 	var wg sync.WaitGroup
-	goroutines := 50
-	iterations := 100
+	const goroutines = 10
+	const iterations = 20
 
 	// Run concurrent shuffles - no panic or race should occur
 	for i := 0; i < goroutines; i++ {
@@ -1284,29 +1311,37 @@ func TestSessionCache_Get_RemovesExpiredEntry(t *testing.T) {
 
 // TestSessionCache_Get_ConcurrentExpiredCleanup verifies thread-safe cleanup
 // of expired entries in Get().
+//
+// This test uses moderate concurrency to validate lock upgrade safety without
+// excessive memory usage from race detector overhead.
 func TestSessionCache_Get_ConcurrentExpiredCleanup(t *testing.T) {
-	cache := NewSessionStateCache(100, 5*time.Millisecond)
+	cache := NewSessionStateCache(20, 5*time.Millisecond)
 	profile := &FingerprintProfile{
-		ID:      "test_profile",
+		ID:      "test",
 		Browser: "chrome",
 	}
 
-	// Create some entries
-	for i := 0; i < 10; i++ {
-		cache.GetOrCreate("origin"+string(rune('A'+i))+".com:443", profile)
+	// Create entries - use small count to minimize memory footprint
+	const numEntries = 5
+	origins := make([]string, numEntries)
+	for i := 0; i < numEntries; i++ {
+		origins[i] = "o" + string(rune('A'+i)) + ".com"
+		cache.GetOrCreate(origins[i], profile)
 	}
 
 	// Wait for expiration
 	time.Sleep(10 * time.Millisecond)
 
-	// Concurrent Get() calls should safely cleanup expired entries
+	// Concurrent Get() calls should safely cleanup expired entries.
+	// Use moderate goroutine count (2x entries) to test lock contention
+	// without excessive memory overhead from race detector.
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	const goroutines = numEntries * 2
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			origin := "origin" + string(rune('A'+id%10)) + ".com:443"
-			_ = cache.Get(origin) // Should return nil and cleanup
+			_ = cache.Get(origins[id%numEntries])
 		}(i)
 	}
 
@@ -1467,9 +1502,12 @@ func TestGetFrozenValues_NilReturnsNil(t *testing.T) {
 }
 
 // TestGetFrozenValues_ThreadSafe verifies concurrent access to getters.
+//
+// Uses moderate concurrency to validate thread-safety without excessive memory
+// overhead from race detector instrumentation.
 func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 	profile := &FingerprintProfile{
-		ID:      "test_profile",
+		ID:      "test",
 		Browser: "chrome",
 		ClientHello: ClientHelloConfig{
 			GREASE:            GREASEConfig{Enabled: true},
@@ -1491,13 +1529,14 @@ func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	errors := int32(0)
 
-	for i := 0; i < 100; i++ {
+	const goroutines = 20
+	const iterations = 20
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for j := 0; j < iterations; j++ {
 				// Call all getters concurrently
 				_ = state.GetFrozenExtensionOrder()
 				_ = state.GetFrozenCipherOrder()
@@ -1512,10 +1551,6 @@ func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	if errors > 0 {
-		t.Errorf("Detected %d errors during concurrent getter access", errors)
-	}
 }
 
 // =============================================================================
@@ -1524,38 +1559,44 @@ func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 
 // TestEvictOldest_LastUsedRaceCondition tests that evictOldest correctly
 // handles concurrent Touch() calls without reading inconsistent timestamps.
+//
+// Uses moderate concurrency to validate race condition fix without excessive
+// memory overhead from race detector instrumentation.
 func TestEvictOldest_LastUsedRaceCondition(t *testing.T) {
 	cache := NewSessionStateCache(5, time.Hour)
 	profile := &FingerprintProfile{
-		ID:      "test_profile",
+		ID:      "test",
 		Browser: "chrome",
 	}
 
 	// Fill cache to capacity
-	for i := 0; i < 5; i++ {
-		cache.GetOrCreate("origin"+string(rune('A'+i))+".com:443", profile)
+	const numEntries = 5
+	origins := make([]string, numEntries)
+	for i := 0; i < numEntries; i++ {
+		origins[i] = "o" + string(rune('A'+i)) + ".com"
+		cache.GetOrCreate(origins[i], profile)
 		time.Sleep(time.Millisecond) // Ensure different timestamps
 	}
 
 	var wg sync.WaitGroup
 
 	// Concurrently touch existing sessions while adding new ones
-	for i := 0; i < 50; i++ {
+	const goroutines = 10
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
 			// Touch existing entries
-			for j := 0; j < 5; j++ {
-				origin := "origin" + string(rune('A'+j)) + ".com:443"
-				state := cache.Get(origin)
+			for j := 0; j < numEntries; j++ {
+				state := cache.Get(origins[j])
 				if state != nil {
 					state.Touch()
 				}
 			}
 
 			// Add new entries (triggers eviction)
-			newOrigin := "new" + string(rune('A'+id%26)) + ".com:443"
+			newOrigin := "n" + string(rune('A'+id%10)) + ".com"
 			cache.GetOrCreate(newOrigin, profile)
 		}(i)
 	}

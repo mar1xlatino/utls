@@ -582,7 +582,13 @@ func (c *HookChain) CallProfileSelected(profile *FingerprintProfile) (err error)
 }
 
 // CallSessionStateCreated calls OnSessionStateCreated on all hooks.
-func (c *HookChain) CallSessionStateCreated(state *SessionFingerprintState) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallSessionStateCreated(state *SessionFingerprintState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnSessionStateCreated", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnSessionStateCreated != nil {
 			if err := h.OnSessionStateCreated(state); err != nil {
@@ -594,7 +600,13 @@ func (c *HookChain) CallSessionStateCreated(state *SessionFingerprintState) erro
 }
 
 // CallSessionStateRestored calls OnSessionStateRestored on all hooks.
-func (c *HookChain) CallSessionStateRestored(state *SessionFingerprintState) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallSessionStateRestored(state *SessionFingerprintState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnSessionStateRestored", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnSessionStateRestored != nil {
 			if err := h.OnSessionStateRestored(state); err != nil {
@@ -606,7 +618,13 @@ func (c *HookChain) CallSessionStateRestored(state *SessionFingerprintState) err
 }
 
 // CallBeforeBuildClientHello calls OnBeforeBuildClientHello on all hooks.
-func (c *HookChain) CallBeforeBuildClientHello(profile *FingerprintProfile) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallBeforeBuildClientHello(profile *FingerprintProfile) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnBeforeBuildClientHello", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnBeforeBuildClientHello != nil {
 			if err := h.OnBeforeBuildClientHello(profile); err != nil {
@@ -618,7 +636,13 @@ func (c *HookChain) CallBeforeBuildClientHello(profile *FingerprintProfile) erro
 }
 
 // CallAfterBuildClientHello calls OnAfterBuildClientHello on all hooks.
-func (c *HookChain) CallAfterBuildClientHello(hello *clientHelloMsg, raw []byte) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallAfterBuildClientHello(hello *clientHelloMsg, raw []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnAfterBuildClientHello", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnAfterBuildClientHello != nil {
 			if err := h.OnAfterBuildClientHello(hello, raw); err != nil {
@@ -630,7 +654,13 @@ func (c *HookChain) CallAfterBuildClientHello(hello *clientHelloMsg, raw []byte)
 }
 
 // CallClientHelloBuilt calls OnClientHelloBuilt on all hooks.
-func (c *HookChain) CallClientHelloBuilt(hello *clientHelloMsg, fp *TLSFingerprint) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallClientHelloBuilt(hello *clientHelloMsg, fp *TLSFingerprint) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnClientHelloBuilt", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnClientHelloBuilt != nil {
 			if err := h.OnClientHelloBuilt(hello, fp); err != nil {
@@ -642,7 +672,13 @@ func (c *HookChain) CallClientHelloBuilt(hello *clientHelloMsg, fp *TLSFingerpri
 }
 
 // CallClientHelloValidation calls OnClientHelloValidation on all hooks.
-func (c *HookChain) CallClientHelloValidation(result *ValidationResult) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallClientHelloValidation(result *ValidationResult) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnClientHelloValidation", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnClientHelloValidation != nil {
 			if err := h.OnClientHelloValidation(result); err != nil {
@@ -654,7 +690,13 @@ func (c *HookChain) CallClientHelloValidation(result *ValidationResult) error {
 }
 
 // CallServerHelloReceived calls OnServerHelloReceived on all hooks.
-func (c *HookChain) CallServerHelloReceived(hello *serverHelloMsg, raw []byte, fp *ServerHelloFingerprint) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallServerHelloReceived(hello *serverHelloMsg, raw []byte, fp *ServerHelloFingerprint) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnServerHelloReceived", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnServerHelloReceived != nil {
 			if err := h.OnServerHelloReceived(hello, raw, fp); err != nil {
@@ -666,7 +708,13 @@ func (c *HookChain) CallServerHelloReceived(hello *serverHelloMsg, raw []byte, f
 }
 
 // CallBeforeSendServerHello calls OnBeforeSendServerHello on all hooks.
-func (c *HookChain) CallBeforeSendServerHello(hello *serverHelloMsg) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallBeforeSendServerHello(hello *serverHelloMsg) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnBeforeSendServerHello", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnBeforeSendServerHello != nil {
 			if err := h.OnBeforeSendServerHello(hello); err != nil {
@@ -678,7 +726,13 @@ func (c *HookChain) CallBeforeSendServerHello(hello *serverHelloMsg) error {
 }
 
 // CallAfterSendServerHello calls OnAfterSendServerHello on all hooks.
-func (c *HookChain) CallAfterSendServerHello(hello *serverHelloMsg, raw []byte) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallAfterSendServerHello(hello *serverHelloMsg, raw []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnAfterSendServerHello", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnAfterSendServerHello != nil {
 			if err := h.OnAfterSendServerHello(hello, raw); err != nil {
@@ -690,7 +744,13 @@ func (c *HookChain) CallAfterSendServerHello(hello *serverHelloMsg, raw []byte) 
 }
 
 // CallCertificatesReceived calls OnCertificatesReceived on all hooks.
-func (c *HookChain) CallCertificatesReceived(certs []*x509.Certificate, fps []*CertificateFingerprint) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallCertificatesReceived(certs []*x509.Certificate, fps []*CertificateFingerprint) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnCertificatesReceived", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnCertificatesReceived != nil {
 			if err := h.OnCertificatesReceived(certs, fps); err != nil {
@@ -702,7 +762,13 @@ func (c *HookChain) CallCertificatesReceived(certs []*x509.Certificate, fps []*C
 }
 
 // CallCertificateValidation calls OnCertificateValidation on all hooks.
-func (c *HookChain) CallCertificateValidation(result *ValidationResult) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallCertificateValidation(result *ValidationResult) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnCertificateValidation", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnCertificateValidation != nil {
 			if err := h.OnCertificateValidation(result); err != nil {
@@ -742,7 +808,13 @@ func (c *HookChain) CallBeforeWriteRecord(rt recordType, data []byte) (modData [
 }
 
 // CallAfterReadRecord calls OnAfterReadRecord on all hooks.
-func (c *HookChain) CallAfterReadRecord(rt recordType, data []byte) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallAfterReadRecord(rt recordType, data []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnAfterReadRecord", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnAfterReadRecord != nil {
 			if err := h.OnAfterReadRecord(rt, data); err != nil {
@@ -754,7 +826,13 @@ func (c *HookChain) CallAfterReadRecord(rt recordType, data []byte) error {
 }
 
 // CallSessionTicketReceived calls OnSessionTicketReceived on all hooks.
-func (c *HookChain) CallSessionTicketReceived(ticket []byte) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallSessionTicketReceived(ticket []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnSessionTicketReceived", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnSessionTicketReceived != nil {
 			if err := h.OnSessionTicketReceived(ticket); err != nil {
@@ -766,7 +844,13 @@ func (c *HookChain) CallSessionTicketReceived(ticket []byte) error {
 }
 
 // CallResumptionAttempt calls OnResumptionAttempt on all hooks.
-func (c *HookChain) CallResumptionAttempt(state *SessionFingerprintState) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallResumptionAttempt(state *SessionFingerprintState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnResumptionAttempt", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnResumptionAttempt != nil {
 			if err := h.OnResumptionAttempt(state); err != nil {
@@ -778,7 +862,13 @@ func (c *HookChain) CallResumptionAttempt(state *SessionFingerprintState) error 
 }
 
 // CallHandshakeStart calls OnHandshakeStart on all hooks.
-func (c *HookChain) CallHandshakeStart() error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallHandshakeStart() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnHandshakeStart", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnHandshakeStart != nil {
 			if err := h.OnHandshakeStart(); err != nil {
@@ -790,7 +880,13 @@ func (c *HookChain) CallHandshakeStart() error {
 }
 
 // CallHandshakeComplete calls OnHandshakeComplete on all hooks.
-func (c *HookChain) CallHandshakeComplete(state ConnectionState, fp *TLSConnectionFingerprint) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallHandshakeComplete(state ConnectionState, fp *TLSConnectionFingerprint) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnHandshakeComplete", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnHandshakeComplete != nil {
 			if err := h.OnHandshakeComplete(state, fp); err != nil {
@@ -802,7 +898,13 @@ func (c *HookChain) CallHandshakeComplete(state ConnectionState, fp *TLSConnecti
 }
 
 // CallHandshakeError calls OnHandshakeError on all hooks.
-func (c *HookChain) CallHandshakeError(err error) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallHandshakeError(err error) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = &ErrHookPanic{Hook: "OnHandshakeError", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnHandshakeError != nil {
 			if herr := h.OnHandshakeError(err); herr != nil {
@@ -814,7 +916,13 @@ func (c *HookChain) CallHandshakeError(err error) error {
 }
 
 // CallFingerprintComputed calls OnFingerprintComputed on all hooks.
-func (c *HookChain) CallFingerprintComputed(fpType, fingerprint string) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallFingerprintComputed(fpType, fingerprint string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnFingerprintComputed", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnFingerprintComputed != nil {
 			if err := h.OnFingerprintComputed(fpType, fingerprint); err != nil {
@@ -826,7 +934,13 @@ func (c *HookChain) CallFingerprintComputed(fpType, fingerprint string) error {
 }
 
 // CallValidationFailure calls OnValidationFailure on all hooks.
-func (c *HookChain) CallValidationFailure(what string, result *ValidationResult) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallValidationFailure(what string, result *ValidationResult) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnValidationFailure", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnValidationFailure != nil {
 			if err := h.OnValidationFailure(what, result); err != nil {
@@ -873,7 +987,13 @@ func (c *HookChain) CallBeforeCertificateGeneration(template *x509.Certificate, 
 }
 
 // CallAfterCertificateGeneration calls OnAfterCertificateGeneration on all hooks.
-func (c *HookChain) CallAfterCertificateGeneration(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallAfterCertificateGeneration(cert *x509.Certificate, privateKey crypto.PrivateKey) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnAfterCertificateGeneration", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnAfterCertificateGeneration != nil {
 			if err := h.OnAfterCertificateGeneration(cert, privateKey); err != nil {
@@ -1089,7 +1209,13 @@ func (c *HookChain) CallAuthenticationData(config *Config) []byte {
 }
 
 // CallAuthenticationVerify calls OnAuthenticationVerify on all hooks.
-func (c *HookChain) CallAuthenticationVerify(authData, expected []byte) error {
+// Recovers from panics in hook callbacks and returns them as errors.
+func (c *HookChain) CallAuthenticationVerify(authData, expected []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &ErrHookPanic{Hook: "OnAuthenticationVerify", Panic: r}
+		}
+	}()
 	for _, h := range c.getHooks() {
 		if h != nil && h.OnAuthenticationVerify != nil {
 			if err := h.OnAuthenticationVerify(authData, expected); err != nil {

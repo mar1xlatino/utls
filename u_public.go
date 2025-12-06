@@ -831,6 +831,7 @@ type KeySharePrivateKeys struct {
 	Ecdhe      *ecdh.PrivateKey
 	Mlkem      *mlkem.DecapsulationKey768
 	MlkemEcdhe *ecdh.PrivateKey
+	Ffdhe      *ffdhePrivateKey // FFDHE private key for RFC 7919 finite field key exchange
 }
 
 func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
@@ -842,6 +843,7 @@ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
 		ecdhe:      ksp.Ecdhe,
 		mlkem:      ksp.Mlkem,
 		mlkemEcdhe: ksp.MlkemEcdhe,
+		ffdhe:      ksp.Ffdhe,
 	}
 }
 
@@ -854,5 +856,6 @@ func (ksp *keySharePrivateKeys) ToPublic() *KeySharePrivateKeys {
 		Ecdhe:      ksp.ecdhe,
 		Mlkem:      ksp.mlkem,
 		MlkemEcdhe: ksp.mlkemEcdhe,
+		Ffdhe:      ksp.ffdhe,
 	}
 }
