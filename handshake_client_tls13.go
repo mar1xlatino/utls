@@ -123,6 +123,10 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 			return errors.New("tls: serverHello too short for ECH confirmation")
 		}
 		confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
+		if confTranscript == nil {
+			c.sendAlert(alertInternalError)
+			return errors.New("tls: failed to clone hash for ECH confirmation")
+		}
 		confTranscript.Write(hs.serverHello.original[:30])
 		confTranscript.Write(make([]byte, 8))
 		confTranscript.Write(hs.serverHello.original[38:])

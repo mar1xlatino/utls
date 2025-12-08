@@ -489,6 +489,9 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 
 		if c.HandshakeState.State13.EarlySecret != nil && session != nil {
 			cipherSuite := cipherSuiteTLS13ByID(session.cipherSuite)
+			if cipherSuite == nil {
+				return errors.New("tls: unknown cipher suite for session resumption")
+			}
 			var esErr error
 			earlySecret, esErr = tls13.NewEarlySecretFromSecret(cipherSuite.hash.New, c.HandshakeState.State13.EarlySecret)
 			if esErr != nil {

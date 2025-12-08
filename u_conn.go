@@ -1166,6 +1166,9 @@ func (uconn *UConn) extensionsList() []uint16 {
 func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
 	// This function is mostly copied from
 	// https://github.com/refraction-networking/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
+	if ech == nil {
+		return errors.New("tls: ech context is nil in computeAndUpdateOuterECHExtension")
+	}
 	var encapKey []byte
 	if useKey {
 		encapKey = ech.encapsulatedKey
@@ -1176,7 +1179,7 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 		return err
 	}
 
-	encryptedLen := len(encodedInner) + 16
+	encryptedLen := len(encodedInner) + ech.hpkeContext.Overhead()
 	outerECHExt, err := generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, make([]byte, encryptedLen))
 	if err != nil {
 		return err

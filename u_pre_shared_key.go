@@ -327,6 +327,9 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	if private == nil {
 		private = hello.getPrivatePtr()
 	}
+	if private == nil {
+		return errors.New("tls: cannot get private client hello pointer for PSK binder computation")
+	}
 	private.original = hello.Raw
 	private.pskBinders = e.Binders // set the placeholder to the private Hello
 

@@ -144,6 +144,9 @@ func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, conf
 	if config.ServerName == "" {
 		// Make a copy to avoid polluting argument or default.
 		c := config.Clone()
+		if c == nil {
+			return nil, errors.New("tls: failed to clone config")
+		}
 		c.ServerName = hostname
 		config = c
 	}

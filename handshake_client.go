@@ -766,6 +766,10 @@ func (hs *clientHandshakeState) handshake() error {
 		return err
 	}
 
+	if hs.suite == nil {
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: internal error: cipher suite not set after handshake")
+	}
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.hello.random, hs.serverHello.random)
 	c.isHandshakeComplete.Store(true)
 
@@ -902,7 +906,9 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 	// certificate to send.
 	if certRequested {
 		certMsg = new(certificateMsg)
-		certMsg.certificates = chainToSend.Certificate
+		if chainToSend != nil {
+			certMsg.certificates = chainToSend.Certificate
+		}
 		if _, err := hs.c.writeHandshakeRecord(certMsg, &hs.finishedHash); err != nil {
 			return err
 		}
