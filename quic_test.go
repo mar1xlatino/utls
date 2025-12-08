@@ -12,6 +12,10 @@ import (
 	"testing"
 )
 
+// quicTestContextKey is a custom type for context keys to avoid SA1029 staticcheck warning.
+// Using a custom type prevents collisions with other packages using context values.
+type quicTestContextKey struct{}
+
 type testQUICConn struct {
 	t                 *testing.T
 	conn              *QUICConn
@@ -177,6 +181,7 @@ func runTestQUICConnection(ctx context.Context, cli, srv *testQUICConn, onEvent 
 }
 
 func TestQUICConnection(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 
@@ -219,6 +224,7 @@ func TestQUICConnection(t *testing.T) {
 }
 
 func TestQUICSessionResumption(t *testing.T) {
+	t.Parallel()
 	clientConfig := &QUICConfig{TLSConfig: testConfig.Clone()}
 	clientConfig.TLSConfig.MinVersion = VersionTLS13
 	clientConfig.TLSConfig.ClientSessionCache = NewLRUClientSessionCache(1)
@@ -251,6 +257,11 @@ func TestQUICSessionResumption(t *testing.T) {
 }
 
 func TestQUICFragmentaryData(t *testing.T) {
+	t.Parallel()
+	// Skip in short mode - fragmentary data test is slow due to byte-by-byte processing
+	if testing.Short() {
+		t.Skip("skipping fragmentary data test in short mode")
+	}
 	clientConfig := &QUICConfig{TLSConfig: testConfig.Clone()}
 	clientConfig.TLSConfig.MinVersion = VersionTLS13
 	clientConfig.TLSConfig.ClientSessionCache = NewLRUClientSessionCache(1)
@@ -282,6 +293,7 @@ func TestQUICFragmentaryData(t *testing.T) {
 }
 
 func TestQUICPostHandshakeClientAuthentication(t *testing.T) {
+	t.Parallel()
 	// RFC 9001, Section 4.4.
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
@@ -310,6 +322,7 @@ func TestQUICPostHandshakeClientAuthentication(t *testing.T) {
 }
 
 func TestQUICPostHandshakeKeyUpdate(t *testing.T) {
+	t.Parallel()
 	// RFC 9001, Section 6: Key updates are not allowed in QUIC.
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
@@ -334,6 +347,7 @@ func TestQUICPostHandshakeKeyUpdate(t *testing.T) {
 }
 
 func TestQUICPostHandshakeMessageTooLarge(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 	cli := newTestQUICClient(t, config)
@@ -356,6 +370,7 @@ func TestQUICPostHandshakeMessageTooLarge(t *testing.T) {
 }
 
 func TestQUICHandshakeError(t *testing.T) {
+	t.Parallel()
 	clientConfig := &QUICConfig{TLSConfig: testConfig.Clone()}
 	clientConfig.TLSConfig.MinVersion = VersionTLS13
 	clientConfig.TLSConfig.InsecureSkipVerify = false
@@ -382,6 +397,7 @@ func TestQUICHandshakeError(t *testing.T) {
 // and that it reports the application protocol as soon as it has been
 // negotiated.
 func TestQUICConnectionState(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 	config.TLSConfig.NextProtos = []string{"h3"}
@@ -410,7 +426,8 @@ func TestQUICConnectionState(t *testing.T) {
 }
 
 func TestQUICStartContextPropagation(t *testing.T) {
-	const key = "key"
+	t.Parallel()
+	key := quicTestContextKey{}
 	const value = "value"
 	ctx := context.WithValue(context.Background(), key, value)
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
@@ -420,7 +437,7 @@ func TestQUICStartContextPropagation(t *testing.T) {
 		calls++
 		got, _ := info.Context().Value(key).(string)
 		if got != value {
-			t.Errorf("GetConfigForClient context key %q has value %q, want %q", key, got, value)
+			t.Errorf("GetConfigForClient context key %v has value %q, want %q", key, got, value)
 		}
 		return nil, nil
 	}
@@ -437,6 +454,7 @@ func TestQUICStartContextPropagation(t *testing.T) {
 }
 
 func TestQUICDelayedTransportParameters(t *testing.T) {
+	t.Parallel()
 	clientConfig := &QUICConfig{TLSConfig: testConfig.Clone()}
 	clientConfig.TLSConfig.MinVersion = VersionTLS13
 	clientConfig.TLSConfig.ClientSessionCache = NewLRUClientSessionCache(1)
@@ -471,6 +489,7 @@ func TestQUICDelayedTransportParameters(t *testing.T) {
 }
 
 func TestQUICEmptyTransportParameters(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 
@@ -497,6 +516,7 @@ func TestQUICEmptyTransportParameters(t *testing.T) {
 }
 
 func TestQUICCanceledWaitingForData(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 	cli := newTestQUICClient(t, config)
@@ -511,6 +531,7 @@ func TestQUICCanceledWaitingForData(t *testing.T) {
 }
 
 func TestQUICCanceledWaitingForTransportParams(t *testing.T) {
+	t.Parallel()
 	config := &QUICConfig{TLSConfig: testConfig.Clone()}
 	config.TLSConfig.MinVersion = VersionTLS13
 	cli := newTestQUICClient(t, config)
@@ -524,6 +545,7 @@ func TestQUICCanceledWaitingForTransportParams(t *testing.T) {
 }
 
 func TestQUICEarlyData(t *testing.T) {
+	t.Parallel()
 	clientConfig := &QUICConfig{TLSConfig: testConfig.Clone()}
 	clientConfig.TLSConfig.MinVersion = VersionTLS13
 	clientConfig.TLSConfig.ClientSessionCache = NewLRUClientSessionCache(1)
@@ -577,10 +599,13 @@ func TestQUICEarlyData(t *testing.T) {
 }
 
 func TestQUICEarlyDataDeclined(t *testing.T) {
+	t.Parallel()
 	t.Run("server", func(t *testing.T) {
+		t.Parallel()
 		testQUICEarlyDataDeclined(t, true)
 	})
 	t.Run("client", func(t *testing.T) {
+		t.Parallel()
 		testQUICEarlyDataDeclined(t, false)
 	})
 }

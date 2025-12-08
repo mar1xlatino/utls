@@ -6,17 +6,16 @@ import "sync/atomic"
 // When set, all memory tracking operations are delegated to the external budget
 // instead of using the internal globalMemoryBudget.
 //
-// This allows Xray-core (or any other application) to provide a single global
-// budget that tracks memory across ALL subsystems (Xray buffers, TLS buffers,
-// REALITY buffers) in ONE place.
+// This allows an upstream application to provide a single global budget that
+// tracks memory across ALL subsystems in ONE place.
 //
-// Usage from Xray-core:
+// Example usage:
 //
-//	// In Xray initialization
-//	xrayBudget := buf.GetBudget()
-//	utls_memcontrol.UseExternalBudget(&xrayBudgetAdapter{xrayBudget})
+//	// In application initialization
+//	appBudget := buf.GetBudget()
+//	memcontrol.UseExternalBudget(&budgetAdapter{appBudget})
 //
-// The adapter pattern allows Xray's budget to be used without circular imports.
+// The adapter pattern allows the upstream budget to be used without circular imports.
 type ExternalBudget interface {
 	// TryAllocate attempts to allocate size bytes without blocking.
 	// Returns true if allocation succeeded, false if would exceed hard limit.
@@ -86,9 +85,4 @@ func getExternalBudget() ExternalBudget {
 		return nil
 	}
 	return *ptr
-}
-
-// hasExternalBudget returns true if an external budget is configured.
-func hasExternalBudget() bool {
-	return externalBudget.Load() != nil
 }

@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+// shortModeIterations returns a reduced iteration count for statistical tests
+// when running in short mode. Returns fullCount in normal mode, reducedCount in short mode.
+func shortModeIterations(fullCount, reducedCount int) int {
+	if testing.Short() {
+		return reducedCount
+	}
+	return fullCount
+}
+
 func TestUTLSIsGrease(t *testing.T) {
 
 	var testMap = []struct {

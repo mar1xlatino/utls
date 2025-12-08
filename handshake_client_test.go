@@ -483,10 +483,16 @@ func runClientTestForVersion(t *testing.T, template *clientTest, version, option
 }
 
 func runClientTestTLS10(t *testing.T, template *clientTest) {
+	if testing.Short() {
+		t.Skip("skipping TLS 1.0 test in short mode")
+	}
 	runClientTestForVersion(t, template, "TLSv10", "-tls1")
 }
 
 func runClientTestTLS11(t *testing.T, template *clientTest) {
+	if testing.Short() {
+		t.Skip("skipping TLS 1.1 test in short mode")
+	}
 	runClientTestForVersion(t, template, "TLSv11", "-tls1_1")
 }
 
@@ -499,6 +505,7 @@ func runClientTestTLS13(t *testing.T, template *clientTest) {
 }
 
 func TestHandshakeClientRSARC4(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "RSA-RC4",
 		args: []string{"-cipher", "RC4-SHA"},
@@ -509,6 +516,7 @@ func TestHandshakeClientRSARC4(t *testing.T) {
 }
 
 func TestHandshakeClientRSAAES128GCM(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "AES128-GCM-SHA256",
 		args: []string{"-cipher", "AES128-GCM-SHA256"},
@@ -517,6 +525,7 @@ func TestHandshakeClientRSAAES128GCM(t *testing.T) {
 }
 
 func TestHandshakeClientRSAAES256GCM(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "AES256-GCM-SHA384",
 		args: []string{"-cipher", "AES256-GCM-SHA384"},
@@ -525,6 +534,7 @@ func TestHandshakeClientRSAAES256GCM(t *testing.T) {
 }
 
 func TestHandshakeClientECDHERSAAES(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-RSA-AES",
 		args: []string{"-cipher", "ECDHE-RSA-AES128-SHA"},
@@ -535,6 +545,7 @@ func TestHandshakeClientECDHERSAAES(t *testing.T) {
 }
 
 func TestHandshakeClientECDHEECDSAAES(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-ECDSA-AES",
 		args: []string{"-cipher", "ECDHE-ECDSA-AES128-SHA"},
@@ -547,6 +558,7 @@ func TestHandshakeClientECDHEECDSAAES(t *testing.T) {
 }
 
 func TestHandshakeClientECDHEECDSAAESGCM(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-ECDSA-AES-GCM",
 		args: []string{"-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256"},
@@ -557,6 +569,7 @@ func TestHandshakeClientECDHEECDSAAESGCM(t *testing.T) {
 }
 
 func TestHandshakeClientAES256GCMSHA384(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-ECDSA-AES256-GCM-SHA384",
 		args: []string{"-cipher", "ECDHE-ECDSA-AES256-GCM-SHA384"},
@@ -567,6 +580,7 @@ func TestHandshakeClientAES256GCMSHA384(t *testing.T) {
 }
 
 func TestHandshakeClientAES128CBCSHA256(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "AES128-SHA256",
 		args: []string{"-cipher", "AES128-SHA256"},
@@ -575,6 +589,7 @@ func TestHandshakeClientAES128CBCSHA256(t *testing.T) {
 }
 
 func TestHandshakeClientECDHERSAAES128CBCSHA256(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-RSA-AES128-SHA256",
 		args: []string{"-cipher", "ECDHE-RSA-AES128-SHA256"},
@@ -583,6 +598,7 @@ func TestHandshakeClientECDHERSAAES128CBCSHA256(t *testing.T) {
 }
 
 func TestHandshakeClientECDHEECDSAAES128CBCSHA256(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDHE-ECDSA-AES128-SHA256",
 		args: []string{"-cipher", "ECDHE-ECDSA-AES128-SHA256"},
@@ -593,6 +609,7 @@ func TestHandshakeClientECDHEECDSAAES128CBCSHA256(t *testing.T) {
 }
 
 func TestHandshakeClientX25519(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{X25519}
 
@@ -607,6 +624,7 @@ func TestHandshakeClientX25519(t *testing.T) {
 }
 
 func TestHandshakeClientP256(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{CurveP256}
 
@@ -621,6 +639,7 @@ func TestHandshakeClientP256(t *testing.T) {
 }
 
 func TestHandshakeClientHelloRetryRequest(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{X25519, CurveP256}
 
@@ -640,6 +659,7 @@ func TestHandshakeClientHelloRetryRequest(t *testing.T) {
 }
 
 func TestHandshakeClientECDHERSAChaCha20(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CipherSuites = []uint16{TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305}
 
@@ -653,6 +673,7 @@ func TestHandshakeClientECDHERSAChaCha20(t *testing.T) {
 }
 
 func TestHandshakeClientECDHEECDSAChaCha20(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CipherSuites = []uint16{TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305}
 
@@ -668,6 +689,7 @@ func TestHandshakeClientECDHEECDSAChaCha20(t *testing.T) {
 }
 
 func TestHandshakeClientAES128SHA256(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "AES128-SHA256",
 		args: []string{"-ciphersuites", "TLS_AES_128_GCM_SHA256"},
@@ -675,6 +697,7 @@ func TestHandshakeClientAES128SHA256(t *testing.T) {
 	runClientTestTLS13(t, test)
 }
 func TestHandshakeClientAES256SHA384(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "AES256-SHA384",
 		args: []string{"-ciphersuites", "TLS_AES_256_GCM_SHA384"},
@@ -682,6 +705,7 @@ func TestHandshakeClientAES256SHA384(t *testing.T) {
 	runClientTestTLS13(t, test)
 }
 func TestHandshakeClientCHACHA20SHA256(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "CHACHA20-SHA256",
 		args: []string{"-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"},
@@ -690,6 +714,7 @@ func TestHandshakeClientCHACHA20SHA256(t *testing.T) {
 }
 
 func TestHandshakeClientECDSATLS13(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "ECDSA",
 		cert: testECDSACertificate,
@@ -699,6 +724,7 @@ func TestHandshakeClientECDSATLS13(t *testing.T) {
 }
 
 func TestHandshakeClientEd25519(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name: "Ed25519",
 		cert: testEd25519Certificate,
@@ -722,6 +748,7 @@ func TestHandshakeClientEd25519(t *testing.T) {
 }
 
 func TestHandshakeClientCertRSA(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	cert, _ := X509KeyPair([]byte(clientCertificatePEM), []byte(clientKeyPEM))
 	config.Certificates = []Certificate{cert}
@@ -759,6 +786,7 @@ func TestHandshakeClientCertRSA(t *testing.T) {
 }
 
 func TestHandshakeClientCertECDSA(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	cert, _ := X509KeyPair([]byte(clientECDSACertificatePEM), []byte(clientECDSAKeyPEM))
 	config.Certificates = []Certificate{cert}
@@ -790,6 +818,7 @@ func TestHandshakeClientCertECDSA(t *testing.T) {
 // signed itself with RSA-PSS, mostly to check that crypto/x509 chain validation
 // works.
 func TestHandshakeClientCertRSAPSS(t *testing.T) {
+	t.Parallel()
 	cert, err := x509.ParseCertificate(testRSAPSSCertificate)
 	if err != nil {
 		panic(err)
@@ -820,6 +849,7 @@ func TestHandshakeClientCertRSAPSS(t *testing.T) {
 }
 
 func TestHandshakeClientCertRSAPKCS1v15(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	cert, _ := X509KeyPair([]byte(clientCertificatePEM), []byte(clientKeyPEM))
 	config.Certificates = []Certificate{cert}
@@ -835,6 +865,7 @@ func TestHandshakeClientCertRSAPKCS1v15(t *testing.T) {
 }
 
 func TestClientKeyUpdate(t *testing.T) {
+	t.Parallel()
 	test := &clientTest{
 		name:          "KeyUpdate",
 		args:          []string{"-state"},
@@ -2084,7 +2115,7 @@ func testVerifyPeerCertificate(t *testing.T, version uint16) {
 }
 
 // brokenConn wraps a net.Conn and causes all Writes after a certain number to
-// fail with brokenConnErr.
+// fail with errBrokenConn.
 type brokenConn struct {
 	net.Conn
 
@@ -2096,12 +2127,12 @@ type brokenConn struct {
 	numWrites int
 }
 
-// brokenConnErr is the error that brokenConn returns once exhausted.
-var brokenConnErr = errors.New("too many writes to brokenConn")
+// errBrokenConn is the error that brokenConn returns once exhausted.
+var errBrokenConn = errors.New("too many writes to brokenConn")
 
 func (b *brokenConn) Write(data []byte) (int, error) {
 	if b.numWrites >= b.breakAfter {
-		return 0, brokenConnErr
+		return 0, errBrokenConn
 	}
 
 	b.numWrites++
@@ -2122,7 +2153,7 @@ func TestFailedWrite(t *testing.T) {
 
 		brokenC := &brokenConn{Conn: c, breakAfter: breakAfter}
 		err := Client(brokenC, testConfig).Handshake()
-		if err != brokenConnErr {
+		if err != errBrokenConn {
 			t.Errorf("#%d: expected error from brokenConn but got %q", breakAfter, err)
 		}
 		brokenC.Close()

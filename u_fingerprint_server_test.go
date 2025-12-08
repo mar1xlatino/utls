@@ -541,17 +541,23 @@ func TestGenerateCertificate_ECDSAKeyType(t *testing.T) {
 }
 
 // TestGenerateCertificate_RSAKeyType verifies RSA key generation.
+// RSA-4096 is skipped in short mode as it takes ~300ms to generate.
 func TestGenerateCertificate_RSAKeyType(t *testing.T) {
 	tests := []struct {
-		keyType string
-		bits    int
+		keyType  string
+		bits     int
+		skipShort bool // Skip in -short mode (expensive key generation)
 	}{
-		{"rsa-2048", 2048},
-		{"rsa-4096", 4096},
+		{"rsa-2048", 2048, false},
+		{"rsa-4096", 4096, true}, // RSA-4096 is slow (~300ms)
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.keyType, func(t *testing.T) {
+			if tc.skipShort && testing.Short() {
+				t.Skipf("skipping %s in short mode (expensive key generation)", tc.keyType)
+			}
+
 			config := &CertificateConfig{
 				KeyType:        tc.keyType,
 				ValidityPeriod: 24 * time.Hour,

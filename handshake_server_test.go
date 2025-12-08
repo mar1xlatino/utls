@@ -30,6 +30,10 @@ import (
 	"github.com/refraction-networking/utls/internal/fips140tls"
 )
 
+// testContextKey is a custom type for context keys to avoid SA1029 staticcheck warning.
+// Using a custom type prevents collisions with other packages using context values.
+type testContextKey struct{}
+
 func testClientHello(t *testing.T, serverConfig *Config, m handshakeMessage) {
 	t.Helper()
 	testClientHelloFailure(t, serverConfig, m, "")
@@ -782,10 +786,16 @@ func runServerTestForVersion(t *testing.T, template *serverTest, version, option
 }
 
 func runServerTestTLS10(t *testing.T, template *serverTest) {
+	if testing.Short() {
+		t.Skip("skipping TLS 1.0 test in short mode")
+	}
 	runServerTestForVersion(t, template, "TLSv10", "-tls1")
 }
 
 func runServerTestTLS11(t *testing.T, template *serverTest) {
+	if testing.Short() {
+		t.Skip("skipping TLS 1.1 test in short mode")
+	}
 	runServerTestForVersion(t, template, "TLSv11", "-tls1_1")
 }
 
@@ -798,6 +808,7 @@ func runServerTestTLS13(t *testing.T, template *serverTest) {
 }
 
 func TestHandshakeServerRSARC4(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-RC4",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "RC4-SHA"},
@@ -808,6 +819,7 @@ func TestHandshakeServerRSARC4(t *testing.T) {
 }
 
 func TestHandshakeServerRSA3DES(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-3DES",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "DES-CBC3-SHA"},
@@ -817,6 +829,7 @@ func TestHandshakeServerRSA3DES(t *testing.T) {
 }
 
 func TestHandshakeServerRSAAES(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-AES",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "AES128-SHA"},
@@ -826,6 +839,7 @@ func TestHandshakeServerRSAAES(t *testing.T) {
 }
 
 func TestHandshakeServerAESGCM(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-AES-GCM",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "ECDHE-RSA-AES128-GCM-SHA256"},
@@ -834,6 +848,7 @@ func TestHandshakeServerAESGCM(t *testing.T) {
 }
 
 func TestHandshakeServerAES256GCMSHA384(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-AES256-GCM-SHA384",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "ECDHE-RSA-AES256-GCM-SHA384"},
@@ -842,6 +857,7 @@ func TestHandshakeServerAES256GCMSHA384(t *testing.T) {
 }
 
 func TestHandshakeServerAES128SHA256(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "AES128-SHA256",
 		command: []string{"openssl", "s_client", "-no_ticket", "-ciphersuites", "TLS_AES_128_GCM_SHA256"},
@@ -849,6 +865,7 @@ func TestHandshakeServerAES128SHA256(t *testing.T) {
 	runServerTestTLS13(t, test)
 }
 func TestHandshakeServerAES256SHA384(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "AES256-SHA384",
 		command: []string{"openssl", "s_client", "-no_ticket", "-ciphersuites", "TLS_AES_256_GCM_SHA384"},
@@ -856,6 +873,7 @@ func TestHandshakeServerAES256SHA384(t *testing.T) {
 	runServerTestTLS13(t, test)
 }
 func TestHandshakeServerCHACHA20SHA256(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "CHACHA20-SHA256",
 		command: []string{"openssl", "s_client", "-no_ticket", "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"},
@@ -864,6 +882,7 @@ func TestHandshakeServerCHACHA20SHA256(t *testing.T) {
 }
 
 func TestHandshakeServerECDHEECDSAAES(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.Certificates = make([]Certificate, 1)
 	config.Certificates[0].Certificate = [][]byte{testECDSACertificate}
@@ -881,6 +900,7 @@ func TestHandshakeServerECDHEECDSAAES(t *testing.T) {
 }
 
 func TestHandshakeServerX25519(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{X25519}
 
@@ -894,6 +914,7 @@ func TestHandshakeServerX25519(t *testing.T) {
 }
 
 func TestHandshakeServerP256(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{CurveP256}
 
@@ -907,6 +928,7 @@ func TestHandshakeServerP256(t *testing.T) {
 }
 
 func TestHandshakeServerHelloRetryRequest(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{CurveP256}
 
@@ -927,6 +949,7 @@ func TestHandshakeServerHelloRetryRequest(t *testing.T) {
 // TestHandshakeServerKeySharePreference checks that we prefer a key share even
 // if it's later in the CurvePreferences order.
 func TestHandshakeServerKeySharePreference(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.CurvePreferences = []CurveID{X25519, CurveP256}
 
@@ -945,6 +968,7 @@ func TestHandshakeServerKeySharePreference(t *testing.T) {
 }
 
 func TestHandshakeServerALPN(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.NextProtos = []string{"proto1", "proto2"}
 
@@ -967,6 +991,7 @@ func TestHandshakeServerALPN(t *testing.T) {
 }
 
 func TestHandshakeServerALPNNoMatch(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.NextProtos = []string{"proto3"}
 
@@ -983,6 +1008,7 @@ func TestHandshakeServerALPNNoMatch(t *testing.T) {
 }
 
 func TestHandshakeServerALPNNotConfigured(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.NextProtos = nil
 
@@ -1004,6 +1030,7 @@ func TestHandshakeServerALPNNotConfigured(t *testing.T) {
 }
 
 func TestHandshakeServerALPNFallback(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.NextProtos = []string{"proto1", "h2", "proto2"}
 
@@ -1028,6 +1055,7 @@ func TestHandshakeServerALPNFallback(t *testing.T) {
 // "snitest.com", which happens to match the CN of testSNICertificate. The test
 // verifies that the server correctly selects that certificate.
 func TestHandshakeServerSNI(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "SNI",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "AES128-SHA", "-servername", "snitest.com"},
@@ -1038,6 +1066,7 @@ func TestHandshakeServerSNI(t *testing.T) {
 // TestHandshakeServerSNIGetCertificate is similar to TestHandshakeServerSNI, but
 // tests the dynamic GetCertificate method
 func TestHandshakeServerSNIGetCertificate(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 
 	// Replace the NameToCertificate map with a GetCertificate function
@@ -1060,6 +1089,7 @@ func TestHandshakeServerSNIGetCertificate(t *testing.T) {
 // GetCertificate method doesn't return a cert, we fall back to what's in
 // the NameToCertificate map.
 func TestHandshakeServerSNIGetCertificateNotFound(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 
 	config.GetCertificate = func(clientHello *ClientHelloInfo) (*Certificate, error) {
@@ -1077,6 +1107,7 @@ func TestHandshakeServerSNIGetCertificateNotFound(t *testing.T) {
 // Extensions passed to GetCertificate match what we expect based on the
 // clientHelloMsg
 func TestHandshakeServerGetCertificateExtensions(t *testing.T) {
+	t.Parallel()
 	const errMsg = "TestHandshakeServerGetCertificateExtensions error"
 	// ensure the test condition inside our GetCertificate callback
 	// is actually invoked
@@ -1135,6 +1166,7 @@ func TestHandshakeServerGetCertificateExtensions(t *testing.T) {
 // TestHandshakeServerSNIGetCertificateError tests to make sure that errors in
 // GetCertificate result in a tls alert.
 func TestHandshakeServerSNIGetCertificateError(t *testing.T) {
+	t.Parallel()
 	const errMsg = "TestHandshakeServerSNIGetCertificateError error"
 
 	serverConfig := testConfig.Clone()
@@ -1155,6 +1187,7 @@ func TestHandshakeServerSNIGetCertificateError(t *testing.T) {
 // TestHandshakeServerEmptyCertificates tests that GetCertificates is called in
 // the case that Certificates is empty, even without SNI.
 func TestHandshakeServerEmptyCertificates(t *testing.T) {
+	t.Parallel()
 	const errMsg = "TestHandshakeServerEmptyCertificates error"
 
 	serverConfig := testConfig.Clone()
@@ -1265,6 +1298,7 @@ func TestServerResumptionDisabled(t *testing.T) {
 }
 
 func TestFallbackSCSV(t *testing.T) {
+	t.Parallel()
 	serverConfig := Config{
 		Certificates: testConfig.Certificates,
 		MinVersion:   VersionTLS11,
@@ -1280,6 +1314,7 @@ func TestFallbackSCSV(t *testing.T) {
 }
 
 func TestHandshakeServerExportKeyingMaterial(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "ExportKeyingMaterial",
 		command: []string{"openssl", "s_client", "-cipher", "ECDHE-RSA-AES256-SHA", "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"},
@@ -1299,6 +1334,7 @@ func TestHandshakeServerExportKeyingMaterial(t *testing.T) {
 }
 
 func TestHandshakeServerRSAPKCS1v15(t *testing.T) {
+	t.Parallel()
 	test := &serverTest{
 		name:    "RSA-RSAPKCS1v15",
 		command: []string{"openssl", "s_client", "-no_ticket", "-cipher", "ECDHE-RSA-CHACHA20-POLY1305", "-sigalgs", "rsa_pkcs1_sha256"},
@@ -1307,6 +1343,7 @@ func TestHandshakeServerRSAPKCS1v15(t *testing.T) {
 }
 
 func TestHandshakeServerRSAPSS(t *testing.T) {
+	t.Parallel()
 	// We send rsa_pss_rsae_sha512 first, as the test key won't fit, and we
 	// verify the server implementation will disregard the client preference in
 	// that case. See Issue 29793.
@@ -1326,6 +1363,7 @@ func TestHandshakeServerRSAPSS(t *testing.T) {
 }
 
 func TestHandshakeServerEd25519(t *testing.T) {
+	t.Parallel()
 	config := testConfig.Clone()
 	config.Certificates = make([]Certificate, 1)
 	config.Certificates[0].Certificate = [][]byte{testEd25519Certificate}
@@ -2069,7 +2107,7 @@ func TestHandshakeContextHierarchy(t *testing.T) {
 	serverConfig := testConfig.Clone()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	key := struct{}{}
+	key := testContextKey{}
 	ctx = context.WithValue(ctx, key, true)
 	go func() {
 		defer close(clientErr)

@@ -364,7 +364,7 @@ func TestBufferPoolBudgetExhaustedRecovers(t *testing.T) {
 	}
 
 	// Try another - might work or fail depending on pool state
-	buf2, err := GetBuffer(8192)
+	buf2, _ := GetBuffer(8192)
 
 	// Release first buffer
 	PutBuffer(buf1)
@@ -467,17 +467,15 @@ func TestConnectionShedOnPressure(t *testing.T) {
 	resetGlobalState()
 
 	// Create wrapped connections
-	var conns []*Conn
 	var servers []net.Conn
 	for i := 0; i < 5; i++ {
 		server, client := net.Pipe()
 		client.Close() // Close client side so connections become "idle"
 		servers = append(servers, server)
 
-		conn := Wrap(server, "test-shed")
-		if conn != nil {
-			conns = append(conns, conn)
-		}
+		// Wrap creates managed connection (return value unused since we just need
+		// them registered in the registry for the shed test)
+		_ = Wrap(server, "test-shed")
 	}
 
 	// Verify connections registered
@@ -705,7 +703,12 @@ func TestLoggerCustomHandler(t *testing.T) {
 	} else {
 		t.Logf("Received %d log messages", len(receivedMessages))
 		for i, msg := range receivedMessages {
-			t.Logf("  [%d] Level %d: %s", i, receivedLevels[i], msg)
+			// Bounds check to prevent potential nil/short slice panic
+			if i < len(receivedLevels) {
+				t.Logf("  [%d] Level %d: %s", i, receivedLevels[i], msg)
+			} else {
+				t.Logf("  [%d] Level ?: %s", i, msg)
+			}
 		}
 	}
 }
