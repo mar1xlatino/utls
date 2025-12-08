@@ -1,7 +1,7 @@
-// Package memcontrol provides memory-aware resource management for uTLS.
+// Package memcontrol provides memory-aware resource management for REALITY.
 //
 // This is adapted from Xray-core's common/buf memory budget system,
-// simplified for uTLS's needs as a TLS fingerprinting library.
+// simplified for REALITY's needs as a TLS fingerprinting library.
 //
 // Architecture:
 //   - Budget tracks total memory usage with soft/hard limits
@@ -13,6 +13,7 @@ package memcontrol
 import (
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -28,6 +29,15 @@ type MemoryBudget struct {
 	// Current usage (bytes)
 	totalBytes atomic.Int64 // Total tracked (inUse + cached)
 	inUseBytes atomic.Int64 // Currently loaned out
+
+	// Pool cache tracking for drift detection
+	// When Release() returns true (cache), we increment cachedBytes
+	// When RecordHit() is called (buffer from pool), we decrement cachedBytes
+	// If sync.Pool GCs buffers, cachedBytes becomes stale (overestimates)
+	// Periodic reconciliation detects and corrects this drift
+	cachedBytes    atomic.Int64 // Expected bytes cached in pools
+	lastActivity   atomic.Int64 // UnixNano of last Get/Put (for idle detection)
+	reconcileCount atomic.Uint64 // Number of reconciliations performed
 
 	// Limits (bytes)
 	softLimit atomic.Int64 // Eviction threshold
@@ -47,9 +57,14 @@ type MemoryBudget struct {
 	onEviction atomic.Pointer[func()]
 
 	// State
-	inEviction       atomic.Bool
-	lastEvictionTime atomic.Int64 // UnixNano timestamp of last eviction callback
-	disabled         atomic.Bool
+	inEviction          atomic.Bool
+	lastEvictionTime    atomic.Int64 // UnixNano timestamp of last eviction callback
+	evictionRateLimitNs atomic.Int64 // Rate limit in nanoseconds (default 1 second)
+	disabled            atomic.Bool
+
+	// Reconciliation control
+	reconcileStop chan struct{}
+	reconcileOnce sync.Once
 }
 
 var globalMemoryBudget *MemoryBudget
@@ -58,25 +73,39 @@ func init() {
 	globalMemoryBudget = newMemoryBudget()
 }
 
-// getEnv returns the value of UTLS_<key> environment variable.
-func getEnv(key string) string {
+// getEnvCompat checks REALITY_*, XRAY_*, and UTLS_* environment variables for compatibility.
+// Priority: REALITY_* > XRAY_* > UTLS_* (first non-empty wins).
+func getEnvCompat(key string) string {
+	// Check REALITY_ prefix first (this project's naming)
+	if val := os.Getenv("REALITY_" + key); val != "" {
+		return val
+	}
+	// Fall back to XRAY_ prefix (for xray-core compatibility)
+	if val := os.Getenv("XRAY_" + key); val != "" {
+		return val
+	}
+	// Fall back to UTLS_ prefix (for uTLS compatibility)
 	return os.Getenv("UTLS_" + key)
 }
 
+// Default eviction rate limit: 1 second in nanoseconds
+const defaultEvictionRateLimitNs = 1_000_000_000
+
 func newMemoryBudget() *MemoryBudget {
 	mb := &MemoryBudget{}
+	mb.evictionRateLimitNs.Store(defaultEvictionRateLimitNs)
 
-	// Check kill switch via UTLS_DISABLE_BUDGET=1
-	if getEnv("DISABLE_BUDGET") == "1" {
+	// Check kill switch (supports both REALITY_DISABLE_BUDGET and XRAY_DISABLE_BUDGET)
+	if getEnvCompat("DISABLE_BUDGET") == "1" {
 		mb.disabled.Store(true)
 		mb.softLimit.Store(1 << 62)
 		mb.hardLimit.Store(1 << 62)
 		return mb
 	}
 
-	// Check for manual override via environment (UTLS_SOFT_LIMIT, UTLS_HARD_LIMIT)
-	softEnv := getEnv("SOFT_LIMIT")
-	hardEnv := getEnv("HARD_LIMIT")
+	// Check for manual override via environment (supports both REALITY_* and XRAY_* prefixes)
+	softEnv := getEnvCompat("SOFT_LIMIT")
+	hardEnv := getEnvCompat("HARD_LIMIT")
 
 	if softEnv != "" && hardEnv != "" {
 		softVal, softErr := strconv.ParseInt(softEnv, 10, 64)
@@ -90,13 +119,13 @@ func newMemoryBudget() *MemoryBudget {
 	}
 
 	// Auto-detect device profile (defaults to client mode for safety)
-	// Applications should call ConfigureMemory() with explicit client/server config
+	// Xray-core should call ConfigureMemory() with explicit client/server config
 	profile := getDeviceProfile()
 	mb.softLimit.Store(profile.BufferSoftCap)
 	mb.hardLimit.Store(profile.BufferHardCap)
 
 	// Log auto-detected profile
-	logInfo("auto-detected profile: %s (soft=%dMB, hard=%dMB)",
+	logWarn("auto-detected profile: %s (soft=%dMB, hard=%dMB) - call ConfigureMemory() for explicit config",
 		profile.Name, profile.BufferSoftCap/(1024*1024), profile.BufferHardCap/(1024*1024))
 
 	return mb
@@ -155,6 +184,8 @@ func (mb *MemoryBudget) MarkInUse(size int64) {
 		return
 	}
 	mb.inUseBytes.Add(size)
+	// Buffer came from cache, so decrement cached tracking
+	mb.cachedBytes.Add(-size)
 }
 
 // RecordGet increments the total Get() counter.
@@ -171,6 +202,8 @@ func (mb *MemoryBudget) RecordHit() {
 		return
 	}
 	mb.hits.Add(1)
+	mb.lastActivity.Store(time.Now().UnixNano())
+	// Note: cachedBytes is decremented in MarkInUse when buffer size is known
 }
 
 // RecordMiss increments the cache miss counter.
@@ -179,6 +212,7 @@ func (mb *MemoryBudget) RecordMiss() {
 		return
 	}
 	mb.misses.Add(1)
+	mb.lastActivity.Store(time.Now().UnixNano())
 }
 
 // AllocateBlocking blocks until size bytes can be allocated or timeout expires.
@@ -225,6 +259,7 @@ func (mb *MemoryBudget) Release(size int64) bool {
 	}
 
 	mb.inUseBytes.Add(-size)
+	mb.lastActivity.Store(time.Now().UnixNano())
 
 	// Use CAS loop to atomically check and decrement
 	// This prevents TOCTOU race where stale value causes wrong decision
@@ -246,7 +281,8 @@ func (mb *MemoryBudget) Release(size int64) bool {
 			// Retry with new value (usually succeeds on first try)
 		} else {
 			// Under soft limit - cache (keep in totalBytes)
-			// No CAS needed here - just returning decision
+			// Track that this buffer is now in cache
+			mb.cachedBytes.Add(size)
 			return true
 		}
 	}
@@ -275,7 +311,7 @@ func (mb *MemoryBudget) ForceEvict(size int64) {
 //
 // IMPORTANT: The inEviction flag represents "are we in eviction mode" and MUST
 // stay true while totalBytes > softLimit. This is separate from callback rate limiting.
-// The callback fires at most once per second, but inEviction reflects the actual state.
+// The callback fires at most once per rate limit interval, but inEviction reflects the actual state.
 func (mb *MemoryBudget) checkEvictionState(current int64) {
 	soft := mb.softLimit.Load()
 	nowEvicting := current > soft
@@ -290,10 +326,14 @@ func (mb *MemoryBudget) checkEvictionState(current int64) {
 			logWarn("memory pressure: entered EVICT mode (current=%dKB, soft=%dKB)",
 				current/1024, soft/1024)
 
-			// Rate limit callbacks to 1 per second
+			// Rate limit callbacks to avoid flooding
 			now := time.Now().UnixNano()
 			last := mb.lastEvictionTime.Load()
-			if now-last > 1_000_000_000 { // 1 second in nanoseconds
+			rateLimit := mb.evictionRateLimitNs.Load()
+			if rateLimit == 0 {
+				rateLimit = defaultEvictionRateLimitNs
+			}
+			if now-last > rateLimit {
 				mb.lastEvictionTime.Store(now)
 				if fn := mb.onEviction.Load(); fn != nil {
 					logInfo("triggering eviction callback")
@@ -303,6 +343,7 @@ func (mb *MemoryBudget) checkEvictionState(current int64) {
 			// Note: inEviction stays true because we ARE in eviction mode.
 			// Callback rate limiting is separate from eviction state.
 		}
+		// If CAS failed, another thread already set inEviction=true
 	} else {
 		// Dropped below soft limit - exit eviction mode
 		wasEvicting := mb.inEviction.Swap(false)
@@ -317,7 +358,7 @@ func (mb *MemoryBudget) checkEvictionState(current int64) {
 type BudgetState struct {
 	TotalBytes  int64
 	InUseBytes  int64
-	CachedBytes int64
+	CachedBytes int64 // Computed: TotalBytes - InUseBytes
 	SoftLimit   int64
 	HardLimit   int64
 	Waiters     int32
@@ -333,6 +374,11 @@ type BudgetState struct {
 
 	// Derived
 	HitRate float64 // Hits / Gets * 100
+
+	// Reconciliation stats
+	TrackedCachedBytes int64  // Explicitly tracked cached bytes (may drift from CachedBytes)
+	ReconcileCount     uint64 // Number of reconciliations performed
+	CacheDrift         int64  // TrackedCachedBytes - CachedBytes (positive = overestimate)
 }
 
 // State returns current budget state.
@@ -346,6 +392,7 @@ func (mb *MemoryBudget) State() BudgetState {
 	inUse := mb.inUseBytes.Load()
 	gets := mb.gets.Load()
 	hits := mb.hits.Load()
+	trackedCached := mb.cachedBytes.Load()
 
 	var hitRate float64
 	if gets > 0 {
@@ -359,20 +406,23 @@ func (mb *MemoryBudget) State() BudgetState {
 	}
 
 	return BudgetState{
-		TotalBytes:  total,
-		InUseBytes:  inUse,
-		CachedBytes: cached,
-		SoftLimit:   mb.softLimit.Load(),
-		HardLimit:   mb.hardLimit.Load(),
-		Waiters:     mb.waiters.Load(),
-		InEviction:  mb.inEviction.Load(),
-		Disabled:    mb.disabled.Load(),
-		Gets:        gets,
-		Hits:        hits,
-		Misses:      mb.misses.Load(),
-		Evictions:   mb.evictions.Load(),
-		Blocks:      mb.blocks.Load(),
-		HitRate:     hitRate,
+		TotalBytes:         total,
+		InUseBytes:         inUse,
+		CachedBytes:        cached,
+		SoftLimit:          mb.softLimit.Load(),
+		HardLimit:          mb.hardLimit.Load(),
+		Waiters:            mb.waiters.Load(),
+		InEviction:         mb.inEviction.Load(),
+		Disabled:           mb.disabled.Load(),
+		Gets:               gets,
+		Hits:               hits,
+		Misses:             mb.misses.Load(),
+		Evictions:          mb.evictions.Load(),
+		Blocks:             mb.blocks.Load(),
+		HitRate:            hitRate,
+		TrackedCachedBytes: trackedCached,
+		ReconcileCount:     mb.reconcileCount.Load(),
+		CacheDrift:         trackedCached - cached,
 	}
 }
 
@@ -411,6 +461,15 @@ func (mb *MemoryBudget) SetLimits(soft, hard int64) {
 	}
 }
 
+// SetEvictionRateLimit sets the minimum interval between eviction callbacks.
+// Default is 1 second. Use shorter values in tests for faster execution.
+func (mb *MemoryBudget) SetEvictionRateLimit(d time.Duration) {
+	if mb == nil {
+		return
+	}
+	mb.evictionRateLimitNs.Store(d.Nanoseconds())
+}
+
 // IsEvicting returns true if in eviction mode.
 func (mb *MemoryBudget) IsEvicting() bool {
 	if mb == nil {
@@ -432,6 +491,163 @@ func GetBudget() *MemoryBudget {
 	return globalMemoryBudget
 }
 
+// ResetForTest clears all budget counters and returns to normal state.
+// This should only be used in tests to ensure test isolation.
+// NOT thread-safe - only call from test setup with no concurrent allocations.
+func ResetForTest() {
+	mb := globalMemoryBudget
+	if mb == nil {
+		return
+	}
+
+	// Clear usage counters
+	mb.totalBytes.Store(0)
+	mb.inUseBytes.Store(0)
+	mb.cachedBytes.Store(0)
+
+	// Clear blocking state
+	mb.waiters.Store(0)
+
+	// Clear stats
+	mb.gets.Store(0)
+	mb.hits.Store(0)
+	mb.misses.Store(0)
+	mb.evictions.Store(0)
+	mb.blocks.Store(0)
+
+	// Clear eviction state
+	mb.inEviction.Store(false)
+	mb.lastEvictionTime.Store(0)
+
+	// Clear reconciliation state
+	mb.lastActivity.Store(0)
+	mb.reconcileCount.Store(0)
+}
+
+// Reconciliation constants
+const (
+	// ReconcileInterval is how often we check for drift (30 seconds)
+	ReconcileInterval = 30 * time.Second
+
+	// IdleThreshold: if no activity for this long, assume pool may have been GC'd
+	IdleThreshold = 60 * time.Second
+
+	// DecayFactor: when idle, decay cachedBytes by this fraction (50%)
+	DecayFactor = 0.5
+
+	// DriftThreshold: if cachedBytes differs from expected by more than this, reconcile
+	// Expected = totalBytes - inUseBytes
+	DriftThreshold = 0.2 // 20% drift tolerance
+)
+
+// StartReconciliation starts the background reconciliation goroutine.
+// Call once at startup (idempotent - multiple calls are safe).
+func StartReconciliation() {
+	mb := globalMemoryBudget
+	if mb == nil {
+		return
+	}
+
+	mb.reconcileOnce.Do(func() {
+		mb.reconcileStop = make(chan struct{})
+		go mb.reconcileLoop()
+		logInfo("started periodic reconciliation (interval=%v)", ReconcileInterval)
+	})
+}
+
+// StopReconciliation stops the background reconciliation goroutine.
+// Safe to call even if not started.
+func StopReconciliation() {
+	mb := globalMemoryBudget
+	if mb == nil || mb.reconcileStop == nil {
+		return
+	}
+
+	select {
+	case <-mb.reconcileStop:
+		// Already stopped
+	default:
+		close(mb.reconcileStop)
+	}
+}
+
+// reconcileLoop runs periodically to detect and correct budget drift.
+func (mb *MemoryBudget) reconcileLoop() {
+	ticker := time.NewTicker(ReconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mb.reconcileStop:
+			logInfo("reconciliation stopped")
+			return
+		case <-ticker.C:
+			mb.reconcile()
+		}
+	}
+}
+
+// reconcile checks for and corrects budget drift.
+// Two strategies:
+// 1. Idle decay: If no activity for IdleThreshold, decay cachedBytes (pool may have been GC'd)
+// 2. Drift detection: If cachedBytes drifts significantly from expected, correct it
+func (mb *MemoryBudget) reconcile() {
+	if mb.disabled.Load() {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	lastAct := mb.lastActivity.Load()
+	idleNs := now - lastAct
+
+	// Strategy 1: Idle decay
+	// If no activity for > IdleThreshold, pool may have been GC'd
+	if idleNs > int64(IdleThreshold) && lastAct > 0 {
+		cached := mb.cachedBytes.Load()
+		if cached > 0 {
+			// Decay cachedBytes and totalBytes by DecayFactor
+			decay := int64(float64(cached) * DecayFactor)
+			if decay > 0 {
+				mb.cachedBytes.Add(-decay)
+				mb.totalBytes.Add(-decay)
+				mb.reconcileCount.Add(1)
+				logDebug("idle decay: reduced cachedBytes by %d bytes (idle for %v)",
+					decay, time.Duration(idleNs))
+			}
+		}
+		return
+	}
+
+	// Strategy 2: Drift detection
+	// If we're getting cache misses when cachedBytes claims we have cached buffers,
+	// the pool was GC'd without our knowledge
+	total := mb.totalBytes.Load()
+	inUse := mb.inUseBytes.Load()
+	cached := mb.cachedBytes.Load()
+
+	// Expected cached = total - inUse (what we think should be in pool)
+	expectedCached := total - inUse
+
+	// If cachedBytes > expectedCached, we have drift (released more than we thought we had)
+	// This shouldn't happen in normal operation, but can occur due to races
+	if cached > expectedCached && expectedCached >= 0 {
+		drift := cached - expectedCached
+		if float64(drift) > float64(expectedCached)*DriftThreshold && expectedCached > 0 {
+			// Significant drift - correct it
+			mb.cachedBytes.Store(expectedCached)
+			mb.reconcileCount.Add(1)
+			logDebug("corrected cachedBytes drift: %d -> %d", cached, expectedCached)
+		}
+	}
+
+	// If cachedBytes < 0 (shouldn't happen), reset to 0
+	if cached < 0 {
+		mb.cachedBytes.Store(0)
+		mb.reconcileCount.Add(1)
+		logWarn("cachedBytes was negative (%d), reset to 0", cached)
+	}
+}
+
 // DeviceProfile contains resource limits for a device class.
 type DeviceProfile struct {
 	Name          string
@@ -441,7 +657,7 @@ type DeviceProfile struct {
 
 // getDeviceProfile auto-detects device class based on RAM.
 // CONSERVATIVE: Assumes client mode (tighter limits) for safety.
-// Applications should use ConfigureMemory() with explicit client/server config.
+// Xray-core should use ConfigureMemory() with explicit client/server config.
 func getDeviceProfile() DeviceProfile {
 	totalMem := getTotalSystemMemory()
 	const MB = 1024 * 1024
@@ -488,6 +704,9 @@ func BudgetTryAllocate(size int64) bool {
 	if ext := getExternalBudget(); ext != nil {
 		return ext.TryAllocate(size)
 	}
+	if globalMemoryBudget == nil {
+		return true // No budget configured, allow allocation
+	}
 	return globalMemoryBudget.TryAllocate(size)
 }
 
@@ -497,6 +716,9 @@ func BudgetRelease(size int64) bool {
 	if ext := getExternalBudget(); ext != nil {
 		return ext.Release(size)
 	}
+	if globalMemoryBudget == nil {
+		return true // No budget configured, allow caching
+	}
 	return globalMemoryBudget.Release(size)
 }
 
@@ -505,6 +727,9 @@ func BudgetRelease(size int64) bool {
 func BudgetMarkInUse(size int64) {
 	if ext := getExternalBudget(); ext != nil {
 		ext.MarkInUse(size)
+		return
+	}
+	if globalMemoryBudget == nil {
 		return
 	}
 	globalMemoryBudget.MarkInUse(size)
@@ -517,6 +742,9 @@ func BudgetForceEvict(size int64) {
 		ext.ForceEvict(size)
 		return
 	}
+	if globalMemoryBudget == nil {
+		return
+	}
 	globalMemoryBudget.ForceEvict(size)
 }
 
@@ -526,6 +754,9 @@ func BudgetIsEvicting() bool {
 	if ext := getExternalBudget(); ext != nil {
 		return ext.IsEvicting()
 	}
+	if globalMemoryBudget == nil {
+		return false
+	}
 	return globalMemoryBudget.IsEvicting()
 }
 
@@ -534,6 +765,9 @@ func BudgetIsEvicting() bool {
 func BudgetRecordGet() {
 	if ext := getExternalBudget(); ext != nil {
 		ext.RecordGet()
+		return
+	}
+	if globalMemoryBudget == nil {
 		return
 	}
 	globalMemoryBudget.RecordGet()
@@ -546,6 +780,9 @@ func BudgetRecordHit() {
 		ext.RecordHit()
 		return
 	}
+	if globalMemoryBudget == nil {
+		return
+	}
 	globalMemoryBudget.RecordHit()
 }
 
@@ -556,6 +793,9 @@ func BudgetRecordMiss() {
 		ext.RecordMiss()
 		return
 	}
+	if globalMemoryBudget == nil {
+		return
+	}
 	globalMemoryBudget.RecordMiss()
 }
 
@@ -564,6 +804,9 @@ func BudgetRecordMiss() {
 func SetGlobalEvictionCallback(fn func()) {
 	if ext := getExternalBudget(); ext != nil {
 		ext.SetEvictionCallback(fn)
+		return
+	}
+	if globalMemoryBudget == nil {
 		return
 	}
 	globalMemoryBudget.SetEvictionCallback(fn)

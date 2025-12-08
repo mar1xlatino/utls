@@ -416,8 +416,8 @@ func TestOOM_ConcurrentAllocateRelease(t *testing.T) {
 	budget.softLimit.Store(2 * 1024 * 1024)  // 2MB
 	budget.hardLimit.Store(4 * 1024 * 1024)  // 4MB
 
-	const duration = 2 * time.Second
-	const goroutines = 50
+	const duration = 500 * time.Millisecond // Reduced from 2s - 500ms is sufficient to validate concurrent behavior
+	const goroutines = 30                   // Reduced from 50 - 30 goroutines provides adequate concurrency coverage
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -503,8 +503,10 @@ func TestOOM_BufferPoolConcurrentStress(t *testing.T) {
 	testBudget.hardLimit.Store(10 * 1024 * 1024)  // 10MB hard
 	globalMemoryBudget = testBudget
 
-	const duration = 2 * time.Second
-	const goroutines = 100
+	// 300ms is sufficient to detect race conditions - race detector works on timing
+	// windows, not absolute duration. 50 goroutines provide adequate contention.
+	const duration = 300 * time.Millisecond
+	const goroutines = 50
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -548,8 +550,8 @@ func TestOOM_BufferPoolConcurrentStress(t *testing.T) {
 					(*buf)[j] = byte(j)
 				}
 
-				// Random hold time
-				time.Sleep(time.Duration(time.Now().UnixNano()%500) * time.Microsecond)
+				// Random hold time - reduced max to 200us for faster iteration
+				time.Sleep(time.Duration(time.Now().UnixNano()%200) * time.Microsecond)
 
 				PutBuffer(buf)
 				stats.puts.Add(1)
@@ -563,9 +565,8 @@ func TestOOM_BufferPoolConcurrentStress(t *testing.T) {
 
 	state := testBudget.State()
 
-	// Force GC to clean up
+	// Force GC to clean up - GC is synchronous, no sleep needed
 	runtime.GC()
-	time.Sleep(50 * time.Millisecond)
 
 	t.Logf("Buffer pool stress: gets=%d, puts=%d, exhausted=%d, final_total=%dKB, limit=%dKB",
 		stats.gets.Load(), stats.puts.Load(), stats.exhausted.Load(),

@@ -17,6 +17,7 @@ func newTestBudget(soft, hard int64) *MemoryBudget {
 	mb := &MemoryBudget{}
 	mb.softLimit.Store(soft)
 	mb.hardLimit.Store(hard)
+	mb.evictionRateLimitNs.Store(defaultEvictionRateLimitNs) // Default 1 second
 	return mb
 }
 
@@ -221,8 +222,11 @@ func TestBudgetEvictionCallback(t *testing.T) {
 	const (
 		softLimit = 1000
 		hardLimit = 2000
+		// Use shorter rate limit for tests (50ms instead of 1s)
+		testRateLimit = 50 * time.Millisecond
 	)
 	mb := newTestBudget(softLimit, hardLimit)
+	mb.SetEvictionRateLimit(testRateLimit) // Override for fast test
 
 	var callCount atomic.Int32
 
@@ -234,13 +238,13 @@ func TestBudgetEvictionCallback(t *testing.T) {
 	mb.TryAllocate(1100)
 
 	// Give async callback time to execute
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	if callCount.Load() != 1 {
 		t.Errorf("Eviction callback should fire once, got %d", callCount.Load())
 	}
 
-	// Exit and re-enter eviction immediately (within 1 second)
+	// Exit and re-enter eviction immediately (within rate limit)
 	mb.Release(200) // Exit eviction (Total = 900)
 	if mb.IsEvicting() {
 		t.Fatal("Should have exited eviction mode")
@@ -251,21 +255,21 @@ func TestBudgetEvictionCallback(t *testing.T) {
 		t.Fatal("Should have re-entered eviction mode")
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
-	// Callback should NOT fire again due to rate limiting (1 per second)
+	// Callback should NOT fire again due to rate limiting
 	if callCount.Load() != 1 {
 		t.Errorf("Eviction callback should still be 1 (rate limited), got %d", callCount.Load())
 	}
 
 	// Wait for rate limit to expire and trigger again
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond) // 50ms rate limit + 10ms buffer
 
 	// Exit and re-enter to trigger again
 	mb.Release(200) // Exit eviction
 	mb.TryAllocate(200) // Re-enter eviction
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 
 	if callCount.Load() != 2 {
 		t.Errorf("Eviction callback should fire again after rate limit expires, got %d", callCount.Load())
@@ -1116,4 +1120,137 @@ func TestBudgetReleaseCASRetry(t *testing.T) {
 
 	t.Logf("CAS contention test completed: evictions=%d, TotalBytes=%d",
 		evictionCount.Load(), state.TotalBytes)
+}
+
+// TestReconcileIdleDecay verifies idle decay reduces stale cachedBytes.
+func TestReconcileIdleDecay(t *testing.T) {
+	mb := newTestBudget(100000, 200000)
+
+	// Simulate cache activity: allocate and cache some buffers
+	mb.TryAllocate(10000)
+	mb.inUseBytes.Store(0)         // Simulate all returned
+	mb.cachedBytes.Store(10000)    // Manually set cached (normally done by Release)
+	mb.lastActivity.Store(time.Now().Add(-2 * IdleThreshold).UnixNano()) // Set old activity
+
+	// Before reconcile
+	stateBefore := mb.State()
+	if stateBefore.TrackedCachedBytes != 10000 {
+		t.Fatalf("Before: TrackedCachedBytes = %d, want 10000", stateBefore.TrackedCachedBytes)
+	}
+
+	// Trigger reconcile
+	mb.reconcile()
+
+	// After reconcile - should have decayed by 50%
+	stateAfter := mb.State()
+	expectedDecay := int64(10000 * DecayFactor) // 5000
+	expectedRemaining := int64(10000) - expectedDecay
+
+	if stateAfter.TrackedCachedBytes != expectedRemaining {
+		t.Errorf("After: TrackedCachedBytes = %d, want %d", stateAfter.TrackedCachedBytes, expectedRemaining)
+	}
+
+	// totalBytes should also have been decremented
+	expectedTotal := int64(10000) - expectedDecay
+	if stateAfter.TotalBytes != expectedTotal {
+		t.Errorf("After: TotalBytes = %d, want %d", stateAfter.TotalBytes, expectedTotal)
+	}
+
+	// ReconcileCount should be 1
+	if stateAfter.ReconcileCount != 1 {
+		t.Errorf("ReconcileCount = %d, want 1", stateAfter.ReconcileCount)
+	}
+
+	t.Logf("Idle decay test: before=%d, after=%d, decay=%d",
+		stateBefore.TrackedCachedBytes, stateAfter.TrackedCachedBytes, expectedDecay)
+}
+
+// TestReconcileNegativeCachedBytes verifies negative cachedBytes is corrected.
+func TestReconcileNegativeCachedBytes(t *testing.T) {
+	mb := newTestBudget(100000, 200000)
+
+	// Simulate bug: negative cachedBytes (shouldn't happen but test recovery)
+	mb.cachedBytes.Store(-1000)
+	mb.lastActivity.Store(time.Now().UnixNano()) // Recent activity (skip idle decay)
+
+	// Trigger reconcile
+	mb.reconcile()
+
+	// cachedBytes should be reset to 0
+	state := mb.State()
+	if state.TrackedCachedBytes != 0 {
+		t.Errorf("TrackedCachedBytes = %d, want 0", state.TrackedCachedBytes)
+	}
+
+	if state.ReconcileCount != 1 {
+		t.Errorf("ReconcileCount = %d, want 1", state.ReconcileCount)
+	}
+}
+
+// TestReconcileNoopWhenActive verifies reconcile is no-op during active usage.
+func TestReconcileNoopWhenActive(t *testing.T) {
+	mb := newTestBudget(100000, 200000)
+
+	// Simulate active usage
+	mb.TryAllocate(10000)
+	mb.cachedBytes.Store(5000)
+	mb.lastActivity.Store(time.Now().UnixNano()) // Very recent
+
+	stateBefore := mb.State()
+
+	// Trigger reconcile
+	mb.reconcile()
+
+	stateAfter := mb.State()
+
+	// Nothing should have changed (not idle, no drift)
+	if stateAfter.TrackedCachedBytes != stateBefore.TrackedCachedBytes {
+		t.Errorf("TrackedCachedBytes changed: %d -> %d",
+			stateBefore.TrackedCachedBytes, stateAfter.TrackedCachedBytes)
+	}
+
+	if stateAfter.ReconcileCount != 0 {
+		t.Errorf("ReconcileCount = %d, want 0 (no reconciliation needed)", stateAfter.ReconcileCount)
+	}
+}
+
+// TestCachedBytesTracking verifies cachedBytes is tracked correctly through normal operations.
+func TestCachedBytesTracking(t *testing.T) {
+	mb := newTestBudget(100000, 200000)
+
+	// Allocate
+	mb.TryAllocate(8192)
+	state := mb.State()
+	if state.TotalBytes != 8192 {
+		t.Errorf("After allocate: TotalBytes = %d, want 8192", state.TotalBytes)
+	}
+	if state.TrackedCachedBytes != 0 {
+		t.Errorf("After allocate: TrackedCachedBytes = %d, want 0", state.TrackedCachedBytes)
+	}
+
+	// Simulate use (MarkInUse called by GetBuffer on hit, but we allocated fresh)
+	mb.inUseBytes.Store(8192)
+
+	// Release (under soft limit, should cache)
+	shouldCache := mb.Release(8192)
+	if !shouldCache {
+		t.Error("Release should return true (cache) when under soft limit")
+	}
+
+	state = mb.State()
+	// After release: inUse = 0, cachedBytes should be 8192
+	if state.TrackedCachedBytes != 8192 {
+		t.Errorf("After release: TrackedCachedBytes = %d, want 8192", state.TrackedCachedBytes)
+	}
+
+	// Now simulate MarkInUse (cache hit)
+	mb.MarkInUse(8192)
+
+	state = mb.State()
+	// After MarkInUse: cachedBytes should be 0 (taken from cache)
+	if state.TrackedCachedBytes != 0 {
+		t.Errorf("After MarkInUse: TrackedCachedBytes = %d, want 0", state.TrackedCachedBytes)
+	}
+
+	t.Logf("Cached bytes tracking verified correctly")
 }

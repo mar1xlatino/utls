@@ -888,3 +888,83 @@ func TestConnSetDeadline(t *testing.T) {
 		t.Errorf("SetWriteDeadline error: %v", err)
 	}
 }
+
+// TestConnNilReceiverSafe verifies all methods are safe to call on nil *Conn.
+// This is critical for nilaway static analysis compliance.
+func TestConnNilReceiverSafe(t *testing.T) {
+	var nilConn *Conn = nil
+
+	// All these should NOT panic - they should return zero/default values
+
+	// ID returns 0 for nil
+	if id := nilConn.ID(); id != 0 {
+		t.Errorf("nil.ID() = %d, want 0", id)
+	}
+
+	// Tag returns empty string for nil
+	if tag := nilConn.Tag(); tag != "" {
+		t.Errorf("nil.Tag() = %q, want empty string", tag)
+	}
+
+	// IsClosed returns true for nil (nil is considered closed)
+	if !nilConn.IsClosed() {
+		t.Error("nil.IsClosed() = false, want true")
+	}
+
+	// Age returns 0 for nil
+	if age := nilConn.Age(); age != 0 {
+		t.Errorf("nil.Age() = %v, want 0", age)
+	}
+
+	// IdleDuration returns 0 for nil
+	if idle := nilConn.IdleDuration(); idle != 0 {
+		t.Errorf("nil.IdleDuration() = %v, want 0", idle)
+	}
+
+	// BytesRead returns 0 for nil
+	if br := nilConn.BytesRead(); br != 0 {
+		t.Errorf("nil.BytesRead() = %d, want 0", br)
+	}
+
+	// BytesWritten returns 0 for nil
+	if bw := nilConn.BytesWritten(); bw != 0 {
+		t.Errorf("nil.BytesWritten() = %d, want 0", bw)
+	}
+
+	// PendingBytes returns 0 for nil
+	if pb := nilConn.PendingBytes(); pb != 0 {
+		t.Errorf("nil.PendingBytes() = %d, want 0", pb)
+	}
+
+	// CreatedAt returns zero time for nil
+	if ca := nilConn.CreatedAt(); !ca.IsZero() {
+		t.Errorf("nil.CreatedAt() = %v, want zero time", ca)
+	}
+
+	// LastActivity returns zero time for nil
+	if la := nilConn.LastActivity(); !la.IsZero() {
+		t.Errorf("nil.LastActivity() = %v, want zero time", la)
+	}
+
+	// Unwrap returns nil for nil
+	if uw := nilConn.Unwrap(); uw != nil {
+		t.Errorf("nil.Unwrap() = %v, want nil", uw)
+	}
+
+	// Close returns nil error for nil
+	if err := nilConn.Close(); err != nil {
+		t.Errorf("nil.Close() = %v, want nil", err)
+	}
+
+	// Stats returns zero Stats with Closed=true for nil
+	stats := nilConn.Stats()
+	if stats.ID != 0 {
+		t.Errorf("nil.Stats().ID = %d, want 0", stats.ID)
+	}
+	if stats.Tag != "" {
+		t.Errorf("nil.Stats().Tag = %q, want empty", stats.Tag)
+	}
+	if !stats.Closed {
+		t.Error("nil.Stats().Closed = false, want true")
+	}
+}

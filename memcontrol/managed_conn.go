@@ -10,12 +10,15 @@ import (
 
 var (
 	connIDGen atomic.Uint64
-	// disabled is set once at init if UTLS_DISABLE_MANAGED_CONN=1
+	// disabled is set once at init via env var
 	disabled bool
 )
 
 func init() {
-	disabled = os.Getenv("UTLS_DISABLE_MANAGED_CONN") == "1"
+	// Support REALITY_*, XRAY_*, and UTLS_* prefixes for compatibility
+	disabled = os.Getenv("REALITY_DISABLE_MANAGED_CONN") == "1" ||
+		os.Getenv("XRAY_DISABLE_MANAGED_CONN") == "1" ||
+		os.Getenv("UTLS_DISABLE_MANAGED_CONN") == "1"
 }
 
 // Conn wraps net.Conn with tracking for memory-aware management.
@@ -39,10 +42,10 @@ type Conn struct {
 }
 
 // Wrap wraps a net.Conn with tracking and registers it.
-// The tag identifies the inbound source (e.g., "reality-in", "reality-fallback").
+// The tag identifies the inbound source (e.g., "tls-in", "tls-fallback").
 // Returns nil only if conn is nil.
-// If disabled via UTLS_DISABLE_MANAGED_CONN=1, returns nil (caller should
-// use WrapOrPassthrough for transparent fallback to unwrapped conn).
+// If disabled via env var (REALITY_*, XRAY_*, or UTLS_DISABLE_MANAGED_CONN=1),
+// returns nil (caller should use WrapOrPassthrough for transparent fallback).
 func Wrap(conn net.Conn, tag string) *Conn {
 	if conn == nil {
 		return nil
@@ -98,8 +101,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 }
 
 // Close implements net.Conn.Close with cleanup.
-// Safe to call multiple times.
+// Safe to call multiple times. Safe to call on nil receiver.
 func (c *Conn) Close() error {
+	if c == nil {
+		return nil
+	}
 	var err error
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
@@ -110,27 +116,47 @@ func (c *Conn) Close() error {
 }
 
 // ID returns the unique connection identifier.
+// Returns 0 if receiver is nil.
 func (c *Conn) ID() uint64 {
+	if c == nil {
+		return 0
+	}
 	return c.id
 }
 
 // Tag returns the inbound tag.
+// Returns empty string if receiver is nil.
 func (c *Conn) Tag() string {
+	if c == nil {
+		return ""
+	}
 	return c.tag
 }
 
 // CreatedAt returns when the connection was created.
+// Returns zero time if receiver is nil.
 func (c *Conn) CreatedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
 	return time.Unix(0, c.createdAt)
 }
 
 // Age returns how long the connection has existed.
+// Returns 0 if receiver is nil.
 func (c *Conn) Age() time.Duration {
+	if c == nil {
+		return 0
+	}
 	return time.Since(c.CreatedAt())
 }
 
 // LastActivity returns the most recent read or write time.
+// Returns zero time if receiver is nil.
 func (c *Conn) LastActivity() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
 	lastRead := c.lastReadAt.Load()
 	lastWrite := c.lastWriteAt.Load()
 
@@ -142,34 +168,58 @@ func (c *Conn) LastActivity() time.Time {
 }
 
 // IdleDuration returns how long since last activity.
+// Returns 0 if receiver is nil.
 func (c *Conn) IdleDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
 	return time.Since(c.LastActivity())
 }
 
 // BytesRead returns total bytes read.
+// Returns 0 if receiver is nil.
 func (c *Conn) BytesRead() uint64 {
+	if c == nil {
+		return 0
+	}
 	return c.bytesRead.Load()
 }
 
 // BytesWritten returns total bytes written.
+// Returns 0 if receiver is nil.
 func (c *Conn) BytesWritten() uint64 {
+	if c == nil {
+		return 0
+	}
 	return c.bytesWritten.Load()
 }
 
 // PendingBytes returns bytes waiting to be written.
 // High values indicate a slow reader on the other end.
+// Returns 0 if receiver is nil.
 func (c *Conn) PendingBytes() int64 {
+	if c == nil {
+		return 0
+	}
 	return c.pendingWrite.Load()
 }
 
 // IsClosed returns whether the connection has been closed.
+// Returns true if receiver is nil (nil connection is considered closed).
 func (c *Conn) IsClosed() bool {
+	if c == nil {
+		return true
+	}
 	return c.closed.Load()
 }
 
 // Unwrap returns the underlying net.Conn.
 // This allows type assertions on the wrapped connection to succeed.
+// Returns nil if receiver is nil.
 func (c *Conn) Unwrap() net.Conn {
+	if c == nil {
+		return nil
+	}
 	return c.Conn
 }
 
@@ -209,7 +259,11 @@ type Stats struct {
 }
 
 // Stats returns a snapshot of connection statistics.
+// Returns zero Stats with Closed=true if receiver is nil.
 func (c *Conn) Stats() Stats {
+	if c == nil {
+		return Stats{Closed: true}
+	}
 	return Stats{
 		ID:           c.id,
 		Tag:          c.tag,

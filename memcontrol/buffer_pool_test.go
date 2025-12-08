@@ -230,6 +230,9 @@ func TestPutBufferPollutionRejection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBuffer(%d) returned error: %v", Size4KB, err)
 	}
+	if buf == nil {
+		t.Fatal("GetBuffer returned nil buffer without error")
+	}
 
 	// Simulate buffer growth via append (creates new backing array)
 	largeData := make([]byte, Size8KB)
@@ -473,6 +476,9 @@ func TestBufferPoolExhausted(t *testing.T) {
 
 	// Set very small limits for testing
 	budget := GetBudget()
+	if budget == nil {
+		t.Fatal("GetBudget returned nil")
+	}
 	originalSoft := budget.softLimit.Load()
 	originalHard := budget.hardLimit.Load()
 	originalTotal := budget.totalBytes.Load()
@@ -524,6 +530,9 @@ func TestBufferPoolExhausted(t *testing.T) {
 // TestTryAllocateHardLimit verifies TryAllocate respects hard limit
 func TestTryAllocateHardLimit(t *testing.T) {
 	budget := GetBudget()
+	if budget == nil {
+		t.Fatal("GetBudget returned nil")
+	}
 	originalSoft := budget.softLimit.Load()
 	originalHard := budget.hardLimit.Load()
 	originalTotal := budget.totalBytes.Load()

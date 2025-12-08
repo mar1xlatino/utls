@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 )
 
-// Config contains memory limits for uTLS connections.
-// uTLS is lightweight - typically needs 5-20MB for TLS handshakes.
+// Config contains memory limits for TLS connections.
+// Lightweight - typically needs 5-20MB for TLS handshakes.
 type Config struct {
 	// SoftLimit triggers cache eviction (stop caching returned buffers)
 	SoftLimit int64
@@ -24,7 +24,7 @@ type Config struct {
 	Disabled bool
 }
 
-// DefaultConfig returns conservative defaults for uTLS.
+// DefaultConfig returns conservative defaults.
 // Uses 5MB soft / 8MB hard - suitable for constrained systems.
 // DEPRECATED: Use ClientConfig() or ServerConfig() instead.
 func DefaultConfig() Config {
@@ -91,8 +91,8 @@ func LargeServerConfig() Config {
 	}
 }
 
-// ConfigureMemory configures uTLS's memory limits.
-// This is the primary integration point for applications to set uTLS's budget.
+// ConfigureMemory configures memory limits.
+// This is the primary integration point for applications.
 //
 // Example usage:
 //
@@ -102,13 +102,13 @@ func LargeServerConfig() Config {
 //	})
 //
 // Typical allocations:
-//   - Small system (64MB RAM):  uTLS gets 5-8MB
-//   - Medium system (512MB RAM): uTLS gets 20-32MB
-//   - Server (4GB+ RAM):         uTLS gets 48-96MB
+//   - Small system (64MB RAM):  5-10MB
+//   - Medium system (512MB RAM): 20-32MB
+//   - Server (4GB+ RAM):         48-96MB
 func ConfigureMemory(cfg Config) {
 	// Defensive: Ensure globalMemoryBudget is initialized (should be done by init())
 	if globalMemoryBudget == nil {
-		panic("tls: memory budget not initialized")
+		panic("memcontrol: globalMemoryBudget not initialized - init() failed")
 	}
 
 	if cfg.Disabled {
@@ -177,7 +177,7 @@ func GetReplayCacheLimit() int {
 //	    memcontrol.GetRegistry().Shed()
 //	})
 func SetEvictionCallback(fn func()) {
-	globalMemoryBudget.SetEvictionCallback(fn)
+	SetGlobalEvictionCallback(fn)
 }
 
 // GetBudgetState returns current memory usage statistics.
@@ -186,7 +186,7 @@ func GetBudgetState() BudgetState {
 	return globalMemoryBudget.State()
 }
 
-// GetMemoryUsage returns current usage in bytes.
+// GetMemoryUsage returns current usage in bytes (for stats APIs).
 func GetMemoryUsage() (total, inUse, cached int64) {
 	state := globalMemoryBudget.State()
 	return state.TotalBytes, state.InUseBytes, state.CachedBytes
@@ -194,34 +194,30 @@ func GetMemoryUsage() (total, inUse, cached int64) {
 
 // IsMemoryPressure returns true if in eviction mode (over soft limit).
 func IsMemoryPressure() bool {
-	return globalMemoryBudget.IsEvicting()
+	return BudgetIsEvicting()
 }
 
 // ============================================================================
 // DOWNSTREAM CONFIGURATION API
 // ============================================================================
-// These functions allow upstream libraries (like REALITY) to configure uTLS's
-// memory budget as part of a chain: Xray-core → REALITY → uTLS
+// These functions allow upstream libraries to configure this package's
+// memory budget as part of a chain: upstream → this library → downstream
 //
-// When REALITY receives memory configuration from Xray-core, it should also
-// configure uTLS using these APIs to maintain coordinated memory management.
+// When an upstream library sets memory configuration, this library receives it
+// and can also pass a portion downstream for coordinated memory management.
 // ============================================================================
 
-// ConfigureFromUpstream configures uTLS's memory budget from an upstream library.
-// This allows REALITY to pass its memory configuration downstream to uTLS.
+// ConfigureFromUpstream configures memory budget from an upstream library.
+// This allows upstream to pass its memory configuration downstream.
 //
-// The upstream library can either:
-//   - Pass its full config (uTLS shares budget with upstream)
-//   - Pass a subset/portion of its budget (uTLS gets dedicated allocation)
-//
-// Example in REALITY:
+// Example:
 //
 //	func ConfigureMemory(cfg MemoryConfig) {
-//	    // Configure REALITY's own memcontrol
+//	    // Configure upstream's own memcontrol
 //	    memcontrol.ConfigureMemory(cfg)
 //
-//	    // Pass downstream to uTLS (share same limits)
-//	    utls_memcontrol.ConfigureFromUpstream(utls_memcontrol.Config{
+//	    // Pass downstream
+//	    downstream_memcontrol.ConfigureFromUpstream(downstream_memcontrol.Config{
 //	        SoftLimit: cfg.SoftLimit,
 //	        HardLimit: cfg.HardLimit,
 //	    })
@@ -232,12 +228,12 @@ func ConfigureFromUpstream(cfg Config) {
 		cfg.SoftLimit/(1024*1024), cfg.HardLimit/(1024*1024))
 }
 
-// ConfigureFromUpstreamWithPortion configures uTLS with a portion of upstream's budget.
-// This is useful when uTLS should have a dedicated slice of the total budget.
+// ConfigureFromUpstreamWithPortion configures with a portion of upstream's budget.
+// This is useful when this library should have a dedicated slice of the total budget.
 //
-// Example: REALITY has 64MB budget, allocates 16MB to uTLS:
+// Example: upstream has 128MB budget, allocates 32MB downstream:
 //
-//	utls_memcontrol.ConfigureFromUpstreamWithPortion(64*MB, 96*MB, 0.25) // 25% = 16MB soft, 24MB hard
+//	downstream_memcontrol.ConfigureFromUpstreamWithPortion(128*MB, 192*MB, 0.25) // 25% = 32MB soft, 48MB hard
 func ConfigureFromUpstreamWithPortion(upstreamSoft, upstreamHard int64, portion float64) {
 	if portion <= 0 || portion > 1 {
 		portion = 0.25 // Default to 25% if invalid
@@ -251,13 +247,13 @@ func ConfigureFromUpstreamWithPortion(upstreamSoft, upstreamHard int64, portion 
 		portion*100, cfg.SoftLimit/(1024*1024), cfg.HardLimit/(1024*1024))
 }
 
-// LinkEvictionCallback links uTLS's eviction to upstream's eviction callback.
-// When uTLS enters eviction mode, it triggers the upstream callback.
+// LinkEvictionCallback links this library's eviction to upstream's eviction callback.
+// When this library enters eviction mode, it triggers the upstream callback.
 //
-// This creates a cascade: uTLS pressure → REALITY pressure → Xray-core shedding
+// This creates a cascade: this library's pressure → upstream shedding
 func LinkEvictionCallback(upstreamCallback func()) {
 	SetEvictionCallback(func() {
-		// First, shed uTLS's own connections
+		// First, shed our own connections
 		GetRegistry().Shed()
 		// Then notify upstream
 		if upstreamCallback != nil {

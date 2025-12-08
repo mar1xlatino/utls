@@ -324,7 +324,7 @@ func GetBuffer(minSize int) (*[]byte, error) {
 	// Uses external budget if set (Xray integration), otherwise internal budget
 	if poolHit {
 		// CACHE HIT: Buffer came from pool (memory already in system)
-		// Just mark it as in-use (moving from cached -> in-use)
+		// Just mark it as in-use (moving from cached → in-use)
 		BudgetRecordHit()
 		BudgetMarkInUse(int64(allocSize))
 	} else {
@@ -681,5 +681,44 @@ func GetPoolStats() PoolStats {
 		Evicted:              stats.evicted.Load(),
 		BufferSizeMapEntries: bufferSizeMapCount.Load(),
 	}
+}
+
+// ClearPoolsForTest drains all sync.Pools and resets statistics.
+// This ensures test isolation - each test starts with empty pools.
+// ONLY call from tests - never from production code.
+//
+// Note: sync.Pool has no "clear" method, so we drain by calling Get()
+// until each pool returns nil. This is O(n) where n is pool size.
+func ClearPoolsForTest() {
+	// Drain all pools
+	for pool128B.Get() != nil {
+	}
+	for pool512B.Get() != nil {
+	}
+	for pool2KB.Get() != nil {
+	}
+	for pool4KB.Get() != nil {
+	}
+	for pool8KB.Get() != nil {
+	}
+	for pool16KB.Get() != nil {
+	}
+
+	// Clear the buffer size tracking map
+	bufferOriginalSizes.Range(func(key, value any) bool {
+		bufferOriginalSizes.Delete(key)
+		return true
+	})
+	bufferSizeMapCount.Store(0)
+
+	// Reset all statistics
+	for i := 0; i < 6; i++ {
+		stats.allocated[i].Store(0)
+		stats.returned[i].Store(0)
+	}
+	stats.oversized.Store(0)
+	stats.polluted.Store(0)
+	stats.orphaned.Store(0)
+	stats.evicted.Store(0)
 }
 
