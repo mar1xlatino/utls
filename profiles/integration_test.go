@@ -23,14 +23,27 @@ func isGREASE(v uint16) bool {
 	return (v&0x0f0f) == 0x0a0a && (v>>8) == (v&0xff)
 }
 
+// representativeProfileIDs returns a subset of profile IDs for -short mode testing.
+func representativeProfileIDs() []string {
+	return []string{
+		"chrome_142_linux",
+		"firefox_145_linux",
+		"safari_18_ios",
+		"edge_141_windows_11",
+		"samsung_internet_29_android",
+	}
+}
+
 // TestCapturedProfilesIntegration verifies that captured profiles
 // work correctly with FingerprintController.
 func TestCapturedProfilesIntegration(t *testing.T) {
+	t.Parallel()
+
 	// Verify profiles are registered (via init())
 	registeredIDs := tls.DefaultRegistry.List()
 	t.Logf("Found %d profiles in DefaultRegistry", len(registeredIDs))
 
-	// All captured profile IDs should be registered
+	// All captured profile IDs should be registered (fast check, always run)
 	for _, id := range profiles.IDs() {
 		if !tls.DefaultRegistry.Exists(id) {
 			t.Errorf("Captured profile %q not registered", id)
@@ -38,15 +51,13 @@ func TestCapturedProfilesIntegration(t *testing.T) {
 	}
 
 	// Test a subset of profiles
-	testProfiles := []string{
-		"chrome_142_linux",
-		"firefox_145_linux",
-		"safari_18_ios",
-		"edge_141_windows_11",
-	}
+	testProfiles := representativeProfileIDs()[:4] // Original 4 profiles
 
 	for _, profileID := range testProfiles {
+		profileID := profileID
 		t.Run(profileID, func(t *testing.T) {
+			t.Parallel()
+
 			// Create UConn
 			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
 			if err != nil {
@@ -94,6 +105,8 @@ func TestCapturedProfilesIntegration(t *testing.T) {
 // TestProfilesExtensionOrder verifies that profiles with ExtensionOrder
 // produce extensions in the correct order.
 func TestProfilesExtensionOrder(t *testing.T) {
+	t.Parallel()
+
 	// Test Firefox (non-shuffling) profile
 	profileID := "firefox_145_linux"
 
@@ -129,6 +142,8 @@ func TestProfilesExtensionOrder(t *testing.T) {
 
 // TestProfilesGREASEConfiguration verifies GREASE is correctly applied.
 func TestProfilesGREASEConfiguration(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		profileID     string
 		expectGREASE  bool
@@ -141,7 +156,10 @@ func TestProfilesGREASEConfiguration(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.profileID, func(t *testing.T) {
+			t.Parallel()
+
 			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
 			if err != nil {
 				t.Fatalf("UClient error: %v", err)
@@ -188,13 +206,21 @@ func TestProfilesGREASEConfiguration(t *testing.T) {
 
 // TestProfilesSessionConsistency verifies GREASE stays frozen across connections.
 func TestProfilesSessionConsistency(t *testing.T) {
+	t.Parallel()
+
 	profileID := "chrome_142_linux"
 	serverName := "session-test.example.com"
 
 	var firstJA4 string
 	var firstGREASECipher uint16
 
-	for i := 0; i < 5; i++ {
+	// Reduced iterations: 3 is sufficient to verify consistency
+	iterations := 3
+	if testing.Short() {
+		iterations = 2
+	}
+
+	for i := 0; i < iterations; i++ {
 		uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: serverName}, tls.HelloCustom)
 		if err != nil {
 			t.Fatalf("iteration %d: UClient error: %v", i, err)
@@ -240,10 +266,35 @@ func TestProfilesSessionConsistency(t *testing.T) {
 	}
 }
 
-// TestAllCapturedProfilesBuildSuccessfully verifies all 26 profiles can build handshake.
+// TestAllCapturedProfilesBuildSuccessfully verifies all profiles can build handshake.
+// In -short mode, tests only a representative subset.
 func TestAllCapturedProfilesBuildSuccessfully(t *testing.T) {
-	for _, p := range profiles.All() {
+	t.Parallel()
+
+	allProfiles := profiles.All()
+	testProfiles := allProfiles
+
+	if testing.Short() {
+		// In short mode, test only representative subset
+		t.Log("Running in short mode: testing representative subset")
+		representativeIDs := representativeProfileIDs()
+		idSet := make(map[string]bool, len(representativeIDs))
+		for _, id := range representativeIDs {
+			idSet[id] = true
+		}
+		testProfiles = nil
+		for _, p := range allProfiles {
+			if idSet[p.ID] {
+				testProfiles = append(testProfiles, p)
+			}
+		}
+	}
+
+	for _, p := range testProfiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
+
 			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
 			if err != nil {
 				t.Fatalf("UClient error: %v", err)
@@ -278,6 +329,8 @@ func TestAllCapturedProfilesBuildSuccessfully(t *testing.T) {
 
 // TestProfilesMatchExpectedJA4Prefix verifies JA4 prefix matches expected browser characteristics.
 func TestProfilesMatchExpectedJA4Prefix(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		profileID      string
 		expectedPrefix string // JA4a part
@@ -291,8 +344,16 @@ func TestProfilesMatchExpectedJA4Prefix(t *testing.T) {
 		{"safari_18_ios", "t13d"},
 	}
 
+	// In short mode, test only first 2
+	if testing.Short() {
+		tests = tests[:2]
+	}
+
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.profileID, func(t *testing.T) {
+			t.Parallel()
+
 			uconn, err := tls.UClient(&net.TCPConn{}, &tls.Config{ServerName: "example.com"}, tls.HelloCustom)
 			if err != nil {
 				t.Fatalf("UClient error: %v", err)

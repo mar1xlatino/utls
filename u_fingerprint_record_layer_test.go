@@ -77,7 +77,8 @@ func TestRandomPaddingStrategy_Pad_NegativeMaxPad(t *testing.T) {
 func TestRandomPaddingStrategy_Pad_ReturnsValueInRange(t *testing.T) {
 	s := &RandomPaddingStrategy{MaxPad: 100}
 
-	for i := 0; i < 1000; i++ {
+	iterations := shortModeIterations(1000, 100)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(1000, 16384)
 		if result < 0 || result > 100 {
 			t.Errorf("iteration %d: RandomPaddingStrategy.Pad returned %d, want [0, 100]", i, result)
@@ -90,7 +91,8 @@ func TestRandomPaddingStrategy_Pad_RespectsAvailableSpace(t *testing.T) {
 	s := &RandomPaddingStrategy{MaxPad: 1000}
 
 	// Only 50 bytes available
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(16334, 16384)
 		if result > 50 {
 			t.Errorf("iteration %d: padding %d exceeds available space 50", i, result)
@@ -103,7 +105,8 @@ func TestRandomPaddingStrategy_Pad_RespectsAvailableSpace(t *testing.T) {
 func TestRandomPaddingStrategy_Pad_OverflowPrevention_MaxPadCapped(t *testing.T) {
 	s := &RandomPaddingStrategy{MaxPad: 70000}
 
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(0, 100000)
 		// Should be capped at 65534
 		if result > 65534 {
@@ -268,7 +271,8 @@ func TestExponentialPaddingStrategy_Pad_DefaultLambda(t *testing.T) {
 	s := &ExponentialPaddingStrategy{Lambda: 0}
 	// With lambda=0, it should default to 3.0
 	// Just verify it doesn't panic and returns reasonable values
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(0, 16384)
 		if result < 0 || result > 16384 {
 			t.Errorf("iteration %d: ExponentialPaddingStrategy.Pad returned %d, want [0, 16384]", i, result)
@@ -280,7 +284,8 @@ func TestExponentialPaddingStrategy_Pad_DefaultLambda(t *testing.T) {
 func TestExponentialPaddingStrategy_Pad_NegativeLambda(t *testing.T) {
 	s := &ExponentialPaddingStrategy{Lambda: -5.0}
 	// Should default to 3.0
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(0, 16384)
 		if result < 0 || result > 16384 {
 			t.Errorf("iteration %d: ExponentialPaddingStrategy.Pad returned %d, want [0, 16384]", i, result)
@@ -314,7 +319,8 @@ func TestExponentialPaddingStrategy_Pad_ReasonableValues(t *testing.T) {
 func TestExponentialPaddingStrategy_Pad_RespectsMaxSize(t *testing.T) {
 	s := &ExponentialPaddingStrategy{Lambda: 1.0}
 
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(16380, 16384)
 		if result > 4 {
 			t.Errorf("iteration %d: padding %d exceeds available space 4", i, result)
@@ -360,7 +366,8 @@ func TestChromePaddingStrategy_Pad_SmallRecords_NoPadding(t *testing.T) {
 func TestChromePaddingStrategy_Pad_LargerRecords_CappedAt255(t *testing.T) {
 	s := &ChromePaddingStrategy{}
 
-	for i := 0; i < 1000; i++ {
+	iterations := shortModeIterations(1000, 100)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(1000, 16384)
 		if result > 255 {
 			t.Errorf("iteration %d: ChromePaddingStrategy.Pad returned %d, want <= 255", i, result)
@@ -376,7 +383,8 @@ func TestChromePaddingStrategy_Pad_RespectsAvailableSpace(t *testing.T) {
 	s := &ChromePaddingStrategy{}
 
 	// Only 50 bytes available, but dataLen >= 256 to trigger padding
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		result := s.Pad(16334, 16384)
 		if result > 50 {
 			t.Errorf("iteration %d: padding %d exceeds available space 50", i, result)
@@ -728,7 +736,8 @@ func TestRecordTimingController_SetJitter_AtomicStore(t *testing.T) {
 
 	// Get multiple delays and verify they vary
 	delays := make(map[time.Duration]bool)
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		d := ctrl.GetDelay()
 		delays[d] = true
 		// Delay should be in [10ms, 15ms)
@@ -753,7 +762,8 @@ func TestRecordTimingController_GetDelay_IncludesJitter(t *testing.T) {
 	min := 100 * time.Millisecond
 	max := 150 * time.Millisecond
 
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		d := ctrl.GetDelay()
 		if d < min || d >= max {
 			t.Errorf("iteration %d: delay %v outside [%v, %v)", i, d, min, max)
@@ -826,7 +836,8 @@ func TestRecordTimingController_ZeroBaseDelay(t *testing.T) {
 	ctrl.SetBurstSize(0)
 
 	// With zero base delay and jitter, delay should be in [0, 10ms)
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		d := ctrl.GetDelay()
 		if d < 0 || d >= 10*time.Millisecond {
 			t.Errorf("iteration %d: delay %v outside [0, 10ms)", i, d)
@@ -842,7 +853,8 @@ func TestRecordTimingController_ZeroJitter(t *testing.T) {
 	ctrl.SetBurstSize(0)
 
 	// All delays should be exactly 50ms
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		d := ctrl.GetDelay()
 		if d != 50*time.Millisecond {
 			t.Errorf("iteration %d: delay %v, want 50ms", i, d)

@@ -16,7 +16,8 @@ func TestRecordPaddingConfig_GenerateUniform(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 1000; i++ {
+	iterations := shortModeIterations(1000, 100)
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 10 || padding > 50 {
 			t.Errorf("Uniform padding out of range: got %d, want [10, 50]", padding)
@@ -35,7 +36,7 @@ func TestRecordPaddingConfig_GenerateChrome(t *testing.T) {
 
 	// Collect distribution statistics
 	var total int64
-	const iterations = 10000
+	iterations := shortModeIterations(10000, 1000)
 	belowMean := 0
 	aboveHigh := 0
 
@@ -55,13 +56,13 @@ func TestRecordPaddingConfig_GenerateChrome(t *testing.T) {
 
 	// Chrome-like distribution should have mean around 72 for lambda=3.0
 	// Allow wider tolerance for statistical variation
-	mean := float64(total) / float64(iterations)
+	mean := float64(total) / float64(int64(iterations))
 	if mean < 40 || mean > 120 {
 		t.Errorf("Chrome padding mean unexpected: got %.2f, expected around 72", mean)
 	}
 
 	// Majority should be below mean (exponential distribution skews low)
-	belowMeanPct := float64(belowMean) / float64(iterations) * 100
+	belowMeanPct := float64(belowMean) / float64(int64(iterations)) * 100
 	if belowMeanPct < 50 {
 		t.Errorf("Chrome distribution not skewed low enough: %.1f%% below 85", belowMeanPct)
 	}
@@ -76,7 +77,8 @@ func TestRecordPaddingConfig_GenerateExponential(t *testing.T) {
 		Lambda:       1.0,
 	}
 
-	for i := 0; i < 1000; i++ {
+	iterations := shortModeIterations(1000, 100)
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 255 {
 			t.Errorf("Exponential padding out of range: got %d, want [0, 255]", padding)
@@ -92,7 +94,8 @@ func TestRecordPaddingConfig_Disabled(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding != 0 {
 			t.Errorf("Disabled padding should return 0, got %d", padding)
@@ -116,7 +119,8 @@ func TestRecordPaddingConfig_EqualMinMax(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding != 42 {
 			t.Errorf("Equal min/max should always return that value, got %d", padding)
@@ -144,7 +148,8 @@ func TestDefaultRecordPaddingConfig(t *testing.T) {
 	}
 
 	// Verify it generates valid padding
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 255 {
 			t.Errorf("Default config padding out of range: got %d", padding)
@@ -209,6 +214,8 @@ func TestClampPaddingToRecordLimit(t *testing.T) {
 }
 
 func TestRecordPaddingConfig_InvalidValues(t *testing.T) {
+	iterations := shortModeIterations(100, 20)
+
 	// Test with negative values
 	config := &RecordPaddingConfig{
 		Enabled:      true,
@@ -217,7 +224,7 @@ func TestRecordPaddingConfig_InvalidValues(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 50 {
 			t.Errorf("Negative min should be clamped to 0: got %d", padding)
@@ -232,7 +239,7 @@ func TestRecordPaddingConfig_InvalidValues(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 255 {
 			t.Errorf("Max should be clamped to 255: got %d", padding)
@@ -247,7 +254,7 @@ func TestRecordPaddingConfig_InvalidValues(t *testing.T) {
 		Distribution: "uniform",
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding != 100 {
 			t.Errorf("Inverted min/max should clamp max to min: got %d", padding)
@@ -256,6 +263,8 @@ func TestRecordPaddingConfig_InvalidValues(t *testing.T) {
 }
 
 func TestRecordPaddingConfig_ZeroLambda(t *testing.T) {
+	iterations := shortModeIterations(100, 20)
+
 	// Test that zero lambda defaults properly
 	config := &RecordPaddingConfig{
 		Enabled:      true,
@@ -265,7 +274,7 @@ func TestRecordPaddingConfig_ZeroLambda(t *testing.T) {
 		Lambda:       0, // Should default to 3.0
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 255 {
 			t.Errorf("Zero lambda should use default, got padding: %d", padding)
@@ -274,7 +283,7 @@ func TestRecordPaddingConfig_ZeroLambda(t *testing.T) {
 
 	// Same for exponential
 	config.Distribution = "exponential"
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		padding := config.GeneratePadding()
 		if padding < 0 || padding > 255 {
 			t.Errorf("Zero lambda exponential should use default, got padding: %d", padding)

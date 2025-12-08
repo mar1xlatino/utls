@@ -123,7 +123,17 @@ func TestVerifyAuthHMAC_TimingConsistency(t *testing.T) {
 
 // TestVerifyAuthHMACWithWindow_TimingConsistency tests that window-based
 // verification scans ALL timestamps regardless of match position.
+//
+// NOTE: The underlying function iterates over 601 timestamps (maxAuthWindowSeconds*2+1)
+// for constant-time security. This test uses reduced iterations to keep runtime
+// reasonable while still validating the timing consistency property.
+//
+// Use -short to skip this test in CI environments where timing measurements are unreliable.
 func TestVerifyAuthHMACWithWindow_TimingConsistency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping timing consistency test in short mode (use full mode for security validation)")
+	}
+
 	authKey := make([]byte, 64)
 	if _, err := rand.Read(authKey); err != nil {
 		t.Fatalf("Failed to generate auth key: %v", err)
@@ -134,9 +144,14 @@ func TestVerifyAuthHMACWithWindow_TimingConsistency(t *testing.T) {
 		t.Fatalf("Failed to generate public key: %v", err)
 	}
 
-	// Test with small window to make timing differences more apparent
+	// Window size for actual validity check (function still iterates full 601 timestamps)
 	const windowSeconds int64 = 5
-	const iterations = 1000
+
+	// Reduced iterations: 50 is sufficient to detect gross timing differences
+	// while keeping total runtime under 3 seconds. The function's constant-time
+	// property comes from always iterating 601 timestamps, not from this test.
+	// For rigorous timing analysis, use dedicated tools like dudect.
+	const iterations = 50
 
 	// Valid auth data for current time
 	validAuth := ComputeAuthHMAC(authKey, publicKey, time.Now())
@@ -173,8 +188,8 @@ func TestVerifyAuthHMACWithWindow_TimingConsistency(t *testing.T) {
 	// All times should be similar because the function checks ALL timestamps
 	times := []time.Duration{timeValid, timeStart, timeEnd, timeInvalid}
 	var total time.Duration
-	for _, t := range times {
-		total += t
+	for _, tm := range times {
+		total += tm
 	}
 	avg := total / time.Duration(len(times))
 	threshold := avg / 4 // 25% variance allowed

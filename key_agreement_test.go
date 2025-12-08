@@ -1196,7 +1196,15 @@ func TestX25519Iteration(t *testing.T) {
 // - dIUT: Implementation Under Test's private key (scalar)
 // - QCAVSx, QCAVSy: CAVS (peer) public key X and Y coordinates
 // - ZIUT: Expected shared secret (X coordinate of the resulting point)
+//
+// Optimization notes:
+// - Uses t.Parallel() for independent test cases to reduce wall-clock time
+// - In short mode (-short), runs only first 2 vectors for fast CI
+// - Full test suite (all vectors) runs when -short is NOT set
 func TestP256NISTCAVS(t *testing.T) {
+	t.Parallel() // Allow parallel execution with other tests
+
+	// Full NIST CAVS P-256 test vectors from KAS_ECC_CDH_PrimitiveTest.txt
 	vectors := []struct {
 		name   string
 		dIUT   string // Private key (hex, 32 bytes)
@@ -1241,8 +1249,22 @@ func TestP256NISTCAVS(t *testing.T) {
 		},
 	}
 
-	for _, tc := range vectors {
+	// Determine which vectors to run based on -short flag
+	// Short mode: sample of 2 vectors for fast CI
+	// Normal mode (no -short): full test suite
+	testVectors := vectors
+	if testing.Short() {
+		const shortModeVectorCount = 2
+		if len(vectors) > shortModeVectorCount {
+			testVectors = vectors[:shortModeVectorCount]
+		}
+	}
+
+	for _, tc := range testVectors {
+		tc := tc // Capture range variable for parallel execution
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // Run subtests in parallel
+
 			// Parse private key
 			dIUT := mustHex(tc.dIUT)
 			privKey, err := ecdh.P256().NewPrivateKey(dIUT)
@@ -1283,6 +1305,8 @@ func TestP256NISTCAVS(t *testing.T) {
 // Source: https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program
 // File: ecccdhtestvectors.zip - KAS_ECC_CDH_PrimitiveTest.txt
 func TestP384NISTCAVS(t *testing.T) {
+	t.Parallel() // Allow this test to run in parallel with other tests
+
 	vectors := []struct {
 		name   string
 		dIUT   string // Private key (hex, 48 bytes)
@@ -1306,8 +1330,15 @@ func TestP384NISTCAVS(t *testing.T) {
 		},
 	}
 
+	// In short mode, run only first vector for quick validation
+	if testing.Short() {
+		vectors = vectors[:1]
+	}
+
 	for _, tc := range vectors {
+		tc := tc // capture range variable for parallel execution
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // Run test vectors in parallel
 			// Parse private key
 			dIUT := mustHex(tc.dIUT)
 			privKey, err := ecdh.P384().NewPrivateKey(dIUT)
@@ -1351,6 +1382,8 @@ func TestP384NISTCAVS(t *testing.T) {
 // Note: P-521 coordinates are 66 bytes (521 bits rounded up to 528 bits = 66 bytes).
 // NIST test vectors use variable-length hex encoding, so we must pad to fixed size.
 func TestP521NISTCAVS(t *testing.T) {
+	t.Parallel() // Allow this test to run in parallel with other tests
+
 	// Helper to pad hex-decoded bytes to required size (big-endian padding with leading zeros)
 	padToSize := func(data []byte, size int) []byte {
 		if len(data) >= size {
@@ -1386,8 +1419,15 @@ func TestP521NISTCAVS(t *testing.T) {
 		},
 	}
 
+	// In short mode, run only first vector for quick validation
+	if testing.Short() {
+		vectors = vectors[:1]
+	}
+
 	for _, tc := range vectors {
+		tc := tc // capture range variable for parallel execution
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel() // Run test vectors in parallel
 			// Parse and pad private key to exactly 66 bytes for P-521
 			dIUT := padToSize(mustHex(tc.dIUT), 66)
 

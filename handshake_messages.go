@@ -318,17 +318,32 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		}
 	}
 	// [uTLS SECTION BEGIN]
-	// reorder OuterExtensions according to their order in the spec
+	// Reorder OuterExtensions according to their order in the outer ClientHello spec.
+	// The ech_outer_extensions must list extensions in the same order they appear in
+	// the outer ClientHello for proper server-side decompression.
+	// CRITICAL: All extensions in echOuterExts must remain - we reorder but never drop.
 	if echInner && outerExts != nil {
-		echOuterExtsReordered := slices.Collect(func(yield func(uint16) bool) {
-			for _, ext := range outerExts {
-				if slices.Contains(echOuterExts, ext) {
-					if !yield(ext) {
-						return
-					}
-				}
+		// Create reordered list following outer's order
+		echOuterExtsReordered := make([]uint16, 0, len(echOuterExts))
+		seen := make(map[uint16]bool)
+
+		// First pass: add extensions in outer's order
+		for _, ext := range outerExts {
+			if slices.Contains(echOuterExts, ext) && !seen[ext] {
+				echOuterExtsReordered = append(echOuterExtsReordered, ext)
+				seen[ext] = true
 			}
-		})
+		}
+
+		// Second pass: add any remaining extensions that weren't in outerExts
+		// This ensures we never drop extensions from echOuterExts
+		for _, ext := range echOuterExts {
+			if !seen[ext] {
+				echOuterExtsReordered = append(echOuterExtsReordered, ext)
+				seen[ext] = true
+			}
+		}
+
 		echOuterExts = echOuterExtsReordered
 	}
 	// [uTLS SECTION END]

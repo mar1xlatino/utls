@@ -21,8 +21,10 @@ func mustHex(s string) []byte {
 }
 
 // TestDeterministicKeyGeneration tests that using a fixed ephemeral key produces
-// consistent results and that sender/recipient derive the same keys
+// consistent results and that sender/recipient derive the same keys.
+// NOTE: This test modifies testingOnlyGenerateKey global, so it cannot run in parallel.
 func TestDeterministicKeyGeneration(t *testing.T) {
+
 	// Fixed test keys
 	skRm := mustHex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8")
 	skEm := mustHex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736")
@@ -98,6 +100,8 @@ func TestDeterministicKeyGeneration(t *testing.T) {
 
 // Test encryption/decryption round-trip
 func TestSealOpen(t *testing.T) {
+	t.Parallel()
+
 	// Generate a random recipient key pair
 	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -162,6 +166,8 @@ func TestSealOpen(t *testing.T) {
 
 // Test with different AEAD algorithms
 func TestDifferentAEADs(t *testing.T) {
+	t.Parallel()
+
 	aeads := []struct {
 		name   string
 		aeadID uint16
@@ -173,6 +179,8 @@ func TestDifferentAEADs(t *testing.T) {
 
 	for _, aead := range aeads {
 		t.Run(aead.name, func(t *testing.T) {
+			t.Parallel()
+
 			recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 			if err != nil {
 				t.Fatalf("GenerateKey failed: %v", err)
@@ -205,14 +213,14 @@ func TestDifferentAEADs(t *testing.T) {
 			}
 
 			plaintext := []byte("Hello, HPKE!")
-			aad := []byte("additional authenticated data")
+			aadData := []byte("additional authenticated data")
 
-			ciphertext, err := sender.Seal(aad, plaintext)
+			ciphertext, err := sender.Seal(aadData, plaintext)
 			if err != nil {
 				t.Fatalf("Seal failed: %v", err)
 			}
 
-			decrypted, err := recipient.Open(aad, ciphertext)
+			decrypted, err := recipient.Open(aadData, ciphertext)
 			if err != nil {
 				t.Fatalf("Open failed: %v", err)
 			}
@@ -224,8 +232,10 @@ func TestDifferentAEADs(t *testing.T) {
 	}
 }
 
-// Test authentication failure with wrong AAD
-func TestOpenWrongAAD(t *testing.T) {
+// TestAuthenticationFailures tests authentication failures with wrong AAD and modified ciphertext
+func TestAuthenticationFailures(t *testing.T) {
+	t.Parallel()
+
 	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -257,203 +267,181 @@ func TestOpenWrongAAD(t *testing.T) {
 		t.Fatalf("SetupRecipient failed: %v", err)
 	}
 
-	plaintext := []byte("secret message")
-	aad := []byte("correct aad")
+	t.Run("WrongAAD", func(t *testing.T) {
+		plaintext := []byte("secret message")
+		aad := []byte("correct aad")
 
-	ciphertext, err := sender.Seal(aad, plaintext)
-	if err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
+		ciphertext, err := sender.Seal(aad, plaintext)
+		if err != nil {
+			t.Fatalf("Seal failed: %v", err)
+		}
 
-	// Try to open with wrong AAD
-	_, err = recipient.Open([]byte("wrong aad"), ciphertext)
-	if err == nil {
-		t.Error("Expected error when opening with wrong AAD, got nil")
-	}
+		// Try to open with wrong AAD
+		_, err = recipient.Open([]byte("wrong aad"), ciphertext)
+		if err == nil {
+			t.Error("Expected error when opening with wrong AAD, got nil")
+		}
+	})
+
+	t.Run("ModifiedCiphertext", func(t *testing.T) {
+		plaintext := []byte("secret message")
+		aad := []byte("aad")
+
+		ciphertext, err := sender.Seal(aad, plaintext)
+		if err != nil {
+			t.Fatalf("Seal failed: %v", err)
+		}
+
+		// Modify ciphertext
+		modified := make([]byte, len(ciphertext))
+		copy(modified, ciphertext)
+		modified[0] ^= 0xff
+
+		_, err = recipient.Open(aad, modified)
+		if err == nil {
+			t.Error("Expected error when opening modified ciphertext, got nil")
+		}
+	})
 }
 
-// Test authentication failure with modified ciphertext
-func TestOpenModifiedCiphertext(t *testing.T) {
-	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey failed: %v", err)
-	}
-	recipientPub := recipientPriv.PublicKey()
+// TestUnsupportedIDs tests error handling for unsupported KEM/KDF/AEAD IDs
+func TestUnsupportedIDs(t *testing.T) {
+	t.Parallel()
 
-	info := []byte("test info")
+	t.Run("UnsupportedKEM", func(t *testing.T) {
+		t.Parallel()
+		key := make([]byte, 32)
+		_, err := ParseHPKEPublicKey(0xFFFF, key)
+		if err == nil {
+			t.Error("Expected error for unsupported KEM ID")
+		}
 
-	enc, sender, err := SetupSender(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		AEAD_AES_128_GCM,
-		recipientPub,
-		info,
-	)
-	if err != nil {
-		t.Fatalf("SetupSender failed: %v", err)
-	}
+		_, err = ParseHPKEPrivateKey(0xFFFF, key)
+		if err == nil {
+			t.Error("Expected error for unsupported KEM ID")
+		}
+	})
 
-	recipient, err := SetupRecipient(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		AEAD_AES_128_GCM,
-		recipientPriv,
-		info,
-		enc,
-	)
-	if err != nil {
-		t.Fatalf("SetupRecipient failed: %v", err)
-	}
+	t.Run("UnsupportedKDF", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		recipientPub := recipientPriv.PublicKey()
 
-	plaintext := []byte("secret message")
-	aad := []byte("aad")
+		_, _, err = SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			0xFFFF, // Invalid KDF ID
+			AEAD_AES_128_GCM,
+			recipientPub,
+			nil,
+		)
+		if err == nil {
+			t.Error("Expected error for unsupported KDF ID")
+		}
+	})
 
-	ciphertext, err := sender.Seal(aad, plaintext)
-	if err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
+	t.Run("UnsupportedAEAD", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		recipientPub := recipientPriv.PublicKey()
 
-	// Modify ciphertext
-	modified := make([]byte, len(ciphertext))
-	copy(modified, ciphertext)
-	modified[0] ^= 0xff
-
-	_, err = recipient.Open(aad, modified)
-	if err == nil {
-		t.Error("Expected error when opening modified ciphertext, got nil")
-	}
+		_, _, err = SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			0xFFFF, // Invalid AEAD ID
+			recipientPub,
+			nil,
+		)
+		if err == nil {
+			t.Error("Expected error for unsupported AEAD ID")
+		}
+	})
 }
 
-// Test unsupported KEM ID
-func TestUnsupportedKEM(t *testing.T) {
-	key := make([]byte, 32)
-	_, err := ParseHPKEPublicKey(0xFFFF, key)
-	if err == nil {
-		t.Error("Expected error for unsupported KEM ID")
-	}
+// TestUint128Operations tests uint128 arithmetic
+func TestUint128Operations(t *testing.T) {
+	t.Parallel()
 
-	_, err = ParseHPKEPrivateKey(0xFFFF, key)
-	if err == nil {
-		t.Error("Expected error for unsupported KEM ID")
-	}
-}
+	t.Run("AddOne", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name   string
+			input  uint128
+			expect uint128
+		}{
+			{"zero", uint128{0, 0}, uint128{0, 1}},
+			{"one", uint128{0, 1}, uint128{0, 2}},
+			{"carry", uint128{0, ^uint64(0)}, uint128{1, 0}},
+			{"max lo", uint128{1, ^uint64(0)}, uint128{2, 0}},
+			{"large", uint128{100, 200}, uint128{100, 201}},
+		}
 
-// Test unsupported KDF ID
-func TestUnsupportedKDF(t *testing.T) {
-	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey failed: %v", err)
-	}
-	recipientPub := recipientPriv.PublicKey()
-
-	_, _, err = SetupSender(
-		DHKEM_X25519_HKDF_SHA256,
-		0xFFFF, // Invalid KDF ID
-		AEAD_AES_128_GCM,
-		recipientPub,
-		nil,
-	)
-	if err == nil {
-		t.Error("Expected error for unsupported KDF ID")
-	}
-}
-
-// Test unsupported AEAD ID
-func TestUnsupportedAEAD(t *testing.T) {
-	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey failed: %v", err)
-	}
-	recipientPub := recipientPriv.PublicKey()
-
-	_, _, err = SetupSender(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		0xFFFF, // Invalid AEAD ID
-		recipientPub,
-		nil,
-	)
-	if err == nil {
-		t.Error("Expected error for unsupported AEAD ID")
-	}
-}
-
-// Test uint128 operations
-func TestUint128AddOne(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  uint128
-		expect uint128
-	}{
-		{"zero", uint128{0, 0}, uint128{0, 1}},
-		{"one", uint128{0, 1}, uint128{0, 2}},
-		{"carry", uint128{0, ^uint64(0)}, uint128{1, 0}},
-		{"max lo", uint128{1, ^uint64(0)}, uint128{2, 0}},
-		{"large", uint128{100, 200}, uint128{100, 201}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		for _, tt := range tests {
 			result := tt.input.addOne()
 			if result != tt.expect {
-				t.Errorf("addOne() = {%d, %d}, want {%d, %d}",
-					result.hi, result.lo, tt.expect.hi, tt.expect.lo)
+				t.Errorf("%s: addOne() = {%d, %d}, want {%d, %d}",
+					tt.name, result.hi, result.lo, tt.expect.hi, tt.expect.lo)
 			}
-		})
-	}
-}
+		}
+	})
 
-func TestUint128BitLen(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  uint128
-		expect int
-	}{
-		{"zero", uint128{0, 0}, 0},
-		{"one", uint128{0, 1}, 1},
-		{"two", uint128{0, 2}, 2},
-		{"255", uint128{0, 255}, 8},
-		{"256", uint128{0, 256}, 9},
-		{"max lo", uint128{0, ^uint64(0)}, 64},
-		{"hi=1", uint128{1, 0}, 65},
-		{"hi=2", uint128{2, 0}, 66},
-		{"hi=255", uint128{255, 0}, 72},
-		{"hi max", uint128{^uint64(0), ^uint64(0)}, 128},
-	}
+	t.Run("BitLen", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name   string
+			input  uint128
+			expect int
+		}{
+			{"zero", uint128{0, 0}, 0},
+			{"one", uint128{0, 1}, 1},
+			{"two", uint128{0, 2}, 2},
+			{"255", uint128{0, 255}, 8},
+			{"256", uint128{0, 256}, 9},
+			{"max lo", uint128{0, ^uint64(0)}, 64},
+			{"hi=1", uint128{1, 0}, 65},
+			{"hi=2", uint128{2, 0}, 66},
+			{"hi=255", uint128{255, 0}, 72},
+			{"hi max", uint128{^uint64(0), ^uint64(0)}, 128},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		for _, tt := range tests {
 			result := tt.input.bitLen()
 			if result != tt.expect {
-				t.Errorf("bitLen() = %d, want %d", result, tt.expect)
+				t.Errorf("%s: bitLen() = %d, want %d", tt.name, result, tt.expect)
 			}
-		})
-	}
-}
+		}
+	})
 
-func TestUint128Bytes(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  uint128
-		expect []byte
-	}{
-		{"zero", uint128{0, 0}, make([]byte, 16)},
-		{"one", uint128{0, 1}, append(make([]byte, 15), 1)},
-		{"hi=1", uint128{1, 0}, append([]byte{0, 0, 0, 0, 0, 0, 0, 1}, make([]byte, 8)...)},
-	}
+	t.Run("Bytes", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name   string
+			input  uint128
+			expect []byte
+		}{
+			{"zero", uint128{0, 0}, make([]byte, 16)},
+			{"one", uint128{0, 1}, append(make([]byte, 15), 1)},
+			{"hi=1", uint128{1, 0}, append([]byte{0, 0, 0, 0, 0, 0, 0, 1}, make([]byte, 8)...)},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		for _, tt := range tests {
 			result := tt.input.bytes()
 			if !bytes.Equal(result, tt.expect) {
-				t.Errorf("bytes() = %x, want %x", result, tt.expect)
+				t.Errorf("%s: bytes() = %x, want %x", tt.name, result, tt.expect)
 			}
-		})
-	}
+		}
+	})
 }
 
-// Test Overhead returns correct tag size
+// TestOverhead tests that Overhead returns correct tag size
 func TestOverhead(t *testing.T) {
+	t.Parallel()
+
 	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -493,8 +481,11 @@ func TestOverhead(t *testing.T) {
 	}
 }
 
-// Test nonce increment behavior
+// TestNonceSequence tests nonce increment behavior
+// In -short mode, only 10 messages are tested instead of 100.
 func TestNonceSequence(t *testing.T) {
+	t.Parallel()
+
 	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -525,7 +516,12 @@ func TestNonceSequence(t *testing.T) {
 	}
 
 	// Send multiple messages to exercise nonce increment
-	for i := 0; i < 100; i++ {
+	numMessages := 100
+	if testing.Short() {
+		numMessages = 10
+	}
+
+	for i := 0; i < numMessages; i++ {
 		plaintext := []byte("message")
 		ciphertext, err := sender.Seal(nil, plaintext)
 		if err != nil {
@@ -543,8 +539,10 @@ func TestNonceSequence(t *testing.T) {
 	}
 }
 
-// Test invalid encapsulated key
+// TestDecapInvalidKey tests invalid encapsulated key handling
 func TestDecapInvalidKey(t *testing.T) {
+	t.Parallel()
+
 	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -552,44 +550,43 @@ func TestDecapInvalidKey(t *testing.T) {
 
 	info := []byte("test info")
 
-	// Try with invalid encapsulated key (too short)
-	_, err = SetupRecipient(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		AEAD_AES_128_GCM,
-		recipientPriv,
-		info,
-		[]byte("short"),
-	)
-	if err == nil {
-		t.Error("Expected error for short encapsulated key")
-	}
+	t.Run("TooShort", func(t *testing.T) {
+		t.Parallel()
+		_, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_AES_128_GCM,
+			recipientPriv,
+			info,
+			[]byte("short"),
+		)
+		if err == nil {
+			t.Error("Expected error for short encapsulated key")
+		}
+	})
 
-	// Try with invalid encapsulated key (all zeros - low order point)
-	_, err = SetupRecipient(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		AEAD_AES_128_GCM,
-		recipientPriv,
-		info,
-		make([]byte, 32),
-	)
-	if err == nil {
-		t.Error("Expected error for low-order point encapsulated key")
-	}
+	t.Run("LowOrderPoint", func(t *testing.T) {
+		t.Parallel()
+		_, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_AES_128_GCM,
+			recipientPriv,
+			info,
+			make([]byte, 32), // all zeros - low order point
+		)
+		if err == nil {
+			t.Error("Expected error for low-order point encapsulated key")
+		}
+	})
 }
 
 // TestRFC9180BaseMode tests against RFC 9180 Appendix A.1 test vectors
 // DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM (Base Mode)
-// This verifies cryptographic correctness against known-answer test vectors.
+// NOTE: This test modifies testingOnlyGenerateKey global, so it cannot run in parallel.
 func TestRFC9180BaseMode(t *testing.T) {
-	// RFC 9180 A.1 Base Setup Information
-	// mode: 0 (base)
-	// kem_id: 0x0020 (DHKEM_X25519_HKDF_SHA256)
-	// kdf_id: 0x0001 (KDF_HKDF_SHA256)
-	// aead_id: 0x0001 (AEAD_AES_128_GCM)
 
-	// Key Material from RFC 9180 A.1
+	// RFC 9180 A.1 Base Setup Information
 	skEm := mustHex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736")
 	skRm := mustHex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8")
 	pkRm := mustHex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d")
@@ -673,10 +670,10 @@ func TestRFC9180BaseMode(t *testing.T) {
 }
 
 // TestRFC9180Encryption tests encryption vectors from RFC 9180 A.1
-// This verifies that Seal produces the exact ciphertext specified in the RFC.
+// In -short mode, only the first vector is tested.
+// NOTE: This test modifies testingOnlyGenerateKey global, so it cannot run in parallel.
 func TestRFC9180Encryption(t *testing.T) {
-	// RFC 9180 A.1 encryption test vectors
-	// These verify the AEAD encryption output matches the RFC exactly
+
 	vectors := []struct {
 		name       string
 		seqNum     int
@@ -685,26 +682,31 @@ func TestRFC9180Encryption(t *testing.T) {
 		ciphertext string // hex
 	}{
 		{
-			name:       "sequence 0",
+			name:       "sequence_0",
 			seqNum:     0,
 			aad:        "436f756e742d30",                                                   // "Count-0"
 			plaintext:  "4265617574792069732074727574682c20747275746820626561757479",       // "Beauty is truth, truth beauty"
 			ciphertext: "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
 		},
 		{
-			name:       "sequence 1",
+			name:       "sequence_1",
 			seqNum:     1,
-			aad:        "436f756e742d31",                                                   // "Count-1"
-			plaintext:  "4265617574792069732074727574682c20747275746820626561757479",       // "Beauty is truth, truth beauty"
+			aad:        "436f756e742d31",
+			plaintext:  "4265617574792069732074727574682c20747275746820626561757479",
 			ciphertext: "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84",
 		},
 		{
-			name:       "sequence 2",
+			name:       "sequence_2",
 			seqNum:     2,
-			aad:        "436f756e742d32",                                                   // "Count-2"
-			plaintext:  "4265617574792069732074727574682c20747275746820626561757479",       // "Beauty is truth, truth beauty"
+			aad:        "436f756e742d32",
+			plaintext:  "4265617574792069732074727574682c20747275746820626561757479",
 			ciphertext: "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb72516491588d96a19ad4a683518973dcc180",
 		},
+	}
+
+	// In short mode, only test first vector
+	if testing.Short() {
+		vectors = vectors[:1]
 	}
 
 	// Setup keys from RFC 9180 A.1
@@ -789,9 +791,9 @@ func TestRFC9180Encryption(t *testing.T) {
 }
 
 // TestRFC9180SharedSecret verifies the intermediate shared secret value
-// This tests the KEM encapsulation produces the correct shared secret
+// NOTE: This test modifies testingOnlyGenerateKey global, so it cannot run in parallel.
 func TestRFC9180SharedSecret(t *testing.T) {
-	// RFC 9180 A.1 values
+
 	skEm := mustHex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736")
 	pkRm := mustHex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d")
 	expectedSharedSecret := mustHex("fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc")
@@ -828,9 +830,10 @@ func TestRFC9180SharedSecret(t *testing.T) {
 	}
 }
 
-// TestP256RoundTrip verifies P-256 KEM encryption/decryption works correctly
+// TestP256RoundTrip verifies P-256 KEM encryption/decryption
 func TestP256RoundTrip(t *testing.T) {
-	// Generate P-256 recipient key pair
+	t.Parallel()
+
 	recipientPriv, err := ecdh.P256().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -839,7 +842,6 @@ func TestP256RoundTrip(t *testing.T) {
 
 	info := []byte("P-256 test info")
 
-	// Setup sender with P-256 KEM
 	enc, sender, err := SetupSender(
 		DHKEM_P256_HKDF_SHA256,
 		KDF_HKDF_SHA256,
@@ -861,7 +863,6 @@ func TestP256RoundTrip(t *testing.T) {
 		t.Errorf("enc[0] = 0x%02x, want 0x04 for uncompressed point", enc[0])
 	}
 
-	// Setup recipient
 	recipient, err := SetupRecipient(
 		DHKEM_P256_HKDF_SHA256,
 		KDF_HKDF_SHA256,
@@ -898,9 +899,10 @@ func TestP256RoundTrip(t *testing.T) {
 	}
 }
 
-// TestP384RoundTrip verifies P-384 KEM encryption/decryption works correctly
+// TestP384RoundTrip verifies P-384 KEM encryption/decryption
 func TestP384RoundTrip(t *testing.T) {
-	// Generate P-384 recipient key pair
+	t.Parallel()
+
 	recipientPriv, err := ecdh.P384().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey failed: %v", err)
@@ -909,7 +911,6 @@ func TestP384RoundTrip(t *testing.T) {
 
 	info := []byte("P-384 test info")
 
-	// Setup sender with P-384 KEM and SHA-384 KDF
 	enc, sender, err := SetupSender(
 		DHKEM_P384_HKDF_SHA384,
 		KDF_HKDF_SHA384,
@@ -926,12 +927,11 @@ func TestP384RoundTrip(t *testing.T) {
 		t.Errorf("enc length = %d, want 97 for P-384", len(enc))
 	}
 
-	// Verify enc starts with 0x04 (uncompressed point indicator)
+	// Verify enc starts with 0x04
 	if enc[0] != 0x04 {
 		t.Errorf("enc[0] = 0x%02x, want 0x04 for uncompressed point", enc[0])
 	}
 
-	// Setup recipient
 	recipient, err := SetupRecipient(
 		DHKEM_P384_HKDF_SHA384,
 		KDF_HKDF_SHA384,
@@ -969,7 +969,10 @@ func TestP384RoundTrip(t *testing.T) {
 }
 
 // TestAllKEMsWithAllAEADs tests all supported KEM/AEAD combinations
+// In -short mode, only X25519 with AES-128-GCM is tested.
 func TestAllKEMsWithAllAEADs(t *testing.T) {
+	t.Parallel()
+
 	kems := []struct {
 		name   string
 		kemID  uint16
@@ -977,9 +980,9 @@ func TestAllKEMsWithAllAEADs(t *testing.T) {
 		curve  ecdh.Curve
 		encLen int
 	}{
+		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519(), 32},
 		{"P-256", DHKEM_P256_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.P256(), 65},
 		{"P-384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384(), 97},
-		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519(), 32},
 	}
 
 	aeads := []struct {
@@ -991,9 +994,17 @@ func TestAllKEMsWithAllAEADs(t *testing.T) {
 		{"ChaCha20-Poly1305", AEAD_ChaCha20Poly1305},
 	}
 
+	// In short mode, only test X25519 with AES-128-GCM
+	if testing.Short() {
+		kems = kems[:1]
+		aeads = aeads[:1]
+	}
+
 	for _, kem := range kems {
 		for _, aead := range aeads {
 			t.Run(kem.name+"/"+aead.name, func(t *testing.T) {
+				t.Parallel()
+
 				recipientPriv, err := kem.curve.GenerateKey(rand.Reader)
 				if err != nil {
 					t.Fatalf("GenerateKey failed: %v", err)
@@ -1050,52 +1061,55 @@ func TestAllKEMsWithAllAEADs(t *testing.T) {
 	}
 }
 
-// TestP256InvalidPublicKey tests rejection of malformed P-256 public keys
-func TestP256InvalidPublicKey(t *testing.T) {
-	tests := []struct {
-		name string
-		key  []byte
-	}{
-		{"empty", []byte{}},
-		{"too short", make([]byte, 32)},
-		{"wrong prefix", append([]byte{0x02}, make([]byte, 64)...)}, // compressed, not uncompressed
-		{"too long", make([]byte, 100)},
-	}
+// TestInvalidPublicKeys tests rejection of malformed public keys
+func TestInvalidPublicKeys(t *testing.T) {
+	t.Parallel()
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	t.Run("P256", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			key  []byte
+		}{
+			{"empty", []byte{}},
+			{"too short", make([]byte, 32)},
+			{"wrong prefix", append([]byte{0x02}, make([]byte, 64)...)},
+			{"too long", make([]byte, 100)},
+		}
+
+		for _, tc := range tests {
 			_, err := ParseHPKEPublicKey(DHKEM_P256_HKDF_SHA256, tc.key)
 			if err == nil {
-				t.Error("Expected error for invalid P-256 public key")
+				t.Errorf("%s: Expected error for invalid P-256 public key", tc.name)
 			}
-		})
-	}
-}
+		}
+	})
 
-// TestP384InvalidPublicKey tests rejection of malformed P-384 public keys
-func TestP384InvalidPublicKey(t *testing.T) {
-	tests := []struct {
-		name string
-		key  []byte
-	}{
-		{"empty", []byte{}},
-		{"too short", make([]byte, 65)},
-		{"wrong prefix", append([]byte{0x02}, make([]byte, 96)...)}, // compressed, not uncompressed
-		{"too long", make([]byte, 150)},
-	}
+	t.Run("P384", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			key  []byte
+		}{
+			{"empty", []byte{}},
+			{"too short", make([]byte, 65)},
+			{"wrong prefix", append([]byte{0x02}, make([]byte, 96)...)},
+			{"too long", make([]byte, 150)},
+		}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+		for _, tc := range tests {
 			_, err := ParseHPKEPublicKey(DHKEM_P384_HKDF_SHA384, tc.key)
 			if err == nil {
-				t.Error("Expected error for invalid P-384 public key")
+				t.Errorf("%s: Expected error for invalid P-384 public key", tc.name)
 			}
-		})
-	}
+		}
+	})
 }
 
 // TestParseHPKEKeys tests key parsing for all supported KEMs
 func TestParseHPKEKeys(t *testing.T) {
+	t.Parallel()
+
 	kems := []struct {
 		name  string
 		kemID uint16
@@ -1108,6 +1122,8 @@ func TestParseHPKEKeys(t *testing.T) {
 
 	for _, kem := range kems {
 		t.Run(kem.name, func(t *testing.T) {
+			t.Parallel()
+
 			// Generate key pair
 			priv, err := kem.curve.GenerateKey(rand.Reader)
 			if err != nil {
@@ -1138,20 +1154,31 @@ func TestParseHPKEKeys(t *testing.T) {
 }
 
 // TestMultipleMessages tests sending multiple messages with all KEMs
+// In -short mode, only X25519 is tested with 10 messages instead of 100.
 func TestMultipleMessages(t *testing.T) {
+	t.Parallel()
+
 	kems := []struct {
 		name  string
 		kemID uint16
 		kdfID uint16
 		curve ecdh.Curve
 	}{
+		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519()},
 		{"P-256", DHKEM_P256_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.P256()},
 		{"P-384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384()},
-		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519()},
+	}
+
+	numMessages := 100
+	if testing.Short() {
+		kems = kems[:1]
+		numMessages = 10
 	}
 
 	for _, kem := range kems {
 		t.Run(kem.name, func(t *testing.T) {
+			t.Parallel()
+
 			recipientPriv, err := kem.curve.GenerateKey(rand.Reader)
 			if err != nil {
 				t.Fatalf("GenerateKey failed: %v", err)
@@ -1180,8 +1207,8 @@ func TestMultipleMessages(t *testing.T) {
 				t.Fatalf("SetupRecipient failed: %v", err)
 			}
 
-			// Send 100 messages
-			for i := 0; i < 100; i++ {
+			// Send messages
+			for i := 0; i < numMessages; i++ {
 				plaintext := []byte("message " + string(rune('A'+i%26)))
 				ciphertext, err := sender.Seal(nil, plaintext)
 				if err != nil {
@@ -1223,21 +1250,12 @@ func BenchmarkSeal(b *testing.B) {
 	recipientPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	recipientPub := recipientPriv.PublicKey()
 
-	_, sender, _ := SetupSender(
-		DHKEM_X25519_HKDF_SHA256,
-		KDF_HKDF_SHA256,
-		AEAD_AES_128_GCM,
-		recipientPub,
-		nil,
-	)
-
 	plaintext := make([]byte, 1024)
 	aad := []byte("aad")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// We need to reset the sender to avoid message limit
-		_, sender, _ = SetupSender(
+		_, sender, _ := SetupSender(
 			DHKEM_X25519_HKDF_SHA256,
 			KDF_HKDF_SHA256,
 			AEAD_AES_128_GCM,
@@ -1281,7 +1299,6 @@ func BenchmarkOpen(b *testing.B) {
 	}
 }
 
-// Benchmarks for P-256 KEM
 func BenchmarkSetupSenderP256(b *testing.B) {
 	recipientPriv, _ := ecdh.P256().GenerateKey(rand.Reader)
 	recipientPub := recipientPriv.PublicKey()
@@ -1325,7 +1342,6 @@ func BenchmarkSetupRecipientP256(b *testing.B) {
 	}
 }
 
-// Benchmarks for P-384 KEM
 func BenchmarkSetupSenderP384(b *testing.B) {
 	recipientPriv, _ := ecdh.P384().GenerateKey(rand.Reader)
 	recipientPub := recipientPriv.PublicKey()

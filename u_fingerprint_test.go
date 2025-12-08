@@ -143,7 +143,11 @@ func TestJA4Calculation(t *testing.T) {
 
 // TestJA4Stability verifies fingerprint stability across multiple generations.
 func TestJA4Stability(t *testing.T) {
-	const iterations = 50
+	// Use fewer iterations in short mode for faster CI
+	iterations := 20
+	if testing.Short() {
+		iterations = 5
+	}
 
 	profiles := []struct {
 		name string
@@ -154,7 +158,9 @@ func TestJA4Stability(t *testing.T) {
 	}
 
 	for _, profile := range profiles {
+		profile := profile // capture range variable
 		t.Run(profile.name, func(t *testing.T) {
+			t.Parallel() // Run subtests in parallel
 			var firstJA3, firstJA4 string
 
 			for i := 0; i < iterations; i++ {

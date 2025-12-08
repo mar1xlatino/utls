@@ -15,9 +15,10 @@ import (
 )
 
 // Tests that the linker is able to remove references to the Client or Server if unused.
+// This is an integration test that requires subprocess compilation.
 func TestLinkerGC(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping in short mode")
+		t.Skip("skipping in short mode: requires subprocess compilation")
 	}
 	t.Parallel()
 	goBin := testenv.GoToolPath(t)
@@ -72,23 +73,31 @@ func main() { tls.Dial("", "", nil) }
 		// That currently brings in the client via Conn.handleRenegotiation.
 
 	}
-	tmpDir := t.TempDir()
-	goFile := filepath.Join(tmpDir, "x.go")
-	exeFile := filepath.Join(tmpDir, "x.exe")
 	for _, tt := range tests {
+		tt := tt // capture range variable for parallel execution
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel() // run subtests in parallel for faster execution
+
+			// Each subtest gets its own temp directory for parallel safety
+			tmpDir := t.TempDir()
+			goFile := filepath.Join(tmpDir, "x.go")
+			exeFile := filepath.Join(tmpDir, "x.exe")
+
 			if err := os.WriteFile(goFile, []byte(tt.program), 0644); err != nil {
 				t.Fatal(err)
 			}
-			os.Remove(exeFile)
-			cmd := exec.Command(goBin, "build", "-o", "x.exe", "x.go")
-			cmd.Dir = tmpDir
+
+			// Use optimized build flags:
+			// -trimpath removes file system paths for reproducible builds and better cache hits
+			// CGO_ENABLED=0 forces pure Go build which is faster
+			// Note: cannot use -ldflags="-s -w" as we need symbols for nm inspection
+			cmd := exec.Command(goBin, "build", "-trimpath", "-o", exeFile, goFile)
+			cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("compile: %v, %s", err, out)
 			}
 
-			cmd = exec.Command(goBin, "tool", "nm", "x.exe")
-			cmd.Dir = tmpDir
+			cmd = exec.Command(goBin, "tool", "nm", exeFile)
 			nm, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("nm: %v, %s", err, nm)

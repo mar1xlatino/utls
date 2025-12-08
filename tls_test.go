@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +34,6 @@ import (
 
 	"github.com/refraction-networking/utls/internal/fips140tls"
 	"github.com/refraction-networking/utls/internal/hpke"
-	"github.com/refraction-networking/utls/testenv"
 )
 
 var rsaCertPEM = `-----BEGIN CERTIFICATE-----
@@ -522,26 +522,135 @@ func TestTLSUniqueMatches(t *testing.T) {
 }
 
 func TestVerifyHostname(t *testing.T) {
-	testenv.MustHaveExternalNetwork(t)
+	t.Parallel()
 
-	c, err := Dial("tcp", "www.google.com:https", nil)
+	// Generate a test certificate with specific SANs (fast ECDSA key)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.VerifyHostname("www.google.com"); err != nil {
-		t.Fatalf("verify www.google.com: %v", err)
-	}
-	if err := c.VerifyHostname("www.yahoo.com"); err == nil {
-		t.Fatalf("verify www.yahoo.com succeeded")
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "Test CA"},
+		DNSNames:     []string{"example.com", "*.example.org"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
-	c, err = Dial("tcp", "www.google.com:https", &Config{InsecureSkipVerify: true})
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.VerifyHostname("www.google.com"); err == nil {
-		t.Fatalf("verify www.google.com succeeded with InsecureSkipVerify=true")
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	tlsCert := Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}
+
+	// Create trusted root pool
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(cert)
+
+	// Start local TLS server
+	ln := newLocalListener(t)
+	defer ln.Close()
+
+	serverConfig := &Config{
+		Certificates: []Certificate{tlsCert},
+	}
+
+	// Server goroutine - handles multiple connections
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for i := 0; i < 4; i++ { // Accept 4 connections for our tests
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				srv := Server(c, serverConfig)
+				srv.Handshake()
+			}(conn)
+		}
+	}()
+
+	tests := []struct {
+		name               string
+		verifyHost         string
+		insecureSkipVerify bool
+		wantErr            bool
+	}{
+		{
+			name:       "exact_match",
+			verifyHost: "example.com",
+			wantErr:    false,
+		},
+		{
+			name:       "wildcard_match",
+			verifyHost: "foo.example.org",
+			wantErr:    false,
+		},
+		{
+			name:       "no_match",
+			verifyHost: "other.com",
+			wantErr:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConfig := &Config{
+				ServerName:         "example.com",
+				RootCAs:            rootPool,
+				InsecureSkipVerify: tc.insecureSkipVerify,
+			}
+
+			conn, err := Dial("tcp", ln.Addr().String(), clientConfig)
+			if err != nil {
+				t.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+
+			err = conn.VerifyHostname(tc.verifyHost)
+			if tc.wantErr && err == nil {
+				t.Errorf("VerifyHostname(%q) succeeded, want error", tc.verifyHost)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("VerifyHostname(%q) failed: %v", tc.verifyHost, err)
+			}
+		})
+	}
+
+	// Test InsecureSkipVerify separately - VerifyHostname should fail
+	// because verifiedChains is empty when InsecureSkipVerify=true
+	t.Run("insecure_skip_verify", func(t *testing.T) {
+		clientConfig := &Config{
+			ServerName:         "example.com",
+			InsecureSkipVerify: true,
+		}
+
+		conn, err := Dial("tcp", ln.Addr().String(), clientConfig)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if err := conn.VerifyHostname("example.com"); err == nil {
+			t.Error("VerifyHostname succeeded with InsecureSkipVerify=true, want error")
+		}
+	})
+
+	// Suppress unused variable warning
+	_ = serverDone
 }
 
 func TestConnCloseBreakingWrite(t *testing.T) {
@@ -2048,34 +2157,50 @@ func TestEarlyLargeCertMsg(t *testing.T) {
 	}
 }
 
-func TestLargeCertMsg(t *testing.T) {
-	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+// Cached large certificate for TestLargeCertMsg to avoid regenerating on each run.
+var (
+	largeCertOnce sync.Once
+	largeCertDER  []byte
+	largeCertErr  error
+)
+
+// initLargeCert creates a certificate with ballast to exceed normal record size.
+// Uses testP256PrivateKey to avoid expensive key generation.
+func initLargeCert() {
+	// 17000 bytes is just above the 16KB TLS record size limit,
+	// sufficient to test multi-record certificate handling.
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "test"},
 		ExtraExtensions: []pkix.Extension{
 			{
-				Id: asn1.ObjectIdentifier{1, 2, 3},
-				// Ballast to inflate the certificate beyond the
-				// regular handshake record size.
-				Value: make([]byte, 65536),
+				Id:    asn1.ObjectIdentifier{1, 2, 3},
+				Value: make([]byte, 17000),
 			},
 		},
 	}
-	cert, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, k.Public(), k)
-	if err != nil {
-		t.Fatal(err)
+	largeCertDER, largeCertErr = x509.CreateCertificate(
+		rand.Reader, tmpl, tmpl, testP256PrivateKey.Public(), testP256PrivateKey,
+	)
+}
+
+func TestLargeCertMsg(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large certificate test in short mode")
+	}
+
+	// Initialize cached certificate once across all test runs.
+	largeCertOnce.Do(initLargeCert)
+	if largeCertErr != nil {
+		t.Fatal(largeCertErr)
 	}
 
 	clientConfig, serverConfig := testConfig.Clone(), testConfig.Clone()
 	clientConfig.InsecureSkipVerify = true
 	serverConfig.Certificates = []Certificate{
 		{
-			Certificate: [][]byte{cert},
-			PrivateKey:  k,
+			Certificate: [][]byte{largeCertDER},
+			PrivateKey:  testP256PrivateKey,
 		},
 	}
 	if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {

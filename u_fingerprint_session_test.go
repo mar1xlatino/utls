@@ -18,6 +18,7 @@ import (
 // returns a valid state with empty profile ID (never returns nil).
 // This prevents nil pointer dereferences in callers.
 func TestNewSessionFingerprintState_NilProfile(t *testing.T) {
+	t.Parallel()
 	state := NewSessionFingerprintState(nil, "example.com:443")
 	if state == nil {
 		t.Fatal("NewSessionFingerprintState(nil, origin) should return valid state, got nil")
@@ -36,6 +37,7 @@ func TestNewSessionFingerprintState_NilProfile(t *testing.T) {
 // TestNewSessionFingerprintState_ValidProfile verifies that a valid profile
 // creates a properly initialized session state.
 func TestNewSessionFingerprintState_ValidProfile(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -85,6 +87,7 @@ func TestNewSessionFingerprintState_ValidProfile(t *testing.T) {
 // TestNewSessionFingerprintState_GREASEDisabled verifies that GREASE values
 // are zero when GREASE is disabled in the profile.
 func TestNewSessionFingerprintState_GREASEDisabled(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "firefox_profile",
 		Browser: "firefox",
@@ -112,6 +115,7 @@ func TestNewSessionFingerprintState_GREASEDisabled(t *testing.T) {
 // TestNewSessionFingerprintState_CopiesSlices verifies that slices from the
 // profile are deep-copied into the session state, not referenced.
 func TestNewSessionFingerprintState_CopiesSlices(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -151,6 +155,7 @@ func TestNewSessionFingerprintState_CopiesSlices(t *testing.T) {
 
 // TestFrozenGREASE_ValidRange verifies all GREASE values follow the 0x?a?a pattern.
 func TestFrozenGREASE_ValidRange(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -160,7 +165,11 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 	}
 
 	// Test multiple times to cover randomness
-	for i := 0; i < 100; i++ {
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		state := NewSessionFingerprintState(profile, "example.com:443")
 		if state == nil {
 			t.Fatal("NewSessionFingerprintState returned nil")
@@ -190,6 +199,7 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 // Extension1 and Extension2 have a natural ~6.25% collision rate (like Chrome).
 // Real Chrome/BoringSSL does NOT deduplicate GREASE values - collisions are allowed.
 func TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -198,8 +208,18 @@ func TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate(t *testing.T) {
 		},
 	}
 
-	// Run many iterations to measure collision rate
-	const iterations = 10000
+	// Run iterations to measure collision rate
+	// Use fewer iterations in short mode, but enough for statistical validity
+	iterations := 10000
+	minCollisions := 400 // ~4% minimum
+	maxCollisions := 850 // ~8.5% maximum
+	if testing.Short() {
+		iterations = 1000
+		// Adjusted bounds for 1000 iterations (expected ~62.5, wider variance)
+		minCollisions = 30  // ~3% minimum
+		maxCollisions = 100 // ~10% maximum
+	}
+
 	collisions := 0
 	for i := 0; i < iterations; i++ {
 		state := NewSessionFingerprintState(profile, "example.com:443")
@@ -213,17 +233,10 @@ func TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate(t *testing.T) {
 	}
 
 	// Expected collision rate: 1/16 = 6.25%
-	// With 10000 iterations, expected collisions ~625, stddev ~24
-	// Allow 3-sigma range: 625 +/- 72 = [553, 697]
-	// We use a wider range [400, 850] to reduce test flakiness
 	actualRate := float64(collisions) / float64(iterations)
 
-	// Verify collision rate is approximately 6.25% (with tolerance for randomness)
-	minCollisions := 400 // ~4% minimum
-	maxCollisions := 850 // ~8.5% maximum
-
 	if collisions < minCollisions || collisions > maxCollisions {
-		t.Errorf("Collision rate out of expected range: got %d collisions (%.2f%%), expected ~625 (6.25%%)",
+		t.Errorf("Collision rate out of expected range: got %d collisions (%.2f%%), expected ~6.25%%",
 			collisions, actualRate*100)
 	}
 
@@ -235,6 +248,7 @@ func TestFrozenGREASE_Extension1Extension2_NaturalCollisionRate(t *testing.T) {
 // TestFrozenGREASE_KeyShareMatchesSupportedGroup verifies Chrome behavior where
 // KeyShare GREASE must equal SupportedGroup GREASE.
 func TestFrozenGREASE_KeyShareMatchesSupportedGroup(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -243,7 +257,11 @@ func TestFrozenGREASE_KeyShareMatchesSupportedGroup(t *testing.T) {
 		},
 	}
 
-	for i := 0; i < 100; i++ {
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		state := NewSessionFingerprintState(profile, "example.com:443")
 		if state == nil {
 			t.Fatal("NewSessionFingerprintState returned nil")
@@ -259,6 +277,7 @@ func TestFrozenGREASE_KeyShareMatchesSupportedGroup(t *testing.T) {
 // TestFrozenGREASE_DeterministicForSameOrigin verifies that once a session is
 // created, the GREASE values remain constant (session consistency).
 func TestFrozenGREASE_DeterministicForSameOrigin(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -276,7 +295,11 @@ func TestFrozenGREASE_DeterministicForSameOrigin(t *testing.T) {
 	initialGREASE := state.FrozenGREASE
 
 	// Access values multiple times - they should never change
-	for i := 0; i < 100; i++ {
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		if state.GetGREASEValue(GREASECipherSuite) != initialGREASE.CipherSuite {
 			t.Errorf("Iteration %d: CipherSuite GREASE changed unexpectedly", i)
 		}
@@ -292,6 +315,7 @@ func TestFrozenGREASE_DeterministicForSameOrigin(t *testing.T) {
 // TestFrozenGREASE_AllValuesPopulated verifies that when GREASE is enabled,
 // all 6 key GREASE values are populated with non-zero values.
 func TestFrozenGREASE_AllValuesPopulated(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -331,6 +355,7 @@ func TestFrozenGREASE_AllValuesPopulated(t *testing.T) {
 
 // TestSessionFreezing_FreezePreventsFrozenFlag verifies Freeze() sets frozen flag.
 func TestSessionFreezing_FreezePreventsFrozenFlag(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -361,6 +386,7 @@ func TestSessionFreezing_FreezePreventsFrozenFlag(t *testing.T) {
 // TestSessionFreezing_SetSessionTicketFailsAfterFreeze verifies that
 // SetSessionTicket returns ErrSessionFrozen after the session is frozen.
 func TestSessionFreezing_SetSessionTicketFailsAfterFreeze(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -397,6 +423,7 @@ func TestSessionFreezing_SetSessionTicketFailsAfterFreeze(t *testing.T) {
 // TestSessionFreezing_SetResumptionSecretFailsAfterFreeze verifies that
 // SetResumptionSecret returns ErrSessionFrozen after the session is frozen.
 func TestSessionFreezing_SetResumptionSecretFailsAfterFreeze(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -433,6 +460,7 @@ func TestSessionFreezing_SetResumptionSecretFailsAfterFreeze(t *testing.T) {
 // TestSessionFreezing_MultipleFreezesCalls verifies that multiple Freeze() calls
 // are safe and idempotent.
 func TestSessionFreezing_MultipleFreezesCalls(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -460,7 +488,8 @@ func TestSessionFreezing_MultipleFreezesCalls(t *testing.T) {
 // TestSessionCache_GetOrCreate_ReturnsSameStateForSameOrigin verifies that
 // GetOrCreate returns the same session state for the same origin.
 func TestSessionCache_GetOrCreate_ReturnsSameStateForSameOrigin(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size for tests
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -497,7 +526,8 @@ func TestSessionCache_GetOrCreate_ReturnsSameStateForSameOrigin(t *testing.T) {
 // TestSessionCache_GetOrCreate_DifferentStateForDifferentOrigin verifies that
 // GetOrCreate returns different session states for different origins.
 func TestSessionCache_GetOrCreate_DifferentStateForDifferentOrigin(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size for tests
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -527,6 +557,7 @@ func TestSessionCache_GetOrCreate_DifferentStateForDifferentOrigin(t *testing.T)
 // TestSessionCache_EvictionAtMaxSize verifies that the cache evicts oldest
 // entries when reaching capacity.
 func TestSessionCache_EvictionAtMaxSize(t *testing.T) {
+	t.Parallel()
 	maxSize := 5
 	cache := NewSessionStateCache(maxSize, time.Hour)
 	profile := &FingerprintProfile{
@@ -537,13 +568,11 @@ func TestSessionCache_EvictionAtMaxSize(t *testing.T) {
 		},
 	}
 
-	// Fill cache to capacity
+	// Fill cache to capacity - use atomic counter instead of time-based ordering
 	origins := make([]string, maxSize+3)
 	for i := 0; i < maxSize+3; i++ {
 		origins[i] = "origin" + string(rune('A'+i)) + ".com:443"
 		cache.GetOrCreate(origins[i], profile)
-		// Small delay to ensure different timestamps
-		time.Sleep(time.Millisecond)
 	}
 
 	// Cache size should be at most maxSize
@@ -555,7 +584,7 @@ func TestSessionCache_EvictionAtMaxSize(t *testing.T) {
 	// Oldest entries should be evicted
 	// First entries should be gone
 	for i := 0; i < 3; i++ {
-		state := cache.Get(origins[i])
+		state := cache.Get(origins[i], profile.ID)
 		if state != nil {
 			t.Errorf("Origin %s should have been evicted", origins[i])
 		}
@@ -565,8 +594,9 @@ func TestSessionCache_EvictionAtMaxSize(t *testing.T) {
 // TestSessionCache_CleanupExpiredEntries verifies that Cleanup removes expired
 // entries from the cache.
 func TestSessionCache_CleanupExpiredEntries(t *testing.T) {
-	// Very short TTL for testing
-	cache := NewSessionStateCache(100, 10*time.Millisecond)
+	t.Parallel()
+	// Very short TTL for testing - use 5ms for faster tests
+	cache := NewSessionStateCache(10, 5*time.Millisecond)
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -582,8 +612,8 @@ func TestSessionCache_CleanupExpiredEntries(t *testing.T) {
 		t.Errorf("Expected 2 entries, got %d", stats.Size)
 	}
 
-	// Wait for expiration
-	time.Sleep(20 * time.Millisecond)
+	// Wait for expiration - 10ms is sufficient for 5ms TTL
+	time.Sleep(10 * time.Millisecond)
 
 	// Run cleanup
 	removed := cache.Cleanup()
@@ -604,7 +634,8 @@ func TestSessionCache_CleanupExpiredEntries(t *testing.T) {
 // Uses moderate concurrency to validate thread-safety without excessive memory
 // overhead from race detector instrumentation.
 func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
-	cache := NewSessionStateCache(50, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(20, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test",
 		Browser: "chrome",
@@ -614,8 +645,12 @@ func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	const goroutines = 20
-	const iterations = 20
+	goroutines := 20
+	iterations := 20
+	if testing.Short() {
+		goroutines = 10
+		iterations = 10
+	}
 
 	// Run concurrent GetOrCreate operations
 	for i := 0; i < goroutines; i++ {
@@ -649,9 +684,10 @@ func TestSessionCache_ThreadSafety_ConcurrentAccess(t *testing.T) {
 // TestSessionCache_Get_ReturnsNilForNonexistent verifies that Get returns nil
 // for origins not in the cache.
 func TestSessionCache_Get_ReturnsNilForNonexistent(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size
 
-	state := cache.Get("nonexistent.com:443")
+	state := cache.Get("nonexistent.com:443", "test_profile")
 	if state != nil {
 		t.Error("Get should return nil for nonexistent origin")
 	}
@@ -660,7 +696,8 @@ func TestSessionCache_Get_ReturnsNilForNonexistent(t *testing.T) {
 // TestSessionCache_Delete_RemovesEntry verifies that Delete removes an entry
 // and clears its sensitive data.
 func TestSessionCache_Delete_RemovesEntry(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -676,10 +713,10 @@ func TestSessionCache_Delete_RemovesEntry(t *testing.T) {
 	state.SetSessionTicket([]byte("secret-ticket"))
 
 	// Delete
-	cache.Delete(origin)
+	cache.Delete(origin, profile.ID)
 
 	// Should be gone
-	retrieved := cache.Get(origin)
+	retrieved := cache.Get(origin, profile.ID)
 	if retrieved != nil {
 		t.Error("Get should return nil after Delete")
 	}
@@ -688,7 +725,8 @@ func TestSessionCache_Delete_RemovesEntry(t *testing.T) {
 // TestSessionCache_Clear_RemovesAllEntries verifies that Clear removes all
 // entries and clears their sensitive data.
 func TestSessionCache_Clear_RemovesAllEntries(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(20, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -716,7 +754,8 @@ func TestSessionCache_Clear_RemovesAllEntries(t *testing.T) {
 // TestSessionCache_TouchUpdatesTimestamp verifies that Touch() updates the
 // lastUsed timestamp and connection count.
 func TestSessionCache_TouchUpdatesTimestamp(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -753,11 +792,16 @@ func TestSessionCache_TouchUpdatesTimestamp(t *testing.T) {
 // TestSimplePRNG_ZeroSeedHandling verifies that a zero seed produces non-zero
 // output (xorshift64 would fail with all zeros otherwise).
 func TestSimplePRNG_ZeroSeedHandling(t *testing.T) {
+	t.Parallel()
 	prng := newPRNGFromSeed(0)
 
 	// Should not be stuck at zero
 	allZero := true
-	for i := 0; i < 100; i++ {
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		// Use a temporary slice to call Shuffle
 		vals := make([]int, 10)
 		for j := range vals {
@@ -797,11 +841,16 @@ func TestSimplePRNG_ZeroSeedHandling(t *testing.T) {
 // Uses moderate concurrency to validate thread-safety without excessive memory
 // overhead from race detector instrumentation.
 func TestSimplePRNG_ShuffleThreadSafe(t *testing.T) {
+	t.Parallel()
 	prng := newPRNGFromSeed(12345)
 
 	var wg sync.WaitGroup
-	const goroutines = 10
-	const iterations = 20
+	goroutines := 10
+	iterations := 20
+	if testing.Short() {
+		goroutines = 5
+		iterations = 10
+	}
 
 	// Run concurrent shuffles - no panic or race should occur
 	for i := 0; i < goroutines; i++ {
@@ -823,11 +872,17 @@ func TestSimplePRNG_ShuffleThreadSafe(t *testing.T) {
 // TestSimplePRNG_DistributionReasonablyUniform verifies that the PRNG produces
 // a reasonably uniform distribution of values.
 func TestSimplePRNG_DistributionReasonablyUniform(t *testing.T) {
+	t.Parallel()
 	prng := newPRNGFromSeed(42)
 
 	// Track which position each element ends up in
 	n := 10
 	iterations := 10000
+	tolerance := 0.2 // 20% deviation allowed
+	if testing.Short() {
+		iterations = 1000
+		tolerance = 0.35 // Allow wider variance with fewer iterations
+	}
 	positionCounts := make([][]int, n)
 	for i := range positionCounts {
 		positionCounts[i] = make([]int, n)
@@ -848,7 +903,7 @@ func TestSimplePRNG_DistributionReasonablyUniform(t *testing.T) {
 
 	// Each element should appear in each position roughly iterations/n times
 	expected := float64(iterations) / float64(n)
-	tolerance := expected * 0.2 // Allow 20% deviation
+	maxDeviation := expected * tolerance
 
 	for val := 0; val < n; val++ {
 		for pos := 0; pos < n; pos++ {
@@ -857,9 +912,9 @@ func TestSimplePRNG_DistributionReasonablyUniform(t *testing.T) {
 			if deviation < 0 {
 				deviation = -deviation
 			}
-			if deviation > tolerance {
+			if deviation > maxDeviation {
 				t.Errorf("Element %d appeared in position %d %d times (expected ~%d, tolerance %f)",
-					val, pos, positionCounts[val][pos], int(expected), tolerance)
+					val, pos, positionCounts[val][pos], int(expected), maxDeviation)
 			}
 		}
 	}
@@ -871,6 +926,7 @@ func TestSimplePRNG_DistributionReasonablyUniform(t *testing.T) {
 
 // TestKeyMaterialZeroing_Clear verifies that Clear() zeros all sensitive data.
 func TestKeyMaterialZeroing_Clear(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -909,6 +965,7 @@ func TestKeyMaterialZeroing_Clear(t *testing.T) {
 // TestKeyMaterialZeroing_SetSessionTicketZerosOld verifies that SetSessionTicket
 // zeros the old ticket before setting a new one.
 func TestKeyMaterialZeroing_SetSessionTicketZerosOld(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -947,6 +1004,7 @@ func TestKeyMaterialZeroing_SetSessionTicketZerosOld(t *testing.T) {
 // TestKeyMaterialZeroing_SetSessionTicketNilClears verifies that
 // SetSessionTicket(nil) clears the ticket.
 func TestKeyMaterialZeroing_SetSessionTicketNilClears(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -976,6 +1034,7 @@ func TestKeyMaterialZeroing_SetSessionTicketNilClears(t *testing.T) {
 // TestKeyMaterialZeroing_SetSessionTicketEmptySliceClears verifies that
 // SetSessionTicket([]byte{}) clears the ticket.
 func TestKeyMaterialZeroing_SetSessionTicketEmptySliceClears(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1005,6 +1064,7 @@ func TestKeyMaterialZeroing_SetSessionTicketEmptySliceClears(t *testing.T) {
 // TestKeyMaterialZeroing_SetResumptionSecretZerosOld verifies that
 // SetResumptionSecret zeros the old secret before setting a new one.
 func TestKeyMaterialZeroing_SetResumptionSecretZerosOld(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1043,6 +1103,7 @@ func TestKeyMaterialZeroing_SetResumptionSecretZerosOld(t *testing.T) {
 // TestGetGREASEValue_AllPositions verifies GetGREASEValue returns correct
 // values for all defined positions.
 func TestGetGREASEValue_AllPositions(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1082,6 +1143,7 @@ func TestGetGREASEValue_AllPositions(t *testing.T) {
 // TestGetGREASEValue_UnknownPosition verifies that unknown GREASE positions
 // return a consistent fallback value (Extension1).
 func TestGetGREASEValue_UnknownPosition(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1113,7 +1175,12 @@ func TestGetGREASEValue_UnknownPosition(t *testing.T) {
 
 // TestGenerateSessionID_Length verifies session IDs have correct length.
 func TestGenerateSessionID_Length(t *testing.T) {
-	for i := 0; i < 100; i++ {
+	t.Parallel()
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		id := generateSessionID()
 		// 16 bytes = 32 hex chars
 		if len(id) != 32 {
@@ -1124,8 +1191,13 @@ func TestGenerateSessionID_Length(t *testing.T) {
 
 // TestGenerateSessionID_Uniqueness verifies session IDs are unique.
 func TestGenerateSessionID_Uniqueness(t *testing.T) {
+	t.Parallel()
+	iterations := 10000
+	if testing.Short() {
+		iterations = 1000
+	}
 	seen := make(map[string]bool)
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < iterations; i++ {
 		id := generateSessionID()
 		if seen[id] {
 			t.Errorf("Duplicate session ID generated: %q", id)
@@ -1136,7 +1208,12 @@ func TestGenerateSessionID_Uniqueness(t *testing.T) {
 
 // TestGenerateSessionID_HexCharacters verifies session IDs contain only hex chars.
 func TestGenerateSessionID_HexCharacters(t *testing.T) {
-	for i := 0; i < 100; i++ {
+	t.Parallel()
+	iterations := 100
+	if testing.Short() {
+		iterations = 20
+	}
+	for i := 0; i < iterations; i++ {
 		id := generateSessionID()
 		for _, c := range id {
 			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
@@ -1152,6 +1229,7 @@ func TestGenerateSessionID_HexCharacters(t *testing.T) {
 
 // TestDefaultSessionCache_Exists verifies the default cache is initialized.
 func TestDefaultSessionCache_Exists(t *testing.T) {
+	t.Parallel()
 	if DefaultSessionCache == nil {
 		t.Fatal("DefaultSessionCache should not be nil")
 	}
@@ -1171,6 +1249,7 @@ func TestDefaultSessionCache_Exists(t *testing.T) {
 
 // TestErrSessionFrozen_ErrorMessage verifies the error message.
 func TestErrSessionFrozen_ErrorMessage(t *testing.T) {
+	t.Parallel()
 	expected := "tls: session state is frozen"
 	if ErrSessionFrozen.Error() != expected {
 		t.Errorf("ErrSessionFrozen.Error() = %q, expected %q",
@@ -1185,6 +1264,7 @@ func TestErrSessionFrozen_ErrorMessage(t *testing.T) {
 // TestNewSessionStateCache_DefaultValues verifies default values are applied
 // for invalid inputs.
 func TestNewSessionStateCache_DefaultValues(t *testing.T) {
+	t.Parallel()
 	// Zero/negative maxSize should use default
 	cache := NewSessionStateCache(0, time.Hour)
 	stats := cache.Stats()
@@ -1220,7 +1300,8 @@ func TestNewSessionStateCache_DefaultValues(t *testing.T) {
 
 // TestSessionCacheStats_WithTickets verifies ticket count is accurate.
 func TestSessionCacheStats_WithTickets(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1249,7 +1330,8 @@ func TestSessionCacheStats_WithTickets(t *testing.T) {
 
 // TestSessionCacheStats_TotalConnections verifies connection count is accurate.
 func TestSessionCacheStats_TotalConnections(t *testing.T) {
-	cache := NewSessionStateCache(100, time.Hour)
+	t.Parallel()
+	cache := NewSessionStateCache(10, time.Hour) // Reduced cache size
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1277,8 +1359,9 @@ func TestSessionCacheStats_TotalConnections(t *testing.T) {
 // TestSessionCache_Get_RemovesExpiredEntry verifies that Get() removes expired
 // entries from the cache instead of leaving them as memory leaks.
 func TestSessionCache_Get_RemovesExpiredEntry(t *testing.T) {
-	// Very short TTL for testing
-	cache := NewSessionStateCache(100, 10*time.Millisecond)
+	t.Parallel()
+	// Very short TTL for testing - reduced from 10ms to 5ms
+	cache := NewSessionStateCache(10, 5*time.Millisecond)
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1293,11 +1376,11 @@ func TestSessionCache_Get_RemovesExpiredEntry(t *testing.T) {
 		t.Fatalf("Expected 1 entry, got %d", stats.Size)
 	}
 
-	// Wait for expiration
-	time.Sleep(20 * time.Millisecond)
+	// Wait for expiration - 10ms is sufficient for 5ms TTL
+	time.Sleep(10 * time.Millisecond)
 
 	// Get() should return nil AND remove the expired entry
-	state := cache.Get("origin.com:443")
+	state := cache.Get("origin.com:443", profile.ID)
 	if state != nil {
 		t.Error("Get() should return nil for expired entry")
 	}
@@ -1315,33 +1398,36 @@ func TestSessionCache_Get_RemovesExpiredEntry(t *testing.T) {
 // This test uses moderate concurrency to validate lock upgrade safety without
 // excessive memory usage from race detector overhead.
 func TestSessionCache_Get_ConcurrentExpiredCleanup(t *testing.T) {
-	cache := NewSessionStateCache(20, 5*time.Millisecond)
+	t.Parallel()
+	cache := NewSessionStateCache(10, 3*time.Millisecond) // Reduced TTL
 	profile := &FingerprintProfile{
 		ID:      "test",
 		Browser: "chrome",
 	}
 
 	// Create entries - use small count to minimize memory footprint
-	const numEntries = 5
+	numEntries := 5
+	if testing.Short() {
+		numEntries = 3
+	}
 	origins := make([]string, numEntries)
 	for i := 0; i < numEntries; i++ {
 		origins[i] = "o" + string(rune('A'+i)) + ".com"
 		cache.GetOrCreate(origins[i], profile)
 	}
 
-	// Wait for expiration
-	time.Sleep(10 * time.Millisecond)
+	// Wait for expiration - 6ms is sufficient for 3ms TTL
+	time.Sleep(6 * time.Millisecond)
 
 	// Concurrent Get() calls should safely cleanup expired entries.
-	// Use moderate goroutine count (2x entries) to test lock contention
-	// without excessive memory overhead from race detector.
+	// Use moderate goroutine count to test lock contention
 	var wg sync.WaitGroup
-	const goroutines = numEntries * 2
+	goroutines := numEntries * 2
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			_ = cache.Get(origins[id%numEntries])
+			_ = cache.Get(origins[id%numEntries], profile.ID)
 		}(i)
 	}
 
@@ -1361,6 +1447,7 @@ func TestSessionCache_Get_ConcurrentExpiredCleanup(t *testing.T) {
 // TestGetFrozenExtensionOrder_ReturnsCopy verifies GetFrozenExtensionOrder
 // returns a copy that doesn't affect the original state when modified.
 func TestGetFrozenExtensionOrder_ReturnsCopy(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1404,6 +1491,7 @@ func TestGetFrozenExtensionOrder_ReturnsCopy(t *testing.T) {
 
 // TestGetFrozenKeyShareGroups_ReturnsCopy verifies the copy behavior.
 func TestGetFrozenKeyShareGroups_ReturnsCopy(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1440,6 +1528,7 @@ func TestGetFrozenKeyShareGroups_ReturnsCopy(t *testing.T) {
 
 // TestGetFrozenSigAlgOrder_ReturnsCopy verifies the copy behavior.
 func TestGetFrozenSigAlgOrder_ReturnsCopy(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1480,6 +1569,7 @@ func TestGetFrozenSigAlgOrder_ReturnsCopy(t *testing.T) {
 
 // TestGetFrozenValues_NilReturnsNil verifies getters return nil for unset values.
 func TestGetFrozenValues_NilReturnsNil(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test_profile",
 		Browser: "chrome",
@@ -1506,6 +1596,7 @@ func TestGetFrozenValues_NilReturnsNil(t *testing.T) {
 // Uses moderate concurrency to validate thread-safety without excessive memory
 // overhead from race detector instrumentation.
 func TestGetFrozenValues_ThreadSafe(t *testing.T) {
+	t.Parallel()
 	profile := &FingerprintProfile{
 		ID:      "test",
 		Browser: "chrome",
@@ -1530,8 +1621,12 @@ func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	const goroutines = 20
-	const iterations = 20
+	goroutines := 20
+	iterations := 20
+	if testing.Short() {
+		goroutines = 10
+		iterations = 10
+	}
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
@@ -1563,6 +1658,7 @@ func TestGetFrozenValues_ThreadSafe(t *testing.T) {
 // Uses moderate concurrency to validate race condition fix without excessive
 // memory overhead from race detector instrumentation.
 func TestEvictOldest_LastUsedRaceCondition(t *testing.T) {
+	t.Parallel()
 	cache := NewSessionStateCache(5, time.Hour)
 	profile := &FingerprintProfile{
 		ID:      "test",
@@ -1570,18 +1666,23 @@ func TestEvictOldest_LastUsedRaceCondition(t *testing.T) {
 	}
 
 	// Fill cache to capacity
-	const numEntries = 5
+	numEntries := 5
+	if testing.Short() {
+		numEntries = 3
+	}
 	origins := make([]string, numEntries)
 	for i := 0; i < numEntries; i++ {
 		origins[i] = "o" + string(rune('A'+i)) + ".com"
 		cache.GetOrCreate(origins[i], profile)
-		time.Sleep(time.Millisecond) // Ensure different timestamps
 	}
 
 	var wg sync.WaitGroup
 
 	// Concurrently touch existing sessions while adding new ones
-	const goroutines = 10
+	goroutines := 10
+	if testing.Short() {
+		goroutines = 5
+	}
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -1589,7 +1690,7 @@ func TestEvictOldest_LastUsedRaceCondition(t *testing.T) {
 
 			// Touch existing entries
 			for j := 0; j < numEntries; j++ {
-				state := cache.Get(origins[j])
+				state := cache.Get(origins[j], profile.ID)
 				if state != nil {
 					state.Touch()
 				}

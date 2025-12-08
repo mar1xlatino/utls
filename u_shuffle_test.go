@@ -19,8 +19,8 @@ import (
 // Generates 1000 ClientHellos and expects at least 100 unique orderings.
 
 func TestShuffleRandomnessChrome(t *testing.T) {
-	const iterations = 1000
-	const minUniqueOrderings = 100
+	iterations := shortModeIterations(1000, 200)
+	minUniqueOrderings := shortModeIterations(100, 20)
 
 	orderingCounts := make(map[string]int)
 
@@ -61,8 +61,8 @@ func TestShuffleRandomnessChrome(t *testing.T) {
 }
 
 func TestShuffleRandomnessFirefox(t *testing.T) {
-	const iterations = 1000
-	const minUniqueOrderings = 100
+	iterations := shortModeIterations(1000, 200)
+	minUniqueOrderings := shortModeIterations(100, 20)
 
 	orderingCounts := make(map[string]int)
 
@@ -148,7 +148,7 @@ func TestShuffleDeterminismWithSeed(t *testing.T) {
 // Verifies GREASE values change between connections and are valid per RFC 8701.
 
 func TestGREASEValueRandomness(t *testing.T) {
-	const iterations = 100
+	iterations := shortModeIterations(100, 30)
 
 	// Valid GREASE values per RFC 8701: 0x?a?a pattern
 	validGREASE := map[uint16]bool{
@@ -277,9 +277,10 @@ func TestShufflePreservesPSKLast(t *testing.T) {
 		HelloChrome_115_PQ_PSK,
 	}
 
+	iterations := shortModeIterations(50, 10)
 	for _, profile := range profiles {
 		t.Run(profile.Str(), func(t *testing.T) {
-			for i := 0; i < 50; i++ {
+			for i := 0; i < iterations; i++ {
 				spec, err := UTLSIdToSpec(profile)
 				if err != nil {
 					t.Fatalf("iteration %d: failed to get spec: %v", i, err)
@@ -314,7 +315,7 @@ func TestShufflePreservesPSKLast(t *testing.T) {
 
 func TestShufflePreservesGREASEPosition(t *testing.T) {
 	// Chrome keeps GREASE extensions in their original positions
-	const iterations = 50
+	iterations := shortModeIterations(50, 10)
 
 	for i := 0; i < iterations; i++ {
 		spec, err := UTLSIdToSpec(HelloChrome_120)
@@ -380,7 +381,7 @@ func TestShufflePreservesPaddingPosition(t *testing.T) {
 // Chrome preserves GREASE positions, Firefox does not use GREASE.
 
 func TestFirefoxVsChromeShuffleComparison(t *testing.T) {
-	const iterations = 100
+	iterations := shortModeIterations(100, 30)
 
 	chromeOrderings := make(map[string]bool)
 	firefoxOrderings := make(map[string]bool)
@@ -448,10 +449,9 @@ func TestNoShuffleLegacyProfiles(t *testing.T) {
 		HelloSafari_18,
 	}
 
+	iterations := shortModeIterations(100, 20)
 	for _, profile := range legacyProfiles {
 		t.Run(profile.Str(), func(t *testing.T) {
-			const iterations = 100
-
 			var referenceOrder string
 			for i := 0; i < iterations; i++ {
 				spec, err := UTLSIdToSpec(profile)
@@ -479,7 +479,7 @@ func TestNoShuffleLegacyProfiles(t *testing.T) {
 func TestNonShufflingFirefox120(t *testing.T) {
 	// Firefox 120 does NOT use shuffle (shuffle was added in Firefox 106/NSS 3.84)
 	// but our HelloFirefox_120 profile is defined without shuffle
-	const iterations = 100
+	iterations := shortModeIterations(100, 20)
 
 	var referenceOrder string
 	for i := 0; i < iterations; i++ {
@@ -508,7 +508,8 @@ func TestShuffleFunctionDirectly(t *testing.T) {
 	// Test ShuffleChromeTLSExtensions directly
 	t.Run("ShuffleChromeTLSExtensions", func(t *testing.T) {
 		orderings := make(map[string]bool)
-		for i := 0; i < 100; i++ {
+		iterations := shortModeIterations(100, 20)
+		for i := 0; i < iterations; i++ {
 			exts := []TLSExtension{
 				&UtlsGREASEExtension{},    // Should stay at position 0
 				&SNIExtension{},           // Can be shuffled
@@ -541,7 +542,8 @@ func TestShuffleFunctionDirectly(t *testing.T) {
 
 	t.Run("ShuffleFirefoxTLSExtensions", func(t *testing.T) {
 		orderings := make(map[string]bool)
-		for i := 0; i < 100; i++ {
+		iterations := shortModeIterations(100, 20)
+		for i := 0; i < iterations; i++ {
 			exts := []TLSExtension{
 				&SNIExtension{},
 				&ALPNExtension{},
@@ -568,7 +570,8 @@ func TestShuffleFunctionDirectly(t *testing.T) {
 
 func TestShuffleWithPSKExtension(t *testing.T) {
 	// PSK must ALWAYS be last per RFC 8446
-	for i := 0; i < 100; i++ {
+	iterations := shortModeIterations(100, 20)
+	for i := 0; i < iterations; i++ {
 		exts := []TLSExtension{
 			&SNIExtension{},
 			&ALPNExtension{},

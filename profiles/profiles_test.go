@@ -5,15 +5,56 @@
 package profiles
 
 import (
+	"sync"
 	"testing"
 
 	tls "github.com/refraction-networking/utls"
 )
 
-// TestAllProfilesValid verifies all profiles pass validation
+// cachedProfiles holds cached All() result to avoid repeated slice allocation.
+var (
+	cachedProfiles     []*tls.FingerprintProfile
+	cachedProfilesOnce sync.Once
+)
+
+// getCachedProfiles returns cached profiles for testing.
+func getCachedProfiles() []*tls.FingerprintProfile {
+	cachedProfilesOnce.Do(func() {
+		cachedProfiles = All()
+	})
+	return cachedProfiles
+}
+
+// representativeProfiles returns a subset of profiles for -short mode testing.
+// Includes one profile from each major browser family.
+func representativeProfiles() []*tls.FingerprintProfile {
+	return []*tls.FingerprintProfile{
+		Chrome142Linux,          // Chromium-based
+		Firefox145Linux,         // Firefox
+		Safari18Ios,             // Safari
+		Edge141Windows11,        // Edge (Chromium)
+		SamsungInternet29Android, // Mobile Chromium variant
+	}
+}
+
+// getTestProfiles returns profiles to test based on -short flag.
+func getTestProfiles(t *testing.T) []*tls.FingerprintProfile {
+	if testing.Short() {
+		t.Log("Running in short mode: testing representative subset of profiles")
+		return representativeProfiles()
+	}
+	return getCachedProfiles()
+}
+
+// TestAllProfilesValid verifies all profiles pass validation.
 func TestAllProfilesValid(t *testing.T) {
-	for _, p := range All() {
+	t.Parallel()
+	profiles := getTestProfiles(t)
+
+	for _, p := range profiles {
+		p := p // capture for parallel
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			errs := p.Validate()
 			if len(errs) > 0 {
 				for _, err := range errs {
@@ -24,10 +65,15 @@ func TestAllProfilesValid(t *testing.T) {
 	}
 }
 
-// TestAllProfilesHaveExpectedFingerprints verifies all profiles have expected JA3/JA4
+// TestAllProfilesHaveExpectedFingerprints verifies all profiles have expected JA3/JA4.
 func TestAllProfilesHaveExpectedFingerprints(t *testing.T) {
-	for _, p := range All() {
+	t.Parallel()
+	profiles := getTestProfiles(t)
+
+	for _, p := range profiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			if p.Expected.JA3 == "" {
 				t.Error("missing Expected.JA3")
 			}
@@ -41,10 +87,15 @@ func TestAllProfilesHaveExpectedFingerprints(t *testing.T) {
 	}
 }
 
-// TestAllProfilesHaveRequiredFields verifies required fields are set
+// TestAllProfilesHaveRequiredFields verifies required fields are set.
 func TestAllProfilesHaveRequiredFields(t *testing.T) {
-	for _, p := range All() {
+	t.Parallel()
+	profiles := getTestProfiles(t)
+
+	for _, p := range profiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			if p.ID == "" {
 				t.Error("missing ID")
 			}
@@ -73,27 +124,46 @@ func TestAllProfilesHaveRequiredFields(t *testing.T) {
 	}
 }
 
-// TestProfilesRegistered verifies profiles are auto-registered
+// TestProfilesRegistered verifies profiles are auto-registered.
 func TestProfilesRegistered(t *testing.T) {
-	// The init() function should have auto-registered all profiles
-	for _, id := range IDs() {
-		if !tls.DefaultRegistry.Exists(id) {
-			t.Errorf("profile %q not registered in DefaultRegistry", id)
+	t.Parallel()
+
+	ids := IDs()
+	if testing.Short() {
+		// Test only representative IDs in short mode
+		ids = []string{
+			"chrome_142_linux",
+			"firefox_145_linux",
+			"safari_18_ios",
+			"edge_141_windows_11",
 		}
+	}
+
+	for _, id := range ids {
+		id := id
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+			if !tls.DefaultRegistry.Exists(id) {
+				t.Errorf("profile %q not registered in DefaultRegistry", id)
+			}
+		})
 	}
 }
 
-// TestProfileCount verifies expected number of profiles
+// TestProfileCount verifies expected number of profiles.
 func TestProfileCount(t *testing.T) {
-	all := All()
+	t.Parallel()
+	all := getCachedProfiles()
 	expected := 26 // Current count
 	if len(all) != expected {
 		t.Errorf("expected %d profiles, got %d", expected, len(all))
 	}
 }
 
-// TestBrowserGroupings verifies browser grouping functions return correct profiles
+// TestBrowserGroupings verifies browser grouping functions return correct profiles.
 func TestBrowserGroupings(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		fn       func() []*tls.FingerprintProfile
@@ -109,7 +179,9 @@ func TestBrowserGroupings(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			profiles := tt.fn()
 			if len(profiles) < tt.minCount {
 				t.Errorf("expected at least %d %s profiles, got %d", tt.minCount, tt.name, len(profiles))
@@ -123,8 +195,10 @@ func TestBrowserGroupings(t *testing.T) {
 	}
 }
 
-// TestAndroidProfiles verifies Android filter works
+// TestAndroidProfiles verifies Android filter works.
 func TestAndroidProfiles(t *testing.T) {
+	t.Parallel()
+
 	android := Android()
 	if len(android) < 8 { // Chrome, Firefox, Opera, Samsung, UC, Yandex all have Android
 		t.Errorf("expected at least 8 Android profiles, got %d", len(android))
@@ -136,34 +210,50 @@ func TestAndroidProfiles(t *testing.T) {
 	}
 }
 
-// TestChromiumBrowsersHaveGREASE verifies Chromium-based browsers have GREASE enabled
+// TestChromiumBrowsersHaveGREASE verifies Chromium-based browsers have GREASE enabled.
 func TestChromiumBrowsersHaveGREASE(t *testing.T) {
-	chromiumBrowsers := []string{"chrome", "edge", "opera", "samsung_internet", "uc_browser", "yandex"}
-	for _, p := range All() {
-		isChromium := false
-		for _, cb := range chromiumBrowsers {
-			if p.Browser == cb {
-				isChromium = true
-				break
+	t.Parallel()
+
+	chromiumBrowsers := map[string]bool{
+		"chrome":           true,
+		"edge":             true,
+		"opera":            true,
+		"samsung_internet": true,
+		"uc_browser":       true,
+		"yandex":           true,
+	}
+
+	profiles := getTestProfiles(t)
+	for _, p := range profiles {
+		if !chromiumBrowsers[p.Browser] {
+			continue
+		}
+		p := p
+		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
+			if !p.ClientHello.GREASE.Enabled {
+				t.Error("Chromium-based browser should have GREASE.Enabled=true")
 			}
-		}
-		if isChromium {
-			t.Run(p.ID, func(t *testing.T) {
-				if !p.ClientHello.GREASE.Enabled {
-					t.Error("Chromium-based browser should have GREASE.Enabled=true")
-				}
-				if !p.ClientHello.ShuffleExtensions {
-					t.Error("Chromium-based browser should have ShuffleExtensions=true")
-				}
-			})
-		}
+			if !p.ClientHello.ShuffleExtensions {
+				t.Error("Chromium-based browser should have ShuffleExtensions=true")
+			}
+		})
 	}
 }
 
-// TestFirefoxNoGREASE verifies Firefox profiles don't use GREASE
+// TestFirefoxNoGREASE verifies Firefox profiles don't use GREASE.
 func TestFirefoxNoGREASE(t *testing.T) {
-	for _, p := range Firefox() {
+	t.Parallel()
+
+	firefoxProfiles := Firefox()
+	if testing.Short() {
+		firefoxProfiles = []*tls.FingerprintProfile{Firefox145Linux}
+	}
+
+	for _, p := range firefoxProfiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			if p.ClientHello.GREASE.Enabled {
 				t.Error("Firefox should not have GREASE.Enabled")
 			}
@@ -174,10 +264,19 @@ func TestFirefoxNoGREASE(t *testing.T) {
 	}
 }
 
-// TestSafariHasGREASE verifies Safari profiles use GREASE (modern Safari does use GREASE)
+// TestSafariHasGREASE verifies Safari profiles use GREASE (modern Safari does use GREASE).
 func TestSafariHasGREASE(t *testing.T) {
-	for _, p := range Safari() {
+	t.Parallel()
+
+	safariProfiles := Safari()
+	if testing.Short() {
+		safariProfiles = []*tls.FingerprintProfile{Safari18Ios}
+	}
+
+	for _, p := range safariProfiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			// Modern Safari (17+) uses GREASE
 			if !p.ClientHello.GREASE.Enabled {
 				t.Error("Modern Safari should have GREASE.Enabled=true")
@@ -190,9 +289,18 @@ func TestSafariHasGREASE(t *testing.T) {
 // Note: JA3 and JA4 (sorted) may vary due to GREASE, but JA4o (original order) should be stable
 // when extension order is NOT shuffled (or matches frozen order).
 func TestProfileFingerprintMatch(t *testing.T) {
+	t.Parallel()
+
 	// Test non-shuffling profiles (Firefox) first - these should have stable JA4o
-	for _, p := range Firefox() {
+	firefoxProfiles := Firefox()
+	if testing.Short() {
+		firefoxProfiles = []*tls.FingerprintProfile{Firefox145Linux}
+	}
+
+	for _, p := range firefoxProfiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			// Verify Firefox profiles don't shuffle
 			if p.ClientHello.ShuffleExtensions {
 				t.Skip("Profile shuffles extensions, JA4o will vary")
@@ -211,10 +319,15 @@ func TestProfileFingerprintMatch(t *testing.T) {
 	}
 }
 
-// TestProfileCloning verifies profiles can be cloned without mutation
+// TestProfileCloning verifies profiles can be cloned without mutation.
 func TestProfileCloning(t *testing.T) {
-	for _, p := range All() {
+	t.Parallel()
+
+	profiles := getTestProfiles(t)
+	for _, p := range profiles {
+		p := p
 		t.Run(p.ID, func(t *testing.T) {
+			t.Parallel()
 			clone := p.Clone()
 			if clone.ID != p.ID {
 				t.Errorf("clone.ID = %q, want %q", clone.ID, p.ID)

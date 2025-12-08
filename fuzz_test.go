@@ -2,6 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Fuzz tests for TLS message parsing.
+//
+// CI Usage:
+//   - go test -run='Fuzz' -v           # Run seed corpus only (fast, default in CI)
+//   - go test -run='TestFuzz' -v       # Run wrapper tests with seed corpus
+//   - go test -short -run='Fuzz'       # Skip fuzz tests entirely
+//
+// Local Fuzzing (not for CI):
+//   - go test -fuzz=FuzzParseClientHello -fuzztime=30s  # Fuzz for 30 seconds
+//   - go test -fuzz=. -fuzztime=1m                       # Fuzz all targets for 1 minute
+//
+// The seed corpus is defined inline via f.Add() calls. Crash inputs are stored
+// in testdata/fuzz/<FuzzTestName>/ automatically by Go's fuzzing infrastructure.
+
 package tls
 
 import (
@@ -12,6 +26,15 @@ import (
 	"github.com/refraction-networking/utls/internal/quicvarint"
 )
 
+// skipFuzzInShortMode skips fuzz tests if -short flag is set.
+// Fuzz tests are fast (seed corpus only takes ~77ms total) but can be
+// skipped in short mode if the test suite needs to be even faster.
+func skipFuzzInShortMode(t testing.TB) {
+	if testing.Short() {
+		t.Skip("skipping fuzz test in short mode")
+	}
+}
+
 // FuzzParseClientHello tests the clientHelloMsg.unmarshal function for panics
 // and crashes when processing arbitrary input data.
 //
@@ -19,6 +42,8 @@ import (
 // data from network clients. This fuzz test ensures the parser handles malformed
 // input gracefully without panicking.
 func FuzzParseClientHello(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Seed corpus: minimal valid ClientHello structure
 	// Format: [1 byte type][3 bytes length][2 bytes version][32 bytes random][1 byte session_id_len][2 bytes cipher_suites_len][1 byte compression_len]
 	minimalClientHello := []byte{
@@ -94,6 +119,8 @@ func FuzzParseClientHello(f *testing.F) {
 // While typically server data is more trusted, a malicious or buggy server
 // could send malformed ServerHello messages that should not crash the client.
 func FuzzParseServerHello(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Seed corpus: minimal valid ServerHello structure
 	// Format: [1 byte type][3 bytes length][2 bytes version][32 bytes random][1 byte session_id_len][2 bytes cipher_suite][1 byte compression]
 	minimalServerHello := []byte{
@@ -183,6 +210,8 @@ func FuzzParseServerHello(f *testing.F) {
 // as it processes externally-provided cryptographic configuration data. Malformed
 // ECH configs could be used to attack clients attempting to establish private connections.
 func FuzzParseECHConfig(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Seed corpus from actual test data
 	// Valid Cloudflare ECH config
 	cloudflareConfig, _ := hex.DecodeString("fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000")
@@ -286,6 +315,8 @@ func FuzzParseECHConfig(f *testing.F) {
 // retrieved from DNS HTTPS records. This is an additional attack surface
 // that should be robust against malformed input.
 func FuzzParseECHConfigList(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Valid single-config list from Cloudflare
 	singleConfigList, _ := hex.DecodeString("0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000")
 	f.Add(singleConfigList)
@@ -331,6 +362,8 @@ func FuzzParseECHConfigList(f *testing.F) {
 // resume sessions, potentially leading to denial of service or information
 // disclosure.
 func FuzzParseSessionState(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Minimal valid session state structure
 	// Based on SessionState.Bytes() encoding
 	minimalSessionState := []byte{
@@ -413,6 +446,8 @@ func FuzzParseSessionState(f *testing.F) {
 // The parser must handle all possible input gracefully, including truncated
 // data, non-minimal encodings, and maximum values.
 func FuzzQUICVarint(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Single byte values (0-63)
 	f.Add([]byte{0x00})
 	f.Add([]byte{0x3f})
@@ -464,6 +499,8 @@ func FuzzQUICVarint(f *testing.F) {
 // could be used to attack TLS clients or servers, potentially leading to
 // memory corruption or denial of service.
 func FuzzCertificateMsgTLS13(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Minimal valid certificate message (empty certificate chain)
 	minimalCertMsg := []byte{
 		0x0b,             // handshake type: Certificate
@@ -568,6 +605,8 @@ func FuzzCertificateMsgTLS13(f *testing.F) {
 // resumption. A malicious server could send malformed session tickets to
 // attack clients, potentially causing crashes or memory corruption.
 func FuzzNewSessionTicketMsgTLS13(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Minimal valid session ticket message
 	minimalTicket := []byte{
 		0x04,             // handshake type: NewSessionTicket
@@ -626,6 +665,8 @@ func FuzzNewSessionTicketMsgTLS13(f *testing.F) {
 // Certificate request messages are sent by servers during mutual TLS handshakes.
 // A malicious server could send malformed certificate requests to attack clients.
 func FuzzCertificateRequestMsgTLS13(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Minimal valid certificate request
 	minimalCertReq := []byte{
 		0x0d,             // handshake type: CertificateRequest
@@ -675,6 +716,8 @@ func FuzzCertificateRequestMsgTLS13(f *testing.F) {
 // Encrypted extensions are sent by servers in TLS 1.3 and contain critical
 // configuration data. Malformed encrypted extensions could crash clients.
 func FuzzEncryptedExtensionsMsg(f *testing.F) {
+	skipFuzzInShortMode(f)
+
 	// Minimal valid encrypted extensions (empty)
 	minimalEE := []byte{
 		0x08,             // handshake type: EncryptedExtensions
@@ -709,4 +752,201 @@ func FuzzEncryptedExtensionsMsg(f *testing.F) {
 		msg := &encryptedExtensionsMsg{}
 		msg.unmarshal(data)
 	})
+}
+
+// =============================================================================
+// TestFuzz* wrapper tests for CI compatibility
+// =============================================================================
+//
+// These wrapper tests allow running fuzz test seed corpuses with:
+//   go test -run 'TestFuzz' -v
+//
+// They provide explicit test coverage verification without requiring the -fuzz flag.
+
+// TestFuzzParsersCI runs all parser fuzz tests with their seed corpus.
+// This is a comprehensive CI test that verifies all parsers handle edge cases.
+func TestFuzzParsersCI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping fuzz parser tests in short mode")
+	}
+
+	t.Run("ClientHello", testClientHelloParsing)
+	t.Run("ServerHello", testServerHelloParsing)
+	t.Run("ECHConfig", testECHConfigParsing)
+	t.Run("ECHConfigList", testECHConfigListParsing)
+	t.Run("SessionState", testSessionStateParsing)
+	t.Run("QUICVarint", testQUICVarintParsing)
+	t.Run("CertificateMsgTLS13", testCertificateMsgTLS13Parsing)
+	t.Run("NewSessionTicketMsgTLS13", testNewSessionTicketMsgTLS13Parsing)
+	t.Run("CertificateRequestMsgTLS13", testCertificateRequestMsgTLS13Parsing)
+	t.Run("EncryptedExtensionsMsg", testEncryptedExtensionsMsgParsing)
+}
+
+// testClientHelloParsing tests ClientHello parsing with edge cases.
+func testClientHelloParsing(t *testing.T) {
+	testCases := [][]byte{
+		// Minimal valid ClientHello
+		{
+			0x01, 0x00, 0x00, 0x26, 0x03, 0x03,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x02, 0x00, 0x2f, 0x01, 0x00,
+		},
+		// Edge cases
+		{},
+		{0x01},
+		{0x01, 0x00, 0x00, 0x00},
+		{0x01, 0xff, 0xff, 0xff},
+	}
+	for _, data := range testCases {
+		msg := &clientHelloMsg{}
+		msg.unmarshal(data) // Should not panic
+	}
+}
+
+// testServerHelloParsing tests ServerHello parsing with edge cases.
+func testServerHelloParsing(t *testing.T) {
+	testCases := [][]byte{
+		// Minimal valid ServerHello
+		{
+			0x02, 0x00, 0x00, 0x26, 0x03, 0x03,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x2f, 0x00,
+		},
+		// Edge cases
+		{},
+		{0x02},
+		{0x02, 0x00, 0x00, 0x00},
+		{0x02, 0xff, 0xff, 0xff},
+	}
+	for _, data := range testCases {
+		msg := &serverHelloMsg{}
+		msg.unmarshal(data) // Should not panic
+	}
+}
+
+// testECHConfigParsing tests ECH config parsing with edge cases.
+func testECHConfigParsing(t *testing.T) {
+	testCases := [][]byte{
+		// Edge cases
+		{},
+		{0xfe},
+		{0xfe, 0x0d},
+		{0xfe, 0x0d, 0x00, 0x00},
+		{0xfe, 0x0d, 0xff, 0xff},
+		{0xba, 0xdd, 0x00, 0x05, 0x05, 0x04, 0x03, 0x02, 0x01}, // Unknown version
+	}
+	for _, data := range testCases {
+		parseECHConfig(data) // Should not panic
+	}
+}
+
+// testECHConfigListParsing tests ECH config list parsing with edge cases.
+func testECHConfigListParsing(t *testing.T) {
+	testCases := [][]byte{
+		{},
+		{0x00},
+		{0x00, 0x00},
+		{0x00, 0x01},
+		{0xff, 0xff},
+	}
+	for _, data := range testCases {
+		parseECHConfigList(data) // Should not panic
+	}
+}
+
+// testSessionStateParsing tests session state parsing with edge cases.
+func testSessionStateParsing(t *testing.T) {
+	testCases := [][]byte{
+		{},
+		{0x03},
+		{0x03, 0x03},
+		{0x03, 0x03, 0x01},
+		{0x03, 0x03, 0x00, 0x00, 0x2f},
+		{0x03, 0x03, 0x03, 0x00, 0x2f},
+		{0x03, 0x03, 0x01, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff},
+	}
+	for _, data := range testCases {
+		ParseSessionState(data) // Should not panic
+	}
+}
+
+// testQUICVarintParsing tests QUIC varint parsing with edge cases.
+func testQUICVarintParsing(t *testing.T) {
+	testCases := [][]byte{
+		{},
+		{0x00},
+		{0x3f},
+		{0x40, 0x40},
+		{0x7f, 0xff},
+		{0x40},                         // Truncated 2-byte
+		{0x80, 0x00},                   // Truncated 4-byte
+		{0xc0, 0x00, 0x00, 0x00},       // Truncated 8-byte
+		{0x40, 0x00},                   // Non-minimal encoding
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // Max value
+	}
+	for _, data := range testCases {
+		quicvarint.Read(bytes.NewReader(data))
+		quicvarint.ReadLenient(bytes.NewReader(data))
+	}
+}
+
+// testCertificateMsgTLS13Parsing tests TLS 1.3 certificate message parsing.
+func testCertificateMsgTLS13Parsing(t *testing.T) {
+	testCases := [][]byte{
+		{0x0b, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00}, // Minimal
+		{},
+		{0x0b},
+		{0x0b, 0x00, 0x00, 0x00},
+		{0x0b, 0xff, 0xff, 0xff},
+	}
+	for _, data := range testCases {
+		msg := &certificateMsgTLS13{}
+		msg.unmarshal(data)
+	}
+}
+
+// testNewSessionTicketMsgTLS13Parsing tests TLS 1.3 session ticket parsing.
+func testNewSessionTicketMsgTLS13Parsing(t *testing.T) {
+	testCases := [][]byte{
+		{},
+		{0x04},
+		{0x04, 0x00, 0x00, 0x00},
+		{0x04, 0xff, 0xff, 0xff},
+	}
+	for _, data := range testCases {
+		msg := &newSessionTicketMsgTLS13{}
+		msg.unmarshal(data)
+	}
+}
+
+// testCertificateRequestMsgTLS13Parsing tests TLS 1.3 certificate request parsing.
+func testCertificateRequestMsgTLS13Parsing(t *testing.T) {
+	testCases := [][]byte{
+		{0x0d, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00}, // Minimal
+		{},
+		{0x0d},
+		{0x0d, 0x00, 0x00, 0x00},
+	}
+	for _, data := range testCases {
+		msg := &certificateRequestMsgTLS13{}
+		msg.unmarshal(data)
+	}
+}
+
+// testEncryptedExtensionsMsgParsing tests encrypted extensions parsing.
+func testEncryptedExtensionsMsgParsing(t *testing.T) {
+	testCases := [][]byte{
+		{0x08, 0x00, 0x00, 0x02, 0x00, 0x00}, // Minimal
+		{},
+	}
+	for _, data := range testCases {
+		msg := &encryptedExtensionsMsg{}
+		msg.unmarshal(data)
+	}
 }

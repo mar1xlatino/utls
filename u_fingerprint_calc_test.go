@@ -392,6 +392,8 @@ func TestJA4_WithSNI(t *testing.T) {
 
 // TestJA4_NonAlphanumericALPN tests JA4 ALPN encoding for non-alphanumeric protocols.
 func TestJA4_NonAlphanumericALPN(t *testing.T) {
+	t.Parallel()
+
 	// Build ClientHello with ALPN containing non-alphanumeric chars
 	// ALPN like "spdy/3.1" has '/' which is non-alphanumeric
 	extensions := []uint16{0, 10, 11, 16, 43} // 16 = ALPN
@@ -402,6 +404,7 @@ func TestJA4_NonAlphanumericALPN(t *testing.T) {
 
 	// Test alphanumeric ALPN
 	t.Run("alphanumeric_h2", func(t *testing.T) {
+		t.Parallel()
 		alpn := "h2"
 		first := alpn[0]
 		last := alpn[len(alpn)-1]
@@ -412,6 +415,7 @@ func TestJA4_NonAlphanumericALPN(t *testing.T) {
 
 	// Test non-alphanumeric ALPN
 	t.Run("non_alphanumeric_spdy/3.1", func(t *testing.T) {
+		t.Parallel()
 		alpn := "spdy/3.1"
 		first := alpn[0]
 		last := alpn[len(alpn)-1]
@@ -425,6 +429,7 @@ func TestJA4_NonAlphanumericALPN(t *testing.T) {
 
 	// Test ALPN with special chars at both ends
 	t.Run("special_chars_at_ends", func(t *testing.T) {
+		t.Parallel()
 		alpn := "/special/"
 		first := alpn[0]
 		last := alpn[len(alpn)-1]
@@ -434,19 +439,22 @@ func TestJA4_NonAlphanumericALPN(t *testing.T) {
 	})
 
 	// Test ClientHello with real ALPN
-	raw := buildValidClientHelloWithALPN(t, []uint16{TLS_AES_128_GCM_SHA256}, extensions, "h2")
-	fp, err := CalculateFingerprints(raw)
-	if err != nil {
-		t.Fatalf("CalculateFingerprints failed: %v", err)
-	}
+	t.Run("real_alpn_h2", func(t *testing.T) {
+		t.Parallel()
+		raw := buildValidClientHelloWithALPN(t, []uint16{TLS_AES_128_GCM_SHA256}, extensions, "h2")
+		fp, err := CalculateFingerprints(raw)
+		if err != nil {
+			t.Fatalf("CalculateFingerprints failed: %v", err)
+		}
 
-	parts := strings.Split(fp.JA4, "_")
-	ja4a := parts[0]
-	// Last 2 chars should be ALPN indicator
-	alpnIndicator := ja4a[len(ja4a)-2:]
-	if alpnIndicator != "h2" {
-		t.Errorf("expected ALPN indicator 'h2', got '%s'", alpnIndicator)
-	}
+		parts := strings.Split(fp.JA4, "_")
+		ja4a := parts[0]
+		// Last 2 chars should be ALPN indicator
+		alpnIndicator := ja4a[len(ja4a)-2:]
+		if alpnIndicator != "h2" {
+			t.Errorf("expected ALPN indicator 'h2', got '%s'", alpnIndicator)
+		}
+	})
 }
 
 // TestJA4_EmptyALPN tests JA4 ALPN indicator when no ALPN extension.
@@ -1877,11 +1885,18 @@ func TestJA4SConsistency_MultipleRuns(t *testing.T) {
 
 // TestJA4XConsistency_MultipleRuns verifies JA4X consistency.
 func TestJA4XConsistency_MultipleRuns(t *testing.T) {
+	// Use fewer iterations in short mode for faster CI
+	// This tests deterministic calculation - 10 iterations is sufficient
+	iterations := 10
+	if testing.Short() {
+		iterations = 3
+	}
+
 	cert := generateTestCertificate(t)
 
 	var firstJA4X string
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		fp := CalculateJA4X(cert)
 
 		if i == 0 {

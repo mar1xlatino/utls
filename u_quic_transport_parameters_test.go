@@ -6,7 +6,11 @@ import (
 )
 
 func TestMarshal(t *testing.T) {
-	t.Run("Firefox", testTransportParametersFirefox)
+	t.Parallel()
+	t.Run("Firefox", func(t *testing.T) {
+		t.Parallel()
+		testTransportParametersFirefox(t)
+	})
 }
 
 func testTransportParametersFirefox(t *testing.T) {

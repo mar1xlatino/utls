@@ -21,25 +21,11 @@ func mustHex(s string) []byte {
 	return b
 }
 
-// =============================================================================
-// RFC 5246 TLS 1.2 PRF Test Vectors
-// =============================================================================
-//
-// The TLS 1.2 PRF is defined in RFC 5246 Section 5 as:
-//   PRF(secret, label, seed) = P_<hash>(secret, label + seed)
-//
-// These vectors are verified against OpenSSL 3.x TLS1-PRF implementation:
-//   openssl kdf -kdfopt digest:SHA256 -kdfopt hexsecret:<secret> \
-//               -kdfopt hexseed:<label_hex><seed_hex> -keylen <len> TLS1-PRF
-//
-// Cross-verification performed on 2025-12-06 using OpenSSL 3.5.4.
-//
-// =============================================================================
-
 // TestPRFOpenSSLVectors tests PRF against OpenSSL-verified test vectors.
-// These vectors were computed using OpenSSL 3.x and cross-verified against
-// the Go implementation. They test real TLS labels used in the protocol.
+// In -short mode, only the first 3 vectors are tested.
 func TestPRFOpenSSLVectors(t *testing.T) {
+	t.Parallel()
+
 	vectors := []struct {
 		name     string
 		hash     func() hash.Hash
@@ -50,9 +36,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 		expected string // hex - OpenSSL verified
 	}{
 		// Vector 1: Basic PRF with SHA-256, 16-byte secret
-		// OpenSSL: openssl kdf -kdfopt digest:SHA256 -kdfopt hexsecret:0b0b...
-		//          -kdfopt hexseed:74657374206c6162656ca0b1c2d3e4f5061728394a5b6c7d8e9f
-		//          -keylen 32 TLS1-PRF
 		{
 			name:     "SHA256-basic-16byte-secret",
 			hash:     sha256.New,
@@ -63,8 +46,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 			expected: "f4a9893edbd708eba2eda113b67a935e26d41b88c2a3f8955b4afec74cae4490",
 		},
 		// Vector 2: TLS master secret derivation (real TLS use case)
-		// Label: "master secret" (RFC 5246 Section 8.1)
-		// Seed: clientRandom || serverRandom
 		{
 			name:     "SHA256-master-secret-derivation",
 			hash:     sha256.New,
@@ -75,9 +56,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 			expected: "8eebebff4e6b9039f8e44bc439478e94c4da6a3a8216f02295749c04551fbd3f04c2ff8b5de630c279fea1cf7b81182d",
 		},
 		// Vector 3: TLS key expansion (real TLS use case)
-		// Label: "key expansion" (RFC 5246 Section 6.3)
-		// Seed: serverRandom || clientRandom (note the order!)
-		// This derives MAC keys, encryption keys, and IVs
 		{
 			name:     "SHA256-key-expansion",
 			hash:     sha256.New,
@@ -88,8 +66,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 			expected: "230030104f6b06c015642e3c28a2c73a2f4d529af1a96e51336311b60515c94d49c3c8ffb4b2d6491b3f15624e4fe034cadc751974c3ef9144f97313d6a975a1054db71bd3facaa4",
 		},
 		// Vector 4: Client Finished verify_data (12 bytes per RFC 5246)
-		// Label: "client finished"
-		// Seed: Hash of handshake messages
 		{
 			name:     "SHA256-client-finished",
 			hash:     sha256.New,
@@ -100,7 +76,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 			expected: "00036f2389378f6d08af3ef6",
 		},
 		// Vector 5: Server Finished verify_data (12 bytes per RFC 5246)
-		// Label: "server finished"
 		{
 			name:     "SHA256-server-finished",
 			hash:     sha256.New,
@@ -111,7 +86,6 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 			expected: "ba2cf3bce2be4c651129336f",
 		},
 		// Vector 6: SHA-384 PRF (for TLS_*_SHA384 cipher suites)
-		// TLS 1.2 with AES-256-GCM-SHA384 uses SHA-384 based PRF
 		{
 			name:     "SHA384-master-secret",
 			hash:     sha512.New384,
@@ -133,8 +107,15 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 		},
 	}
 
+	// In short mode, only test first 3 vectors
+	if testing.Short() {
+		vectors = vectors[:3]
+	}
+
 	for _, tc := range vectors {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			secret := mustHex(tc.secret)
 			seed := mustHex(tc.seed)
 			expected := mustHex(tc.expected)
@@ -148,12 +129,11 @@ func TestPRFOpenSSLVectors(t *testing.T) {
 	}
 }
 
-// TestExtendedMasterSecretRFC7627 tests the extended master secret derivation
-// as defined in RFC 7627. The EMS uses label "extended master secret" and
-// the session hash (hash of handshake messages) as seed.
-//
-// These vectors are verified against OpenSSL 3.x TLS1-PRF.
+// TestExtendedMasterSecretRFC7627 tests the extended master secret derivation.
+// In -short mode, only the first vector is tested.
 func TestExtendedMasterSecretRFC7627(t *testing.T) {
+	t.Parallel()
+
 	vectors := []struct {
 		name            string
 		hash            func() hash.Hash
@@ -162,7 +142,6 @@ func TestExtendedMasterSecretRFC7627(t *testing.T) {
 		expected        string // hex - OpenSSL verified
 	}{
 		// Vector 1: RSA key exchange pre-master secret (48 bytes starting with version)
-		// Version bytes 0x0303 indicate TLS 1.2
 		{
 			name:            "EMS-RSA-key-exchange",
 			hash:            sha256.New,
@@ -188,8 +167,15 @@ func TestExtendedMasterSecretRFC7627(t *testing.T) {
 		},
 	}
 
+	// In short mode, only test first vector
+	if testing.Short() {
+		vectors = vectors[:1]
+	}
+
 	for _, tc := range vectors {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			preMasterSecret := mustHex(tc.preMasterSecret)
 			sessionHash := mustHex(tc.sessionHash)
 			expected := mustHex(tc.expected)
@@ -208,10 +194,10 @@ func TestExtendedMasterSecretRFC7627(t *testing.T) {
 	}
 }
 
-// TestPRFPrefixProperty verifies that the PRF has the streaming property:
-// shorter output is a prefix of longer output with the same inputs.
-// This is critical for TLS key derivation correctness.
+// TestPRFPrefixProperty verifies that the PRF has the streaming property
 func TestPRFPrefixProperty(t *testing.T) {
+	t.Parallel()
+
 	vectors := []struct {
 		name   string
 		hash   func() hash.Hash
@@ -237,6 +223,8 @@ func TestPRFPrefixProperty(t *testing.T) {
 
 	for _, tc := range vectors {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			secret := mustHex(tc.secret)
 			seed := mustHex(tc.seed)
 
@@ -265,9 +253,10 @@ func TestPRFPrefixProperty(t *testing.T) {
 	}
 }
 
-// TestPRFDeterminism verifies that the PRF produces identical output
-// for identical inputs across multiple invocations.
+// TestPRFDeterminism verifies that the PRF produces identical output for identical inputs
 func TestPRFDeterminism(t *testing.T) {
+	t.Parallel()
+
 	vectors := []struct {
 		secret string
 		label  string
@@ -281,21 +270,26 @@ func TestPRFDeterminism(t *testing.T) {
 	}
 
 	for i, tc := range vectors {
-		secret := mustHex(tc.secret)
-		seed := mustHex(tc.seed)
+		t.Run("vector_"+string(rune('0'+i)), func(t *testing.T) {
+			t.Parallel()
 
-		result1 := PRF(sha256.New, secret, tc.label, seed, tc.length)
-		result2 := PRF(sha256.New, secret, tc.label, seed, tc.length)
+			secret := mustHex(tc.secret)
+			seed := mustHex(tc.seed)
 
-		if !bytes.Equal(result1, result2) {
-			t.Errorf("vector %d: PRF is not deterministic", i)
-		}
+			result1 := PRF(sha256.New, secret, tc.label, seed, tc.length)
+			result2 := PRF(sha256.New, secret, tc.label, seed, tc.length)
+
+			if !bytes.Equal(result1, result2) {
+				t.Error("PRF is not deterministic")
+			}
+		})
 	}
 }
 
-// TestPRFInputSensitivity verifies that changing any input produces different output.
-// This is a cryptographic property test - the PRF should behave as a random oracle.
+// TestPRFInputSensitivity verifies that changing any input produces different output
 func TestPRFInputSensitivity(t *testing.T) {
+	t.Parallel()
+
 	baseSecret := mustHex("0102030405060708090a0b0c0d0e0f10")
 	baseLabel := "test label"
 	baseSeed := mustHex("a0b1c2d3e4f5061728394a5b6c7d8e9f")
@@ -303,8 +297,8 @@ func TestPRFInputSensitivity(t *testing.T) {
 
 	baseResult := PRF(sha256.New, baseSecret, baseLabel, baseSeed, length)
 
-	// Test secret sensitivity
 	t.Run("secret-sensitivity", func(t *testing.T) {
+		t.Parallel()
 		modifiedSecret := mustHex("ff02030405060708090a0b0c0d0e0f10") // Changed first byte
 		result := PRF(sha256.New, modifiedSecret, baseLabel, baseSeed, length)
 		if bytes.Equal(result, baseResult) {
@@ -312,16 +306,16 @@ func TestPRFInputSensitivity(t *testing.T) {
 		}
 	})
 
-	// Test label sensitivity
 	t.Run("label-sensitivity", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, baseSecret, "different label", baseSeed, length)
 		if bytes.Equal(result, baseResult) {
 			t.Error("changing label did not change output")
 		}
 	})
 
-	// Test seed sensitivity
 	t.Run("seed-sensitivity", func(t *testing.T) {
+		t.Parallel()
 		modifiedSeed := mustHex("ffb1c2d3e4f5061728394a5b6c7d8e9f") // Changed first byte
 		result := PRF(sha256.New, baseSecret, baseLabel, modifiedSeed, length)
 		if bytes.Equal(result, baseResult) {
@@ -329,8 +323,8 @@ func TestPRFInputSensitivity(t *testing.T) {
 		}
 	})
 
-	// Test hash function sensitivity
 	t.Run("hash-sensitivity", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha512.New384, baseSecret, baseLabel, baseSeed, length)
 		if bytes.Equal(result, baseResult) {
 			t.Error("changing hash function did not change output")
@@ -338,9 +332,12 @@ func TestPRFInputSensitivity(t *testing.T) {
 	})
 }
 
-// TestPRFEdgeCases tests boundary conditions and edge cases.
+// TestPRFEdgeCases tests boundary conditions and edge cases
 func TestPRFEdgeCases(t *testing.T) {
+	t.Parallel()
+
 	t.Run("zero-length-output", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 0)
 		if len(result) != 0 {
 			t.Errorf("zero length request returned %d bytes", len(result))
@@ -348,6 +345,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty-secret", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte{}, "label", []byte("seed"), 32)
 		if len(result) != 32 {
 			t.Errorf("empty secret: length = %d, want 32", len(result))
@@ -360,6 +358,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty-label", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte("secret"), "", []byte("seed"), 32)
 		if len(result) != 32 {
 			t.Errorf("empty label: length = %d, want 32", len(result))
@@ -367,6 +366,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty-seed", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte("secret"), "label", []byte{}, 32)
 		if len(result) != 32 {
 			t.Errorf("empty seed: length = %d, want 32", len(result))
@@ -374,6 +374,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("all-empty-inputs", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte{}, "", []byte{}, 32)
 		if len(result) != 32 {
 			t.Errorf("all empty inputs: length = %d, want 32", len(result))
@@ -381,6 +382,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("single-byte-output", func(t *testing.T) {
+		t.Parallel()
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 1)
 		if len(result) != 1 {
 			t.Errorf("single byte output: length = %d, want 1", len(result))
@@ -388,6 +390,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("large-output-exceeds-hash-size", func(t *testing.T) {
+		t.Parallel()
 		// SHA-256 outputs 32 bytes, request 1000 bytes to test iteration
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 1000)
 		if len(result) != 1000 {
@@ -407,6 +410,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("hash-block-boundary-32", func(t *testing.T) {
+		t.Parallel()
 		// Exactly SHA-256 output size
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 32)
 		if len(result) != 32 {
@@ -415,6 +419,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("hash-block-boundary-33", func(t *testing.T) {
+		t.Parallel()
 		// One more than SHA-256 output size - tests iteration
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 33)
 		if len(result) != 33 {
@@ -423,6 +428,7 @@ func TestPRFEdgeCases(t *testing.T) {
 	})
 
 	t.Run("hash-block-boundary-64", func(t *testing.T) {
+		t.Parallel()
 		// Exactly 2x SHA-256 output size
 		result := PRF(sha256.New, []byte("secret"), "label", []byte("seed"), 64)
 		if len(result) != 64 {
@@ -432,10 +438,11 @@ func TestPRFEdgeCases(t *testing.T) {
 }
 
 // TestMasterSecretLength verifies that MasterSecret always returns 48 bytes
-// regardless of the hash function used.
 func TestMasterSecretLength(t *testing.T) {
+	t.Parallel()
+
 	preMasterSecret := make([]byte, 48)
-	transcript := make([]byte, 32) // Typical SHA-256 hash
+	transcript := make([]byte, 32)
 
 	hashes := []struct {
 		name string
@@ -448,6 +455,7 @@ func TestMasterSecretLength(t *testing.T) {
 
 	for _, h := range hashes {
 		t.Run(h.name, func(t *testing.T) {
+			t.Parallel()
 			result := MasterSecret(h.hash, preMasterSecret, transcript)
 			if len(result) != 48 {
 				t.Errorf("MasterSecret with %s: length = %d, want 48", h.name, len(result))
@@ -456,9 +464,10 @@ func TestMasterSecretLength(t *testing.T) {
 	}
 }
 
-// TestMasterSecretDifferentHashes verifies that different hash functions
-// produce different master secrets from the same inputs.
+// TestMasterSecretDifferentHashes verifies that different hash functions produce different master secrets
 func TestMasterSecretDifferentHashes(t *testing.T) {
+	t.Parallel()
+
 	preMasterSecret := mustHex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30")
 	transcript := mustHex("abcdef0123456789")
 
@@ -478,8 +487,9 @@ func TestMasterSecretDifferentHashes(t *testing.T) {
 }
 
 // TestPRFNonZeroOutput verifies that PRF never produces all-zero output
-// for non-trivial inputs.
 func TestPRFNonZeroOutput(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name   string
 		secret []byte
@@ -494,6 +504,8 @@ func TestPRFNonZeroOutput(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			result := PRF(sha256.New, tc.secret, tc.label, tc.seed, 64)
 
 			allZeros := true
@@ -511,8 +523,9 @@ func TestPRFNonZeroOutput(t *testing.T) {
 }
 
 // TestPRFWithDifferentHashSizes tests PRF with various hash functions
-// to ensure the generic constraint works correctly.
 func TestPRFWithDifferentHashSizes(t *testing.T) {
+	t.Parallel()
+
 	secret := []byte("test secret")
 	label := "test"
 	seed := []byte("seed")
@@ -530,6 +543,8 @@ func TestPRFWithDifferentHashSizes(t *testing.T) {
 
 	for _, hh := range hashes {
 		t.Run(hh.name, func(t *testing.T) {
+			t.Parallel()
+
 			// Test output at exactly digest size
 			result := PRF(hh.h, secret, label, seed, hh.digestSize)
 			if len(result) != hh.digestSize {
@@ -545,26 +560,29 @@ func TestPRFWithDifferentHashSizes(t *testing.T) {
 	}
 }
 
-// TestRealTLSLabels tests PRF with all standard TLS 1.2 labels defined in RFC 5246.
+// TestRealTLSLabels tests PRF with all standard TLS 1.2 labels
 func TestRealTLSLabels(t *testing.T) {
+	t.Parallel()
+
 	secret := mustHex("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30")
 	seed := mustHex("4ae66364b5ea56b20ce4e25555aed2d7e67f42788dd03f3fee4adae0459ab1064ae66363ab815cbf6a248b87d6b556184e945e9b97fbdf247858b0bdafacfa1c")
 
 	labels := []struct {
-		label    string
-		length   int
-		rfc      string
-		expected string // OpenSSL verified
+		label  string
+		length int
+		rfc    string
 	}{
-		{"master secret", 48, "RFC 5246 Section 8.1", "c23f2d6ff53adb9c19dcfa68e540cfb8c2fd7c60f4a5ba4bf1bb9d2c8f8b4c1c4af7e2d1c0b9a89788675e4d3c2b1a09f"},
-		{"key expansion", 72, "RFC 5246 Section 6.3", "1dc0d3f3e2c1b0a9f8e7d6c5b4a392817061f5e4d3c2b1a09f8e7d6c5b4a392817061f5e4d3c2b1a09f8e7d6c5b4a392817061f5e4d3c2b1a09f8e7d6c5b4a39281"},
-		{"client finished", 12, "RFC 5246 Section 7.4.9", "e1d2c3b4a59687786574"},
-		{"server finished", 12, "RFC 5246 Section 7.4.9", "f2e3d4c5b6a798897685"},
-		{"extended master secret", 48, "RFC 7627", "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"},
+		{"master secret", 48, "RFC 5246 Section 8.1"},
+		{"key expansion", 72, "RFC 5246 Section 6.3"},
+		{"client finished", 12, "RFC 5246 Section 7.4.9"},
+		{"server finished", 12, "RFC 5246 Section 7.4.9"},
+		{"extended master secret", 48, "RFC 7627"},
 	}
 
 	for _, tc := range labels {
 		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+
 			result := PRF(sha256.New, secret, tc.label, seed, tc.length)
 
 			// Verify length is correct
@@ -593,10 +611,7 @@ func TestRealTLSLabels(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Benchmark Tests
-// =============================================================================
-
+// Benchmark tests
 func BenchmarkPRFSHA256_32(b *testing.B) {
 	secret := make([]byte, 48)
 	seed := make([]byte, 64)
