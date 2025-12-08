@@ -66,45 +66,56 @@ type GREASEECHExtension = GREASEEncryptedClientHelloExtension // alias
 // Note: The error is stored in g.initErr so subsequent calls return the same error.
 func (g *GREASEEncryptedClientHelloExtension) init() error {
 	g.initOnce.Do(func() {
-		// Set the config_id field to a random byte.
-		//
-		// Note: must not reuse this extension unless for HRR. It is required
-		// to generate new random bytes for config_id for each new ClientHello,
-		// but reuse the same config_id for HRR.
-		if len(g.CandidateConfigIds) == 0 {
-			var b []byte = make([]byte, 1)
-			_, err := rand.Read(b[:])
-			if err != nil {
-				g.initErr = fmt.Errorf("error generating random byte for config_id: %w", err)
-				return
-			}
-			g.configId = b[0]
-		} else {
-			// randomly pick one from the list
-			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateConfigIds))))
-			if err != nil {
-				g.initErr = fmt.Errorf("error generating random index for config_id: %w", err)
-				return
-			}
-			g.configId = g.CandidateConfigIds[rndIndex.Int64()]
-		}
+		// Skip configId and cipherSuite generation if EncapsulatedKey is already set.
+		// This indicates the extension was created via cloneWithState from an already-
+		// initialized extension, so we should preserve the copied values.
+		// EncapsulatedKey is used as a sentinel because:
+		// 1. It's always set after configId and cipherSuite during normal initialization
+		// 2. It's never empty for an initialized extension
+		// 3. It's always copied by cloneWithState
+		alreadyInitialized := len(g.EncapsulatedKey) > 0
 
-		// Set the cipher_suite field to a supported HpkeSymmetricCipherSuite.
-		// The selection SHOULD vary to exercise all supported configurations,
-		// but MAY be held constant for successive connections to the same server
-		// in the same session.
-		if len(g.CandidateCipherSuites) == 0 {
-			g.cipherSuite = HPKESymmetricCipherSuite{uint16(defaultHpkeKdf), uint16(defaultHpkeAead)}
-		} else {
-			// randomly pick one from the list
-			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateCipherSuites))))
-			if err != nil {
-				g.initErr = fmt.Errorf("error generating random index for cipher_suite: %w", err)
-				return
+		if !alreadyInitialized {
+			// Set the config_id field to a random byte.
+			//
+			// Note: must not reuse this extension unless for HRR. It is required
+			// to generate new random bytes for config_id for each new ClientHello,
+			// but reuse the same config_id for HRR.
+			if len(g.CandidateConfigIds) == 0 {
+				var b []byte = make([]byte, 1)
+				_, err := rand.Read(b[:])
+				if err != nil {
+					g.initErr = fmt.Errorf("error generating random byte for config_id: %w", err)
+					return
+				}
+				g.configId = b[0]
+			} else {
+				// randomly pick one from the list
+				rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateConfigIds))))
+				if err != nil {
+					g.initErr = fmt.Errorf("error generating random index for config_id: %w", err)
+					return
+				}
+				g.configId = g.CandidateConfigIds[rndIndex.Int64()]
 			}
-			g.cipherSuite = HPKESymmetricCipherSuite{
-				g.CandidateCipherSuites[rndIndex.Int64()].KdfId,
-				g.CandidateCipherSuites[rndIndex.Int64()].AeadId,
+
+			// Set the cipher_suite field to a supported HpkeSymmetricCipherSuite.
+			// The selection SHOULD vary to exercise all supported configurations,
+			// but MAY be held constant for successive connections to the same server
+			// in the same session.
+			if len(g.CandidateCipherSuites) == 0 {
+				g.cipherSuite = HPKESymmetricCipherSuite{uint16(defaultHpkeKdf), uint16(defaultHpkeAead)}
+			} else {
+				// randomly pick one from the list
+				rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateCipherSuites))))
+				if err != nil {
+					g.initErr = fmt.Errorf("error generating random index for cipher_suite: %w", err)
+					return
+				}
+				g.cipherSuite = HPKESymmetricCipherSuite{
+					g.CandidateCipherSuites[rndIndex.Int64()].KdfId,
+					g.CandidateCipherSuites[rndIndex.Int64()].AeadId,
+				}
 			}
 		}
 
@@ -339,6 +350,12 @@ func (g *GREASEEncryptedClientHelloExtension) cloneWithState(
 	payloadLens []uint16,
 	encapKey []byte,
 ) *GREASEEncryptedClientHelloExtension {
+	// Ensure initialization is complete before reading internal state.
+	// This prevents race conditions when cloneWithState is called concurrently
+	// while another goroutine might be running init() via sync.Once.
+	// The init() call is idempotent due to sync.Once, so this is safe.
+	_ = g.init()
+
 	// Clone payload if present (set by Write() during fingerprinting)
 	var payload []byte
 	if len(g.payload) > 0 {

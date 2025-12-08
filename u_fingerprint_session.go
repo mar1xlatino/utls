@@ -568,23 +568,45 @@ func NewSessionStateCache(maxSize int, maxAge time.Duration) *SessionStateCache 
 	}
 }
 
+// makeCacheKey creates a cache key from origin and profile ID.
+// The key format is "origin|profileID" to ensure different profiles
+// don't share incompatible session state.
+func makeCacheKey(origin, profileID string) string {
+	return origin + "|" + profileID
+}
+
 // GetOrCreate returns existing session state or creates a new one.
 // Touch() is called on the returned state to track connection count:
 // - connectionCount == 1: First connection (new session)
 // - connectionCount > 1: Subsequent connections (reused session)
+//
+// IMPORTANT: Session state is keyed by both origin AND profile ID. This prevents
+// different profiles from sharing incompatible session state (e.g., a profile
+// with GREASE disabled creating state with zeroed GREASE values that would
+// corrupt a GREASE-enabled profile that later connects to the same origin).
 func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfile) *SessionFingerprintState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Build cache key that includes both origin and profile ID.
+	// This ensures different profiles don't share incompatible session state.
+	// For example, Firefox (no GREASE) and Chrome (with GREASE) connecting to
+	// the same origin must have separate session states.
+	profileID := ""
+	if profile != nil {
+		profileID = profile.ID
+	}
+	cacheKey := makeCacheKey(origin, profileID)
+
 	// Check for existing state
-	if state, ok := c.cache[origin]; ok {
+	if state, ok := c.cache[cacheKey]; ok {
 		if time.Since(state.CreatedAt) < c.maxAge {
 			state.Touch()
 			return state
 		}
 		// Expired, remove it
 		state.Clear()
-		delete(c.cache, origin)
+		delete(c.cache, cacheKey)
 	}
 
 	// Create new state (always returns valid state, even if profile is nil)
@@ -601,16 +623,21 @@ func (c *SessionStateCache) GetOrCreate(origin string, profile *FingerprintProfi
 		c.evictOldest()
 	}
 
-	c.cache[origin] = state
+	c.cache[cacheKey] = state
 	return state
 }
 
-// Get returns session state for origin if it exists.
+// Get returns session state for origin and profile if it exists.
 // Returns nil if the entry doesn't exist or is expired.
 // Expired entries are lazily removed on the next write operation.
-func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
+//
+// The profileID parameter is required because session state is keyed by
+// both origin and profile ID to prevent incompatible state sharing.
+func (c *SessionStateCache) Get(origin, profileID string) *SessionFingerprintState {
+	cacheKey := makeCacheKey(origin, profileID)
+
 	c.mu.RLock()
-	state, ok := c.cache[origin]
+	state, ok := c.cache[cacheKey]
 	if !ok {
 		c.mu.RUnlock()
 		return nil
@@ -628,7 +655,7 @@ func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
 	defer c.mu.Unlock()
 
 	// Re-check under write lock (another goroutine may have modified)
-	state, ok = c.cache[origin]
+	state, ok = c.cache[cacheKey]
 	if !ok {
 		return nil
 	}
@@ -638,17 +665,22 @@ func (c *SessionStateCache) Get(origin string) *SessionFingerprintState {
 	}
 	// Still expired, remove it
 	state.Clear()
-	delete(c.cache, origin)
+	delete(c.cache, cacheKey)
 	return nil
 }
 
-// Set stores session state for origin.
-func (c *SessionStateCache) Set(origin string, state *SessionFingerprintState) {
+// Set stores session state for origin and profile.
+//
+// The profileID parameter is required because session state is keyed by
+// both origin and profile ID to prevent incompatible state sharing.
+func (c *SessionStateCache) Set(origin, profileID string, state *SessionFingerprintState) {
+	cacheKey := makeCacheKey(origin, profileID)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// Clear any existing state
-	if existing, ok := c.cache[origin]; ok {
+	if existing, ok := c.cache[cacheKey]; ok {
 		existing.Clear()
 	}
 
@@ -657,17 +689,22 @@ func (c *SessionStateCache) Set(origin string, state *SessionFingerprintState) {
 		c.evictOldest()
 	}
 
-	c.cache[origin] = state
+	c.cache[cacheKey] = state
 }
 
-// Delete removes session state for origin.
-func (c *SessionStateCache) Delete(origin string) {
+// Delete removes session state for origin and profile.
+//
+// The profileID parameter is required because session state is keyed by
+// both origin and profile ID to prevent incompatible state sharing.
+func (c *SessionStateCache) Delete(origin, profileID string) {
+	cacheKey := makeCacheKey(origin, profileID)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if state, ok := c.cache[origin]; ok {
+	if state, ok := c.cache[cacheKey]; ok {
 		state.Clear()
-		delete(c.cache, origin)
+		delete(c.cache, cacheKey)
 	}
 }
 
