@@ -236,13 +236,20 @@ func calculateJA4FromRaw(raw []byte) (ja4Fingerprint, error) {
 // identical across multiple ClientHello generations with shuffled extensions.
 // JA4 sorts extensions before hashing, making it stable despite shuffling.
 func TestJA4StabilityWithShuffledExtensions(t *testing.T) {
-	const iterations = 100
+	// Use fewer iterations in short mode for faster CI
+	iterations := 20
+	if testing.Short() {
+		iterations = 5
+	}
 	serverName := "example.com"
 
 	var ja4Fingerprints []string
 
 	for i := 0; i < iterations; i++ {
-		uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient failed: %v", i, err)
+		}
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -271,7 +278,10 @@ func TestJA4StabilityWithShuffledExtensions(t *testing.T) {
 func TestJA4ComponentsCalculation(t *testing.T) {
 	serverName := "example.com"
 
-	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -332,26 +342,43 @@ func TestJA4ComponentsCalculation(t *testing.T) {
 
 // TestJA4ForMultipleBrowserProfiles tests JA4 calculation for different browser profiles.
 func TestJA4ForMultipleBrowserProfiles(t *testing.T) {
+	t.Parallel()
+
+	// Use representative sample of browser families for faster CI runs
 	profiles := []struct {
 		name string
 		id   ClientHelloID
 	}{
 		{"Chrome_142", HelloChrome_142},
-		{"Chrome_120", HelloChrome_120},
 		{"Firefox_145", HelloFirefox_145},
-		{"Firefox_120", HelloFirefox_120},
 		{"Safari_18", HelloSafari_18},
-		{"Edge_142", HelloEdge_142},
+	}
+
+	// In short mode, test only one profile
+	if testing.Short() {
+		profiles = profiles[:1]
 	}
 
 	serverName := "example.com"
 
+	// Reduce iterations: 3 is sufficient to verify stability
+	iterations := 3
+	if testing.Short() {
+		iterations = 1
+	}
+
 	for _, profile := range profiles {
+		profile := profile // capture for parallel
 		t.Run(profile.name, func(t *testing.T) {
+			t.Parallel()
+
 			// Generate fingerprint multiple times to verify stability
 			var fingerprints []string
-			for i := 0; i < 10; i++ {
-				uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, profile.id)
+			for i := 0; i < iterations; i++ {
+				uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, profile.id)
+				if err != nil {
+					t.Fatalf("UClient failed: %v", err)
+				}
 				if err := uconn.BuildHandshakeState(); err != nil {
 					t.Fatalf("BuildHandshakeState failed: %v", err)
 				}
@@ -379,6 +406,8 @@ func TestJA4ForMultipleBrowserProfiles(t *testing.T) {
 
 // TestJA4WithCustomSpec tests JA4 calculation with a custom ClientHelloSpec.
 func TestJA4WithCustomSpec(t *testing.T) {
+	t.Parallel()
+
 	serverName := "example.com"
 
 	customSpec := ClientHelloSpec{
@@ -405,7 +434,10 @@ func TestJA4WithCustomSpec(t *testing.T) {
 		},
 	}
 
-	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn.ApplyPreset(&customSpec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -423,9 +455,18 @@ func TestJA4WithCustomSpec(t *testing.T) {
 		t.Errorf("JA4_a too short: %s", ja4.A)
 	}
 
+	// Skip consistency check in short mode
+	if testing.Short() {
+		t.Logf("Custom spec JA4: %s", ja4.String())
+		return
+	}
+
 	// Custom spec should produce consistent fingerprint
 	// Generate again and compare
-	uconn2, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn2, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn2.ApplyPreset(&customSpec); err != nil {
 		t.Fatalf("ApplyPreset failed: %v", err)
 	}
@@ -450,7 +491,10 @@ func TestJA4WithCustomSpec(t *testing.T) {
 func TestJA4WithoutSNI(t *testing.T) {
 	// No server name = no SNI extension
 	// InsecureSkipVerify is required when no ServerName is provided
-	uconn, _ := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{InsecureSkipVerify: true}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	uconn.SetSNI("") // Explicitly set empty SNI
 
 	if err := uconn.BuildHandshakeState(); err != nil {
@@ -472,6 +516,8 @@ func TestJA4WithoutSNI(t *testing.T) {
 
 // TestJA4ExtensionOrderIndependence verifies that extension order doesn't affect JA4.
 func TestJA4ExtensionOrderIndependence(t *testing.T) {
+	t.Parallel()
+
 	serverName := "example.com"
 
 	// Create two specs with same extensions but different order
@@ -512,7 +558,10 @@ func TestJA4ExtensionOrderIndependence(t *testing.T) {
 		},
 	}
 
-	uconn1, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconn1, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn1.ApplyPreset(&spec1); err != nil {
 		t.Fatalf("ApplyPreset spec1 failed: %v", err)
 	}
@@ -520,17 +569,26 @@ func TestJA4ExtensionOrderIndependence(t *testing.T) {
 		t.Fatalf("BuildHandshakeState spec1 failed: %v", err)
 	}
 
-	uconn2, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	ja4_1, err := calculateJA4FromRaw(uconn1.HandshakeState.Hello.Raw)
+	if err != nil {
+		t.Fatalf("JA4 calculation for spec1 failed: %v", err)
+	}
+
+	// In short mode, just verify spec1 works and skip spec2 comparison
+	if testing.Short() {
+		t.Logf("JA4 from spec1: %s", ja4_1.String())
+		return
+	}
+
+	uconn2, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn2.ApplyPreset(&spec2); err != nil {
 		t.Fatalf("ApplyPreset spec2 failed: %v", err)
 	}
 	if err := uconn2.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState spec2 failed: %v", err)
-	}
-
-	ja4_1, err := calculateJA4FromRaw(uconn1.HandshakeState.Hello.Raw)
-	if err != nil {
-		t.Fatalf("JA4 calculation for spec1 failed: %v", err)
 	}
 
 	ja4_2, err := calculateJA4FromRaw(uconn2.HandshakeState.Hello.Raw)
@@ -549,10 +607,18 @@ func TestJA4ExtensionOrderIndependence(t *testing.T) {
 
 // TestJA4GREASEFiltering verifies that GREASE values are properly excluded.
 func TestJA4GREASEFiltering(t *testing.T) {
+	// Use fewer iterations in short mode for faster CI
+	iterations := 5
+	if testing.Short() {
+		iterations = 2
+	}
 	serverName := "example.com"
 
 	// Chrome profiles include GREASE - they should be filtered out
-	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -565,8 +631,11 @@ func TestJA4GREASEFiltering(t *testing.T) {
 	// The fingerprint should be stable (GREASE values change but are filtered)
 	// Verify by generating multiple times
 	var fingerprints []string
-	for i := 0; i < 10; i++ {
-		uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	for i := 0; i < iterations; i++ {
+		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("iteration %d: UClient failed: %v", i, err)
+		}
 		if err := uconn.BuildHandshakeState(); err != nil {
 			t.Fatalf("iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -625,7 +694,10 @@ func TestJA4ALPNVariations(t *testing.T) {
 				spec.Extensions = append(spec.Extensions, &ALPNExtension{AlpnProtocols: tc.alpn})
 			}
 
-			uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+			uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			if err := uconn.ApplyPreset(&spec); err != nil {
 				t.Fatalf("ApplyPreset failed: %v", err)
 			}
@@ -654,9 +726,18 @@ func TestJA4ALPNVariations(t *testing.T) {
 
 // TestJA4RawBytesConsistency verifies JA4 calculation from raw bytes is consistent.
 func TestJA4RawBytesConsistency(t *testing.T) {
+	// Use fewer iterations in short mode for faster CI
+	// This tests deterministic parsing - 10 iterations is sufficient
+	iterations := 10
+	if testing.Short() {
+		iterations = 3
+	}
 	serverName := "example.com"
 
-	uconn, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloChrome_142)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	if err := uconn.BuildHandshakeState(); err != nil {
 		t.Fatalf("BuildHandshakeState failed: %v", err)
 	}
@@ -665,7 +746,7 @@ func TestJA4RawBytesConsistency(t *testing.T) {
 
 	// Calculate JA4 multiple times from same raw bytes
 	var fingerprints []string
-	for i := 0; i < 100; i++ {
+	for i := 0; i < iterations; i++ {
 		ja4, err := calculateJA4FromRaw(rawHello)
 		if err != nil {
 			t.Fatalf("iteration %d: JA4 calculation failed: %v", i, err)

@@ -121,8 +121,14 @@ func TestDCParseValidECDSA(t *testing.T) {
 
 // TestDCParseTrailingData verifies trailing data is rejected
 func TestDCParseTrailingData(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	spki, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("Failed to marshal public key: %v", err)
+	}
 
 	validTime := uint32(3600)
 	expectedAlgo := uint16(ECDSAWithP256AndSHA256)
@@ -152,7 +158,7 @@ func TestDCParseTrailingData(t *testing.T) {
 	offset += 2
 	copy(data[offset:], signature)
 
-	_, err := parseDelegatedCredential(data)
+	_, err = parseDelegatedCredential(data)
 	if err == nil {
 		t.Error("Expected error for trailing data, got nil")
 	}
@@ -258,9 +264,18 @@ func TestDCTTLValidation(t *testing.T) {
 
 // TestDCAlgorithmCompatibility tests algorithm compatibility checking
 func TestDCAlgorithmCompatibility(t *testing.T) {
-	ecdsaKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	ed25519PubKey, _, _ := ed25519.GenerateKey(rand.Reader) // Note: first return is public key
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate ECDSA key: %v", err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate RSA key: %v", err)
+	}
+	ed25519PubKey, _, err := ed25519.GenerateKey(rand.Reader) // Note: first return is public key
+	if err != nil {
+		t.Fatalf("Failed to generate Ed25519 key: %v", err)
+	}
 
 	testCases := []struct {
 		name      string
@@ -323,7 +338,10 @@ func TestDCAlgorithmCompatibility(t *testing.T) {
 
 // TestDCHasDelegationUsage tests the DelegationUsage extension check
 func TestDCHasDelegationUsage(t *testing.T) {
-	privateKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
 
 	// Certificate without DelegationUsage
 	templateNoDU := &x509.Certificate{
@@ -333,8 +351,14 @@ func TestDCHasDelegationUsage(t *testing.T) {
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 	}
 
-	certNoDUDER, _ := x509.CreateCertificate(rand.Reader, templateNoDU, templateNoDU, &privateKey.PublicKey, privateKey)
-	certNoDU, _ := x509.ParseCertificate(certNoDUDER)
+	certNoDUDER, err := x509.CreateCertificate(rand.Reader, templateNoDU, templateNoDU, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+	certNoDU, err := x509.ParseCertificate(certNoDUDER)
+	if err != nil {
+		t.Fatalf("Failed to parse certificate: %v", err)
+	}
 
 	if hasDelegationUsage(certNoDU) {
 		t.Error("Certificate without DelegationUsage should return false")
@@ -355,8 +379,14 @@ func TestDCHasDelegationUsage(t *testing.T) {
 		},
 	}
 
-	certWithDUDER, _ := x509.CreateCertificate(rand.Reader, templateWithDU, templateWithDU, &privateKey.PublicKey, privateKey)
-	certWithDU, _ := x509.ParseCertificate(certWithDUDER)
+	certWithDUDER, err := x509.CreateCertificate(rand.Reader, templateWithDU, templateWithDU, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("Failed to create certificate with DU: %v", err)
+	}
+	certWithDU, err := x509.ParseCertificate(certWithDUDER)
+	if err != nil {
+		t.Fatalf("Failed to parse certificate with DU: %v", err)
+	}
 
 	if !hasDelegationUsage(certWithDU) {
 		t.Error("Certificate with DelegationUsage should return true")
@@ -365,8 +395,14 @@ func TestDCHasDelegationUsage(t *testing.T) {
 
 // TestDCCredentialBytes tests the credential serialization
 func TestDCCredentialBytes(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	spki, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("Failed to marshal public key: %v", err)
+	}
 
 	dc := &DelegatedCredential{
 		ValidTime:                   3600,
@@ -399,7 +435,10 @@ func TestDCCredentialBytes(t *testing.T) {
 
 // TestDCVerifyWithoutDelegationUsage tests that verification fails without DelegationUsage
 func TestDCVerifyWithoutDelegationUsage(t *testing.T) {
-	privateKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
 
 	// Certificate without DelegationUsage
 	template := &x509.Certificate{
@@ -409,8 +448,14 @@ func TestDCVerifyWithoutDelegationUsage(t *testing.T) {
 		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 	}
 
-	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
-	cert, _ := x509.ParseCertificate(certDER)
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("Failed to parse certificate: %v", err)
+	}
 
 	dc := &DelegatedCredential{
 		ValidTime:                   3600,
@@ -418,7 +463,7 @@ func TestDCVerifyWithoutDelegationUsage(t *testing.T) {
 		Algorithm:                   ECDSAWithP256AndSHA256,
 	}
 
-	err := dc.Verify(cert)
+	err = dc.Verify(cert)
 	if err == nil {
 		t.Error("Expected error when verifying DC against cert without DelegationUsage")
 	}

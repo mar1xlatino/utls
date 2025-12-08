@@ -335,8 +335,14 @@ func TestUTLSFingerprintClientHelloAlwaysAddPadding(t *testing.T) {
 		t.Errorf("got error: %v; expected to succeed", err)
 	}
 
-	uconnWithoutPadding, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
-	uconnWithPadding, _ := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	uconnWithoutPadding, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
+	uconnWithPadding, err := UClient(&net.TCPConn{}, &Config{ServerName: serverName}, HelloCustom)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := uconnWithoutPadding.ApplyPreset(&specWithoutPadding); err != nil {
 		t.Errorf("got error: %v; expected to succeed", err)

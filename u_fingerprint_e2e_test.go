@@ -14,6 +14,48 @@ import (
 	"testing"
 )
 
+// e2eTestConfig holds shared configuration for E2E tests
+type e2eTestConfig struct {
+	// Number of iterations for consistency tests
+	iterations int
+	// Browser profiles to test (reduced in short mode)
+	browsers []struct {
+		name string
+		id   ClientHelloID
+	}
+}
+
+// getE2ETestConfig returns test configuration based on -short flag
+func getE2ETestConfig(t *testing.T) *e2eTestConfig {
+	cfg := &e2eTestConfig{}
+
+	if testing.Short() {
+		cfg.iterations = 3
+		cfg.browsers = []struct {
+			name string
+			id   ClientHelloID
+		}{
+			{"Chrome_142", HelloChrome_142},
+			{"Firefox_145", HelloFirefox_145},
+		}
+	} else {
+		cfg.iterations = 20
+		cfg.browsers = []struct {
+			name string
+			id   ClientHelloID
+		}{
+			{"Chrome_120", HelloChrome_120},
+			{"Chrome_142", HelloChrome_142},
+			{"Firefox_120", HelloFirefox_120},
+			{"Firefox_145", HelloFirefox_145},
+			{"Safari_18", HelloSafari_18},
+			{"Edge_142", HelloEdge_142},
+		}
+	}
+
+	return cfg
+}
+
 // =============================================================================
 // TEST 1: Full Chrome Fingerprint Application and JA4 Verification
 // =============================================================================
@@ -21,6 +63,7 @@ import (
 // TestE2E_ChromeFingerprintApplication verifies that applying a Chrome profile
 // produces expected JA4 fingerprint characteristics.
 func TestE2E_ChromeFingerprintApplication(t *testing.T) {
+	t.Parallel()
 	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_120)
 	if err != nil {
 		t.Fatalf("UClient error: %v", err)
@@ -103,7 +146,11 @@ func TestE2E_ChromeFingerprintApplication(t *testing.T) {
 // TestE2E_SessionConsistency verifies that GREASE values remain consistent
 // across multiple connections to the same origin within a session.
 func TestE2E_SessionConsistency(t *testing.T) {
-	const iterations = 10
+	t.Parallel()
+	iterations := 10
+	if testing.Short() {
+		iterations = 3
+	}
 	serverName := "consistent.example.com"
 
 	var firstGREASECipher uint16
@@ -171,6 +218,7 @@ func TestE2E_SessionConsistency(t *testing.T) {
 
 // TestE2E_GREASEFreezing verifies that GREASE values follow the 0x?a?a pattern.
 func TestE2E_GREASEFreezing(t *testing.T) {
+	t.Parallel()
 	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "grease.example.com"}, HelloChrome_142)
 	if err != nil {
 		t.Fatalf("UClient error: %v", err)
@@ -263,6 +311,7 @@ func TestE2E_GREASEFreezing(t *testing.T) {
 // TestE2E_ProfileBuilderToConnection verifies the complete flow from
 // profile builder to connection creation.
 func TestE2E_ProfileBuilderToConnection(t *testing.T) {
+	t.Parallel()
 	// Create custom profile using builder
 	builder := NewEmptyProfileBuilder().
 		WithID("test_custom_profile").
@@ -323,6 +372,7 @@ func TestE2E_ProfileBuilderToConnection(t *testing.T) {
 // TestE2E_ValidationRoundTrip verifies that a profile's expected fingerprints
 // match what's actually produced.
 func TestE2E_ValidationRoundTrip(t *testing.T) {
+	t.Parallel()
 	// Build profile with specific characteristics
 	builder := NewEmptyProfileBuilder().
 		WithID("validation_test_profile").
@@ -410,8 +460,10 @@ func TestE2E_ValidationRoundTrip(t *testing.T) {
 // TestE2E_RecordPaddingIntegration verifies that record padding configuration
 // is correctly applied to connections.
 func TestE2E_RecordPaddingIntegration(t *testing.T) {
+	t.Parallel()
 	// Test that padding is ENABLED BY DEFAULT for UConn (security fix)
 	t.Run("default_enabled", func(t *testing.T) {
+		t.Parallel()
 		uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
 		if err != nil {
 			t.Fatalf("UClient error: %v", err)
@@ -437,7 +489,9 @@ func TestE2E_RecordPaddingIntegration(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
 			if err != nil {
 				t.Fatalf("UClient error: %v", err)
@@ -469,6 +523,7 @@ func TestE2E_RecordPaddingIntegration(t *testing.T) {
 
 // TestE2E_RecordPaddingConfig verifies custom record padding configuration.
 func TestE2E_RecordPaddingConfig(t *testing.T) {
+	t.Parallel()
 	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "padding.example.com"}, HelloChrome_142)
 	if err != nil {
 		t.Fatalf("UClient error: %v", err)
@@ -501,6 +556,7 @@ func TestE2E_RecordPaddingConfig(t *testing.T) {
 
 // TestE2E_ErrorHandling_InvalidProfileID tests error when requesting non-existent profile.
 func TestE2E_ErrorHandling_InvalidProfileID(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	_, err := registry.Get("nonexistent_profile_id")
@@ -514,6 +570,7 @@ func TestE2E_ErrorHandling_InvalidProfileID(t *testing.T) {
 
 // TestE2E_ErrorHandling_NilProfile tests error when registering nil profile.
 func TestE2E_ErrorHandling_NilProfile(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	err := registry.Register(nil)
@@ -524,6 +581,7 @@ func TestE2E_ErrorHandling_NilProfile(t *testing.T) {
 
 // TestE2E_ErrorHandling_EmptyProfileID tests error for empty profile ID.
 func TestE2E_ErrorHandling_EmptyProfileID(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	profile := &FingerprintProfile{
@@ -538,6 +596,7 @@ func TestE2E_ErrorHandling_EmptyProfileID(t *testing.T) {
 
 // TestE2E_ErrorHandling_DuplicateRegistration tests error for duplicate profile.
 func TestE2E_ErrorHandling_DuplicateRegistration(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	profile := &FingerprintProfile{
@@ -569,6 +628,7 @@ func TestE2E_ErrorHandling_DuplicateRegistration(t *testing.T) {
 // TestE2E_ErrorHandling_FingerprintBeforeHandshake tests error when getting
 // fingerprint before building handshake state.
 func TestE2E_ErrorHandling_FingerprintBeforeHandshake(t *testing.T) {
+	t.Parallel()
 	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "example.com"}, HelloChrome_142)
 	if err != nil {
 		t.Fatalf("UClient error: %v", err)
@@ -587,6 +647,7 @@ func TestE2E_ErrorHandling_FingerprintBeforeHandshake(t *testing.T) {
 
 // TestE2E_HooksInvocation tests that fingerprint hooks are properly invoked.
 func TestE2E_HooksInvocation(t *testing.T) {
+	t.Parallel()
 	// Track hook calls
 	var profileSelectedCalled atomic.Bool
 	var sessionCreatedCalled atomic.Bool
@@ -632,6 +693,7 @@ func TestE2E_HooksInvocation(t *testing.T) {
 
 // TestE2E_HookChainOrder tests that hooks are called in order and stop on error.
 func TestE2E_HookChainOrder(t *testing.T) {
+	t.Parallel()
 	var callOrder []int
 	var mu sync.Mutex
 
@@ -686,6 +748,7 @@ func TestE2E_HookChainOrder(t *testing.T) {
 
 // TestE2E_FingerprintMonitor tests the fingerprint monitoring system.
 func TestE2E_FingerprintMonitor(t *testing.T) {
+	t.Parallel()
 	monitor := NewFingerprintMonitor(100)
 
 	var eventCount atomic.Int32
@@ -723,6 +786,7 @@ func TestE2E_FingerprintMonitor(t *testing.T) {
 
 // TestE2E_RegistryOperations tests comprehensive registry functionality.
 func TestE2E_RegistryOperations(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	// Helper to create minimal valid profile
@@ -829,22 +893,15 @@ func TestE2E_RegistryOperations(t *testing.T) {
 // TestE2E_BrowserFingerprintConsistency verifies that different browser profiles
 // produce consistent fingerprints across multiple generations.
 func TestE2E_BrowserFingerprintConsistency(t *testing.T) {
-	browsers := []struct {
-		name string
-		id   ClientHelloID
-	}{
-		{"Chrome_120", HelloChrome_120},
-		{"Chrome_142", HelloChrome_142},
-		{"Firefox_120", HelloFirefox_120},
-		{"Firefox_145", HelloFirefox_145},
-		{"Safari_18", HelloSafari_18},
-		{"Edge_142", HelloEdge_142},
-	}
+	t.Parallel()
+	cfg := getE2ETestConfig(t)
 
-	for _, browser := range browsers {
+	for _, browser := range cfg.browsers {
+		browser := browser // capture range variable
 		t.Run(browser.name, func(t *testing.T) {
+			t.Parallel()
 			var fingerprints []string
-			const iterations = 20
+			iterations := cfg.iterations
 
 			for i := 0; i < iterations; i++ {
 				uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, browser.id)
@@ -882,6 +939,7 @@ func TestE2E_BrowserFingerprintConsistency(t *testing.T) {
 
 // TestE2E_FirefoxVsChromeCharacteristics verifies browser-specific characteristics.
 func TestE2E_FirefoxVsChromeCharacteristics(t *testing.T) {
+	t.Parallel()
 	// Chrome uses GREASE, Firefox doesn't
 	chromeConn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
 	if err != nil {
@@ -949,6 +1007,7 @@ func TestE2E_FirefoxVsChromeCharacteristics(t *testing.T) {
 
 // TestE2E_CustomSpecApplication tests applying a custom ClientHelloSpec.
 func TestE2E_CustomSpecApplication(t *testing.T) {
+	t.Parallel()
 	spec := ClientHelloSpec{
 		CipherSuites: []uint16{
 			TLS_AES_128_GCM_SHA256,
@@ -1021,6 +1080,7 @@ func TestE2E_CustomSpecApplication(t *testing.T) {
 
 // TestE2E_JA3FormatVerification verifies JA3 string format correctness.
 func TestE2E_JA3FormatVerification(t *testing.T) {
+	t.Parallel()
 	uconn, err := UClient(&net.TCPConn{}, &Config{ServerName: "ja3.example.com"}, HelloChrome_142)
 	if err != nil {
 		t.Fatalf("UClient error: %v", err)
@@ -1085,6 +1145,7 @@ func TestE2E_JA3FormatVerification(t *testing.T) {
 
 // TestE2E_JA4ComparisonUtility tests the JA4 comparison function.
 func TestE2E_JA4ComparisonUtility(t *testing.T) {
+	t.Parallel()
 	// Create two different connections
 	chrome, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
 	if err != nil {
@@ -1102,8 +1163,14 @@ func TestE2E_JA4ComparisonUtility(t *testing.T) {
 		t.Fatalf("Firefox BuildHandshakeState failed: %v", err)
 	}
 
-	chromeFP, _ := chrome.Fingerprint()
-	firefoxFP, _ := firefox.Fingerprint()
+	chromeFP, err := chrome.Fingerprint()
+	if err != nil {
+		t.Fatalf("Chrome Fingerprint failed: %v", err)
+	}
+	firefoxFP, err := firefox.Fingerprint()
+	if err != nil {
+		t.Fatalf("Firefox Fingerprint failed: %v", err)
+	}
 
 	// Compare same fingerprint
 	sameComp := CompareJA4(chromeFP.JA4, chromeFP.JA4)
@@ -1137,6 +1204,7 @@ func TestE2E_JA4ComparisonUtility(t *testing.T) {
 
 // TestE2E_ValidatorWithSessionState tests validation using session state.
 func TestE2E_ValidatorWithSessionState(t *testing.T) {
+	t.Parallel()
 	// Create session state
 	state := &SessionFingerprintState{
 		ID:     "test-session-123",
@@ -1178,6 +1246,7 @@ func TestE2E_ValidatorWithSessionState(t *testing.T) {
 
 // TestE2E_ProfileExportImport tests profile JSON export and import.
 func TestE2E_ProfileExportImport(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 
 	original := &FingerprintProfile{
@@ -1233,9 +1302,13 @@ func TestE2E_ProfileExportImport(t *testing.T) {
 
 // TestE2E_ConcurrentRegistryAccess tests thread safety of registry operations.
 func TestE2E_ConcurrentRegistryAccess(t *testing.T) {
+	t.Parallel()
 	registry := NewProfileRegistry()
 	var wg sync.WaitGroup
-	const goroutines = 100
+	goroutines := 100
+	if testing.Short() {
+		goroutines = 20
+	}
 
 	// Concurrent writes
 	for i := 0; i < goroutines; i++ {
@@ -1279,6 +1352,7 @@ func TestE2E_ConcurrentRegistryAccess(t *testing.T) {
 
 // TestE2E_ProfileCloning tests that profile cloning creates independent copies.
 func TestE2E_ProfileCloning(t *testing.T) {
+	t.Parallel()
 	original := &FingerprintProfile{
 		ID:      "clone_test",
 		Browser: "original",
@@ -1309,6 +1383,7 @@ func TestE2E_ProfileCloning(t *testing.T) {
 
 // TestE2E_SNIHandling tests various SNI configurations and their effect on fingerprints.
 func TestE2E_SNIHandling(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		serverName     string
@@ -1319,7 +1394,9 @@ func TestE2E_SNIHandling(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			config := &Config{ServerName: tc.serverName, InsecureSkipVerify: true}
 			uconn, err := UClient(&net.TCPConn{}, config, HelloChrome_142)
 			if err != nil {
@@ -1361,6 +1438,7 @@ func TestE2E_SNIHandling(t *testing.T) {
 
 // TestE2E_DefaultRegistryBuiltinProfiles verifies default registry has built-in profiles.
 func TestE2E_DefaultRegistryBuiltinProfiles(t *testing.T) {
+	t.Parallel()
 	expectedProfiles := []string{
 		"chrome_133_windows_11",
 		"firefox_145_windows_11",
@@ -1409,6 +1487,7 @@ func TestE2E_DefaultRegistryBuiltinProfiles(t *testing.T) {
 
 // TestE2E_ProfileValidation tests profile validation catches invalid configurations.
 func TestE2E_ProfileValidation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		profile     *FingerprintProfile
@@ -1443,7 +1522,9 @@ func TestE2E_ProfileValidation(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			registry := NewProfileRegistry()
 			err := registry.Register(tc.profile)
 
@@ -1463,6 +1544,7 @@ func TestE2E_ProfileValidation(t *testing.T) {
 
 // TestE2E_HookChainManagement tests adding, removing, and clearing hooks.
 func TestE2E_HookChainManagement(t *testing.T) {
+	t.Parallel()
 	chain := NewHookChain()
 
 	if chain.Len() != 0 {
@@ -1520,6 +1602,7 @@ func TestE2E_HookChainManagement(t *testing.T) {
 
 // TestE2E_LoggingHooks tests the logging hooks factory function.
 func TestE2E_LoggingHooks(t *testing.T) {
+	t.Parallel()
 	var logs []string
 	var mu sync.Mutex
 
@@ -1563,6 +1646,7 @@ func TestE2E_LoggingHooks(t *testing.T) {
 
 // TestE2E_ProfileBuilderErrors tests that builder accumulates and reports errors.
 func TestE2E_ProfileBuilderErrors(t *testing.T) {
+	t.Parallel()
 	builder := NewEmptyProfileBuilder().
 		WithID("error_test").
 		WithBrowser("test").
@@ -1587,6 +1671,7 @@ func TestE2E_ProfileBuilderErrors(t *testing.T) {
 // TestE2E_FullProfileApplication tests complete workflow from profile creation
 // to fingerprint generation with validation.
 func TestE2E_FullProfileApplication(t *testing.T) {
+	t.Parallel()
 	// Step 1: Create custom profile using builder
 	builder := ChromeProfile(200, "linux").
 		WithID("e2e_test_chrome_200").
