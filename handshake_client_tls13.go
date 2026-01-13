@@ -49,11 +49,24 @@ type clientHandshakeStateTLS13 struct {
 	// "unexpected_message" alert if it receives a second HelloRetryRequest.
 	hrrCount int
 
+	// echAcceptedInHRR tracks whether ECH was accepted in HelloRetryRequest.
+	// ECH spec Section 6.1.5: If the HRR indicates ECH acceptance but the
+	// subsequent ServerHello does not also accept ECH, the client MUST
+	// terminate the connection with an "illegal_parameter" alert.
+	echAcceptedInHRR bool
+
 	// peerDC holds the parsed and verified delegated credential from the server,
 	// if one was received and accepted. When set, its public key is used for
 	// CertificateVerify instead of the certificate's public key.
 	// See RFC 9345 for delegated credentials specification.
 	peerDC *DelegatedCredential // [uTLS]
+
+	// earlyDataAccepted tracks whether the server accepted early data.
+	// RFC 8446 Section 4.5: If the server accepts early data, the client
+	// MUST send an EndOfEarlyData message after receiving server Finished.
+	// This is set in readServerParameters() when EncryptedExtensions
+	// contains the early_data extension.
+	earlyDataAccepted bool // [uTLS]
 
 	uconn *UConn // [uTLS]
 }
@@ -161,6 +174,13 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 				return errors.New("tls: unexpected server_name extension in server hello")
 			}
 		} else {
+			// ECH spec Section 6.1.5: If the HRR indicates ECH acceptance but
+			// the subsequent ServerHello does not also accept ECH, the client
+			// MUST terminate the connection with an "illegal_parameter" alert.
+			if hs.echAcceptedInHRR {
+				c.sendAlert(alertIllegalParameter)
+				return errors.New("tls: server accepted ECH in HelloRetryRequest but not in ServerHello")
+			}
 			hs.echContext.echRejected = true
 		}
 	}
@@ -208,6 +228,12 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		return err
 	}
 	// [UTLS SECTION END]
+	// [uTLS] RFC 8446 Section 4.5: Send EndOfEarlyData if server accepted early data.
+	// This must be sent after receiving server Finished but before client Certificate.
+	// For QUIC connections, this message is not sent (RFC 9001 Section 8.3).
+	if err := hs.sendEndOfEarlyData(); err != nil {
+		return err
+	}
 	if err := hs.sendClientCertificate(); err != nil {
 		return err
 	}
@@ -474,6 +500,9 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				c.serverName = c.config.ServerName
 				isInnerHello = true
 				c.echAccepted = true
+				// ECH spec Section 6.1.5: Track that HRR accepted ECH.
+				// The subsequent ServerHello must also accept ECH.
+				hs.echAcceptedInHRR = true
 			}
 		}
 
@@ -518,7 +547,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 			return errors.New("tls: server sent an unnecessary HelloRetryRequest key_share")
 		}
 		// [uTLS] Handle ML-KEM/post-quantum hybrid key exchange in HRR
-		// This fixes the detection vector where server selects X25519MLKEM768/X25519Kyber768Draft00
+		// This fixes the detection vector where server selects X25519MLKEM768/X25519Kyber768Draft00/SecP256r1MLKEM768
 		// via HelloRetryRequest and we couldn't generate the key share.
 		if curveID == X25519MLKEM768 || curveID == X25519Kyber768Draft00 {
 			// Generate X25519 ephemeral key for the hybrid
@@ -554,6 +583,61 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				// Final X25519MLKEM768 format: ML-KEM encapsulation key (1184 bytes) || X25519 (32 bytes)
 				keyShareData = append(mlkemKey.EncapsulationKey().Bytes(), ecdheKey.PublicKey().Bytes()...)
 			}
+			hello.keyShares = []keyShare{{group: curveID, data: keyShareData}}
+		} else if curveID == SecP256r1MLKEM768 {
+			// [uTLS] SecP256r1MLKEM768: P-256 + ML-KEM-768 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+			// Key share format: P-256 point (65 bytes) || ML-KEM encapsulation key (1184 bytes)
+			// Shared secret: ECDHE_SS (32 bytes) || ML-KEM_SS (32 bytes)
+			ecdheKey, err := generateECDHEKey(c.config.rand(), CurveP256)
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			seed := make([]byte, mlkem.SeedSize)
+			if _, err := io.ReadFull(c.config.rand(), seed); err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			mlkemKey, err := mlkem.NewDecapsulationKey768(seed)
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			hs.keyShareKeys = &keySharePrivateKeys{
+				curveID:    curveID,
+				ecdhe:      ecdheKey,
+				mlkem:      mlkemKey,
+				mlkemEcdhe: ecdheKey,
+			}
+			// SecP256r1MLKEM768 format: P-256 point (65 bytes) || ML-KEM encapsulation key (1184 bytes)
+			keyShareData := append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
+			hello.keyShares = []keyShare{{group: curveID, data: keyShareData}}
+		} else if curveID == SecP384r1MLKEM1024 {
+			// [uTLS] SecP384r1MLKEM1024: P-384 + ML-KEM-1024 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+			// Key share format: P-384 point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes)
+			// Shared secret: ECDHE_SS (48 bytes) || ML-KEM_SS (32 bytes) = 80 bytes
+			ecdheKey, err := generateECDHEKey(c.config.rand(), CurveP384)
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			seed := make([]byte, mlkem.SeedSize)
+			if _, err := io.ReadFull(c.config.rand(), seed); err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			mlkemKey, err := mlkem.NewDecapsulationKey1024(seed)
+			if err != nil {
+				c.sendAlert(alertInternalError)
+				return err
+			}
+			hs.keyShareKeys = &keySharePrivateKeys{
+				curveID:   curveID,
+				ecdhe:     ecdheKey,
+				mlkem1024: mlkemKey,
+			}
+			// SecP384r1MLKEM1024 format: P-384 point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes)
+			keyShareData := append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
 			hello.keyShares = []keyShare{{group: curveID, data: keyShareData}}
 		} else if IsFFDHEGroup(curveID) {
 			// [uTLS] Handle FFDHE (Finite Field Diffie-Hellman Ephemeral) key exchange in HRR
@@ -980,6 +1064,85 @@ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
 		}
 		sharedKey = append(sharedKey, kyberShared...)
 	}
+	// SecP256r1MLKEM768 handling (draft-ietf-tls-ecdhe-mlkem-03)
+	// Server share format: P-256 point (65 bytes) || ML-KEM-768 ciphertext (1088 bytes) = 1153 bytes
+	// Shared secret: ECDH_SS (32 bytes) || ML-KEM_SS (32 bytes) = 64 bytes
+	if serverGroup == SecP256r1MLKEM768 {
+		if hs.keyShareKeys.mlkem == nil {
+			return c.sendAlert(alertInternalError)
+		}
+		serverShareData := hs.serverHello.serverShare.data
+		if len(serverShareData) != secP256r1MLKEM768ServerKeyShare {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid server SecP256r1MLKEM768 key share size")
+		}
+		// Extract P-256 ECDH peer data (first 65 bytes)
+		ecdhePeerKey := serverShareData[:p256PublicKeySize]
+		// For uTLS, use the separate mlkemEcdhe key
+		if hs.uconn != nil && hs.uconn.clientHelloBuildStatus == BuildByUtls {
+			if sharedKey, err = getSharedKey(ecdhePeerKey, hs.keyShareKeys.mlkemEcdhe); err != nil {
+				c.sendAlert(alertIllegalParameter)
+				return errors.New("tls: invalid server key share")
+			}
+		} else {
+			// Standard Go TLS path uses ecdhe key
+			if sharedKey, err = getSharedKey(ecdhePeerKey, hs.keyShareKeys.ecdhe); err != nil {
+				c.sendAlert(alertIllegalParameter)
+				return errors.New("tls: invalid server key share")
+			}
+		}
+		// Extract and decapsulate ML-KEM-768 ciphertext (after P-256 point)
+		ciphertext := serverShareData[p256PublicKeySize:]
+		mlkemShared, err := hs.keyShareKeys.mlkem.Decapsulate(ciphertext)
+		if err != nil {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP256r1MLKEM768 server key share")
+		}
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.3: shared secret = ECDH_SS || ML-KEM_SS
+		sharedKey = append(sharedKey, mlkemShared...)
+	}
+	// SecP384r1MLKEM1024 handling (draft-ietf-tls-ecdhe-mlkem-03)
+	// Server share format: P-384 point (97 bytes) || ML-KEM-1024 ciphertext (1568 bytes) = 1665 bytes
+	// Shared secret: ECDH_SS (48 bytes) || ML-KEM_SS (32 bytes) = 80 bytes
+	if serverGroup == SecP384r1MLKEM1024 {
+		if hs.keyShareKeys.mlkem1024 == nil {
+			return c.sendAlert(alertInternalError)
+		}
+		serverShareData := hs.serverHello.serverShare.data
+		if len(serverShareData) != p384PublicKeySize+mlkem1024CiphertextSize {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid server SecP384r1MLKEM1024 key share size")
+		}
+		// Extract P-384 ECDH peer data (first 97 bytes)
+		ecdhePeerKey := serverShareData[:p384PublicKeySize]
+		// Compute ECDH shared secret
+		// [uTLS] Use mlkemEcdhe key for uTLS-built ClientHello to match the key share
+		// that was sent. Standard Go TLS path uses ecdhe key.
+		var ecdhShared []byte
+		if hs.uconn != nil && hs.uconn.clientHelloBuildStatus == BuildByUtls {
+			if hs.keyShareKeys.mlkemEcdhe == nil {
+				c.sendAlert(alertInternalError)
+				return errors.New("tls: mlkemEcdhe key not available for SecP384r1MLKEM1024")
+			}
+			ecdhShared, err = getSharedKey(ecdhePeerKey, hs.keyShareKeys.mlkemEcdhe)
+		} else {
+			ecdhShared, err = getSharedKey(ecdhePeerKey, hs.keyShareKeys.ecdhe)
+		}
+		if err != nil {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid server SecP384r1MLKEM1024 ECDH key share")
+		}
+		// Extract ML-KEM-1024 ciphertext (last 1568 bytes)
+		mlkemCiphertext := serverShareData[p384PublicKeySize:]
+		// Decapsulate ML-KEM-1024
+		mlkemShared, err := hs.keyShareKeys.mlkem1024.Decapsulate(mlkemCiphertext)
+		if err != nil {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP384r1MLKEM1024 ML-KEM ciphertext")
+		}
+		// Shared secret: ECDH_SS || ML-KEM_SS (per draft-ietf-tls-ecdhe-mlkem-03)
+		sharedKey = append(ecdhShared, mlkemShared...)
+	}
 	// [uTLS] SECTION END
 	c.curveID = serverGroup
 
@@ -1104,6 +1267,12 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 	}
 	if hs.hello.earlyData && !encryptedExtensions.earlyData {
 		c.quicRejectedEarlyData()
+		// [uTLS] For non-QUIC connections, update early data state when server rejects.
+		// The buffered data will be sent as regular data after handshake completion
+		// via sendBufferedEarlyData() in u_conn.go.
+		if c.quic == nil && hs.uconn != nil && hs.uconn.earlyData != nil {
+			hs.uconn.earlyData.SetRejected()
+		}
 	}
 	if encryptedExtensions.earlyData {
 		if hs.session.cipherSuite != c.cipherSuite {
@@ -1113,6 +1282,16 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 		if hs.session.alpnProtocol != c.clientProtocol {
 			c.sendAlert(alertHandshakeFailure)
 			return errors.New("tls: server accepted 0-RTT with the wrong ALPN")
+		}
+		// [uTLS] Track that server accepted early data for EndOfEarlyData sending.
+		// RFC 8446 Section 4.5 requires the client to send EndOfEarlyData
+		// after receiving server Finished if early data was accepted.
+		hs.earlyDataAccepted = true
+		// [uTLS] For non-QUIC connections, update early data state when server accepts.
+		// This clears the buffer since the data was successfully delivered.
+		if c.quic == nil && hs.uconn != nil && hs.uconn.earlyData != nil {
+			hs.uconn.earlyData.SetAccepted()
+			hs.uconn.earlyData.ClearBuffer()
 		}
 	}
 	if hs.echContext != nil {
@@ -1384,6 +1563,52 @@ func (hs *clientHandshakeStateTLS13) readServerFinished() error {
 	return nil
 }
 
+// sendEndOfEarlyData sends the EndOfEarlyData message if the server accepted
+// early data and this is not a QUIC connection.
+//
+// RFC 8446 Section 4.5:
+//
+//	If the server sent an "early_data" extension in EncryptedExtensions,
+//	the client MUST send an EndOfEarlyData message after receiving the
+//	server Finished. If the server does not send an "early_data"
+//	extension in EncryptedExtensions, then the client MUST NOT send an
+//	EndOfEarlyData message.
+//
+// RFC 9001 Section 8.3:
+//
+//	The TLS EndOfEarlyData message is not used with QUIC. QUIC does not
+//	rely on this message to mark the end of 0-RTT data or signal the
+//	change to Handshake keys.
+//
+// [uTLS]
+func (hs *clientHandshakeStateTLS13) sendEndOfEarlyData() error {
+	c := hs.c
+
+	// RFC 9001 Section 8.3: QUIC does not use EndOfEarlyData message.
+	// The end of early data is determined by the QUIC layer, not TLS.
+	if c.quic != nil {
+		return nil
+	}
+
+	// Only send if the server accepted early data in EncryptedExtensions.
+	// This is tracked when we process the EncryptedExtensions message
+	// in readServerParameters().
+	if !hs.earlyDataAccepted {
+		return nil
+	}
+
+	// Send the EndOfEarlyData message. This message has no content beyond
+	// the 4-byte header (handshake type + 3-byte length of 0).
+	// It indicates that all 0-RTT application data has been transmitted
+	// and subsequent records are protected under handshake traffic keys.
+	endOfEarlyData := new(endOfEarlyDataMsg)
+	if _, err := c.writeHandshakeRecord(endOfEarlyData, hs.transcript); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {
 	c := hs.c
 
@@ -1543,7 +1768,18 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	session.secret = psk
 	session.useBy = uint64(c.config.time().Add(lifetime).Unix())
 	session.ageAdd = msg.ageAdd
-	session.EarlyData = c.quic != nil && msg.maxEarlyData == 0xffffffff // RFC 9001, Section 4.6.1
+	// [uTLS] Enable early data for both QUIC and non-QUIC connections.
+	// RFC 9001 Section 4.6.1: For QUIC, max_early_data_size must be 0xffffffff.
+	// RFC 8446 Section 4.6.1: For standard TLS, max_early_data_size > 0 indicates
+	// early data support with that byte limit.
+	if c.quic != nil {
+		// QUIC requires exactly 0xffffffff to enable early data
+		session.EarlyData = msg.maxEarlyData == 0xffffffff
+	} else {
+		// Standard TLS: any non-zero value enables early data with that limit
+		session.EarlyData = msg.maxEarlyData > 0
+	}
+	session.maxEarlyDataSize = msg.maxEarlyData
 	session.ticket = msg.label
 	if c.quic != nil && c.quic.enableSessionEvents {
 		c.quicStoreSession(session)

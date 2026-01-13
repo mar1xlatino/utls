@@ -167,7 +167,10 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServer
 			c.config = configForClient
 		}
 	}
-	c.ticketKeys = originalConfig.ticketKeys(configForClient)
+	c.ticketKeys, err = originalConfig.ticketKeys(configForClient)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	clientVersions := clientHello.supportedVersions
 	if len(clientHello.supportedVersions) == 0 {
@@ -824,8 +827,15 @@ func (hs *serverHandshakeState) establishKeys() error {
 		}
 		serverHash = hs.suite.mac(serverMAC)
 	} else {
-		clientCipher = hs.suite.aead(clientKey, clientIV)
-		serverCipher = hs.suite.aead(serverKey, serverIV)
+		var err error
+		clientCipher, err = hs.suite.aead(clientKey, clientIV)
+		if err != nil {
+			return fmt.Errorf("tls: failed to create client AEAD cipher: %w", err)
+		}
+		serverCipher, err = hs.suite.aead(serverKey, serverIV)
+		if err != nil {
+			return fmt.Errorf("tls: failed to create server AEAD cipher: %w", err)
+		}
 	}
 
 	c.in.prepareCipherSpec(c.vers, clientCipher, clientHash)

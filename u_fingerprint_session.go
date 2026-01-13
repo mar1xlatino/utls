@@ -65,7 +65,7 @@ type FrozenGREASEValues struct {
 	SupportedVersion uint16 // GREASE in supported_versions
 	KeyShare         uint16 // GREASE key share group
 	SignatureAlgo    uint16 // GREASE in signature_algorithms
-	PSKMode          uint16 // GREASE in PSK modes (rare)
+	PSKMode          uint8  // GREASE in PSK modes (RFC 8701 uses different values: 0x0B, 0x2A, etc.)
 }
 
 // GreaseExtMarker1 and GreaseExtMarker2 are special marker values used in
@@ -96,6 +96,12 @@ var greaseValues = []uint16{
 	0xcaca, 0xdada, 0xeaea, 0xfafa,
 }
 
+// greasePSKModeValues is the set of valid GREASE values for PskKeyExchangeModes per RFC 8701.
+// These are single-byte values (different from the 2-byte GREASE pattern used elsewhere).
+var greasePSKModeValues = []uint8{
+	0x0B, 0x2A, 0x49, 0x68, 0x87, 0xA6, 0xC5, 0xE4,
+}
+
 // randomGREASE returns a random GREASE value.
 func randomGREASE() uint16 {
 	var b [2]byte
@@ -105,6 +111,25 @@ func randomGREASE() uint16 {
 	}
 	idx := binary.BigEndian.Uint16(b[:]) % uint16(len(greaseValues))
 	return greaseValues[idx]
+}
+
+// randomPSKModeGREASE returns a random GREASE value for PskKeyExchangeModes per RFC 8701.
+func randomPSKModeGREASE() uint8 {
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return greasePSKModeValues[0]
+	}
+	return greasePSKModeValues[b[0]%uint8(len(greasePSKModeValues))]
+}
+
+// IsValidPSKModeGREASE returns true if v is a valid GREASE value for PskKeyExchangeModes per RFC 8701.
+func IsValidPSKModeGREASE(v uint8) bool {
+	for _, valid := range greasePSKModeValues {
+		if v == valid {
+			return true
+		}
+	}
+	return false
 }
 
 // NewSessionFingerprintState creates a new session state from a profile.
@@ -152,7 +177,7 @@ func NewSessionFingerprintState(profile *FingerprintProfile, origin string) *Ses
 				SupportedVersion: randomGREASE(),
 				KeyShare:         supportedGroup, // MUST match SupportedGroup per Chrome behavior
 				SignatureAlgo:    randomGREASE(),
-				PSKMode:          randomGREASE(),
+				PSKMode:          randomPSKModeGREASE(), // RFC 8701: PSK modes use different GREASE values
 			}
 		}
 
@@ -361,7 +386,7 @@ func (s *SessionFingerprintState) GetGREASEValue(position GREASEPosition) uint16
 	case GREASESignatureAlgo:
 		return s.FrozenGREASE.SignatureAlgo
 	case GREASEPSKMode:
-		return s.FrozenGREASE.PSKMode
+		return uint16(s.FrozenGREASE.PSKMode)
 	default:
 		// Return a consistent value for unknown positions instead of random
 		// to maintain session consistency

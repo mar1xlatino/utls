@@ -175,6 +175,7 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 			t.Fatal("NewSessionFingerprintState returned nil")
 		}
 
+		// Standard GREASE values use 0x?a?a pattern
 		greaseValues := []uint16{
 			state.FrozenGREASE.CipherSuite,
 			state.FrozenGREASE.Extension1,
@@ -183,7 +184,6 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 			state.FrozenGREASE.SupportedVersion,
 			state.FrozenGREASE.KeyShare,
 			state.FrozenGREASE.SignatureAlgo,
-			state.FrozenGREASE.PSKMode,
 		}
 
 		for j, v := range greaseValues {
@@ -191,6 +191,12 @@ func TestFrozenGREASE_ValidRange(t *testing.T) {
 				t.Errorf("Iteration %d: GREASE value %d (0x%04x) at index %d is not valid GREASE",
 					i, v, v, j)
 			}
+		}
+
+		// PSKMode uses RFC 8701 Section 2 PSK mode GREASE values (0x0B, 0x2A, etc.)
+		if !IsValidPSKModeGREASE(state.FrozenGREASE.PSKMode) {
+			t.Errorf("Iteration %d: PSKMode value 0x%02x is not valid PSK mode GREASE",
+				i, state.FrozenGREASE.PSKMode)
 		}
 	}
 }
@@ -1128,7 +1134,7 @@ func TestGetGREASEValue_AllPositions(t *testing.T) {
 		{GREASESupportedVersion, state.FrozenGREASE.SupportedVersion},
 		{GREASEKeyShare, state.FrozenGREASE.KeyShare},
 		{GREASESignatureAlgo, state.FrozenGREASE.SignatureAlgo},
-		{GREASEPSKMode, state.FrozenGREASE.PSKMode},
+		{GREASEPSKMode, uint16(state.FrozenGREASE.PSKMode)},
 	}
 
 	for _, tt := range tests {

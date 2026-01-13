@@ -1,0 +1,153 @@
+{
+  "timestamp": "2025-12-21T14:21:17.688750567+03:00",
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+  "remote_addr": "[::1]:58742",
+  "record_version": 769,
+  "client_version": 771,
+  "session_id_length": 32,
+  "session_id": "c4ce81e27ad77be62e65759abeb6000331c9eb1f63289f02b7323553b069bb2a",
+  "cipher_suites": [
+    14906,
+    4865,
+    4866,
+    4867,
+    49195,
+    49199,
+    49196,
+    49200,
+    52393,
+    52392,
+    49171,
+    49172,
+    156,
+    157,
+    47,
+    53
+  ],
+  "compression_methods": "AA==",
+  "extensions": [
+    39578,
+    45,
+    35,
+    18,
+    16,
+    43,
+    10,
+    17613,
+    23,
+    65037,
+    5,
+    0,
+    51,
+    65281,
+    13,
+    27,
+    11,
+    23130
+  ],
+  "grease": {
+    "cipher_suite": 14906,
+    "extensions": [
+      39578,
+      23130
+    ],
+    "supported_group": 23130,
+    "supported_version": 39578,
+    "key_share": 23130,
+    "cipher_suite_pos": 0,
+    "extension_pos": [
+      0,
+      17
+    ],
+    "supported_group_pos": 0,
+    "supported_version_pos": 0,
+    "key_share_pos": 0
+  },
+  "server_name": "localhost",
+  "supported_groups": [
+    23130,
+    4588,
+    29,
+    23,
+    24
+  ],
+  "ec_point_formats": "AA==",
+  "signature_algorithms": [
+    1027,
+    2052,
+    1025,
+    1283,
+    2053,
+    1281,
+    2054,
+    1537
+  ],
+  "signature_algorithms_cert": null,
+  "alpn_protocols": [
+    "h2",
+    "http/1.1"
+  ],
+  "supported_versions": [
+    39578,
+    772,
+    771
+  ],
+  "key_shares": [
+    {
+      "group": 23130,
+      "key_length": 1
+    },
+    {
+      "group": 4588,
+      "key_length": 1216
+    },
+    {
+      "group": 29,
+      "key_length": 32
+    }
+  ],
+  "psk_modes": "AQ==",
+  "cert_compression_algs": [
+    2
+  ],
+  "early_data_enabled": false,
+  "psk_present": false,
+  "psk_identities_count": 0,
+  "psk_binders_count": 0,
+  "cookie_present": false,
+  "cookie_length": 0,
+  "status_request": true,
+  "status_request_v2": false,
+  "sct_enabled": true,
+  "extended_master_secret": true,
+  "encrypt_then_mac": false,
+  "post_handshake_auth": false,
+  "delegated_credentials": false,
+  "renegotiation_info": true,
+  "renegotiation_info_len": 1,
+  "application_settings": true,
+  "application_settings_old": false,
+  "alps_protocols": [
+    "h2"
+  ],
+  "ech_enabled": true,
+  "ech_type": 65037,
+  "ech_outer_exts": false,
+  "ech_is_grease": false,
+  "ech_config_id": 94,
+  "npn_enabled": false,
+  "channel_id_enabled": false,
+  "token_binding": false,
+  "cert_authorities_present": false,
+  "cert_authorities_length": 0,
+  "quic_transport_params": false,
+  "padding_length": 0,
+  "record_size_limit": 0,
+  "session_ticket_length": 0,
+  "ja3": "af1fb04365550e3980d2f903aba9e1a7",
+  "ja3_raw": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,45-35-18-16-43-10-17613-23-65037-5-0-51-65281-13-27-11,4588-29-23-24,0",
+  "ja4": "t13d1516h2_8daaf6152771_d8a2da3f94cd",
+  "ja4_raw": "t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,44cd,fe0d,ff01_0403,0804,0401,0503,0805,0501,0806,0601",
+  "ja4_original": "t13d1516h2_acb858a92679_e06f1b81f7b0",
+  "ja4_original_raw": "t13d1516h2_1301,1302,1303,c02b,c02f,c02c,c030,cca9,cca8,c013,c014,009c,009d,002f,0035_002d,0023,0012,002b,000a,44cd,0017,fe0d,0005,0033,ff01,000d,001b,000b_0403,0804,0401,0503,0805,0501,0806,0601"
+}

@@ -210,7 +210,7 @@ func (crm *CertificateRequestMsgTLS13) toPrivate() *certificateRequestMsgTLS13 {
 type PubCipherSuiteTLS13 struct {
 	Id     uint16
 	KeyLen int
-	Aead   func(key, fixedNonce []byte) aead
+	Aead   func(key, fixedNonce []byte) (aead, error)
 	Hash   crypto.Hash
 }
 
@@ -482,7 +482,7 @@ type PubCipherSuite struct {
 	Flags  int
 	Cipher func(key, iv []byte, isRead bool) interface{}
 	Mac    func(macKey []byte) hash.Hash
-	Aead   func(key, fixedNonce []byte) aead
+	Aead   func(key, fixedNonce []byte) (aead, error)
 }
 
 func (cs *PubCipherSuite) getPrivatePtr() *cipherSuite {
@@ -830,6 +830,7 @@ type KeySharePrivateKeys struct {
 	CurveID    CurveID
 	Ecdhe      *ecdh.PrivateKey
 	Mlkem      *mlkem.DecapsulationKey768
+	Mlkem1024  *mlkem.DecapsulationKey1024 // ML-KEM-1024 for SecP384r1MLKEM1024 hybrid
 	MlkemEcdhe *ecdh.PrivateKey
 	Ffdhe      *ffdhePrivateKey // FFDHE private key for RFC 7919 finite field key exchange
 }
@@ -842,6 +843,7 @@ func (ksp *KeySharePrivateKeys) ToPrivate() *keySharePrivateKeys {
 		curveID:    ksp.CurveID,
 		ecdhe:      ksp.Ecdhe,
 		mlkem:      ksp.Mlkem,
+		mlkem1024:  ksp.Mlkem1024,
 		mlkemEcdhe: ksp.MlkemEcdhe,
 		ffdhe:      ksp.Ffdhe,
 	}
@@ -855,6 +857,7 @@ func (ksp *keySharePrivateKeys) ToPublic() *KeySharePrivateKeys {
 		CurveID:    ksp.curveID,
 		Ecdhe:      ksp.ecdhe,
 		Mlkem:      ksp.mlkem,
+		Mlkem1024:  ksp.mlkem1024,
 		MlkemEcdhe: ksp.mlkemEcdhe,
 		Ffdhe:      ksp.ffdhe,
 	}

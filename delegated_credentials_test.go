@@ -336,60 +336,88 @@ func TestDCAlgorithmCompatibility(t *testing.T) {
 	}
 }
 
-// TestDCHasDelegationUsage tests the DelegationUsage extension check
+// TestDCHasDelegationUsage tests the DelegationUsage extension and digitalSignature KeyUsage check.
+// Per RFC 9345 Section 4.2, certificates used for delegated credentials MUST have:
+// 1. The digitalSignature KeyUsage bit set
+// 2. The DelegationUsage extension present
 func TestDCHasDelegationUsage(t *testing.T) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("Failed to generate key: %v", err)
 	}
 
-	// Certificate without DelegationUsage
-	templateNoDU := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "Test No DU"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-	}
-
-	certNoDUDER, err := x509.CreateCertificate(rand.Reader, templateNoDU, templateNoDU, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		t.Fatalf("Failed to create certificate: %v", err)
-	}
-	certNoDU, err := x509.ParseCertificate(certNoDUDER)
-	if err != nil {
-		t.Fatalf("Failed to parse certificate: %v", err)
-	}
-
-	if hasDelegationUsage(certNoDU) {
-		t.Error("Certificate without DelegationUsage should return false")
-	}
-
-	// Certificate with DelegationUsage
-	templateWithDU := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "Test With DU"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		ExtraExtensions: []pkix.Extension{
-			{
-				Id:       delegationUsageOID,
-				Critical: false,
-				Value:    []byte{},
-			},
+	testCases := []struct {
+		name           string
+		keyUsage       x509.KeyUsage
+		hasDUExtension bool
+		expectResult   bool
+	}{
+		{
+			name:           "no DelegationUsage, no digitalSignature",
+			keyUsage:       0,
+			hasDUExtension: false,
+			expectResult:   false,
+		},
+		{
+			name:           "with DelegationUsage, no digitalSignature",
+			keyUsage:       0,
+			hasDUExtension: true,
+			expectResult:   false, // RFC 9345: digitalSignature KeyUsage is required
+		},
+		{
+			name:           "no DelegationUsage, with digitalSignature",
+			keyUsage:       x509.KeyUsageDigitalSignature,
+			hasDUExtension: false,
+			expectResult:   false, // DelegationUsage extension is required
+		},
+		{
+			name:           "with DelegationUsage, with digitalSignature",
+			keyUsage:       x509.KeyUsageDigitalSignature,
+			hasDUExtension: true,
+			expectResult:   true, // Both requirements satisfied
+		},
+		{
+			name:           "with DelegationUsage, with digitalSignature and other usages",
+			keyUsage:       x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			hasDUExtension: true,
+			expectResult:   true, // digitalSignature is present, other usages don't affect it
 		},
 	}
 
-	certWithDUDER, err := x509.CreateCertificate(rand.Reader, templateWithDU, templateWithDU, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		t.Fatalf("Failed to create certificate with DU: %v", err)
-	}
-	certWithDU, err := x509.ParseCertificate(certWithDUDER)
-	if err != nil {
-		t.Fatalf("Failed to parse certificate with DU: %v", err)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			template := &x509.Certificate{
+				SerialNumber: big.NewInt(1),
+				Subject:      pkix.Name{CommonName: "Test " + tc.name},
+				NotBefore:    time.Now(),
+				NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+				KeyUsage:     tc.keyUsage,
+			}
 
-	if !hasDelegationUsage(certWithDU) {
-		t.Error("Certificate with DelegationUsage should return true")
+			if tc.hasDUExtension {
+				template.ExtraExtensions = []pkix.Extension{
+					{
+						Id:       delegationUsageOID,
+						Critical: false,
+						Value:    []byte{},
+					},
+				}
+			}
+
+			certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+			if err != nil {
+				t.Fatalf("Failed to create certificate: %v", err)
+			}
+			cert, err := x509.ParseCertificate(certDER)
+			if err != nil {
+				t.Fatalf("Failed to parse certificate: %v", err)
+			}
+
+			result := hasDelegationUsage(cert)
+			if result != tc.expectResult {
+				t.Errorf("hasDelegationUsage() = %v, want %v", result, tc.expectResult)
+			}
+		})
 	}
 }
 

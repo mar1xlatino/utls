@@ -145,7 +145,7 @@ type cipherSuite struct {
 	flags  int
 	cipher func(key, iv []byte, isRead bool) any
 	mac    func(key []byte) hash.Hash
-	aead   func(key, fixedNonce []byte) aead
+	aead   func(key, fixedNonce []byte) (aead, error)
 }
 
 var cipherSuites = []*cipherSuite{ // TODO: replace with a map, since the order doesn't matter.
@@ -196,7 +196,7 @@ func selectCipherSuite(ids, supportedIDs []uint16, ok func(*cipherSuite) bool) *
 type cipherSuiteTLS13 struct {
 	id     uint16
 	keyLen int
-	aead   func(key, fixedNonce []byte) aead
+	aead   func(key, fixedNonce []byte) (aead, error)
 	hash   crypto.Hash
 }
 
@@ -558,31 +558,31 @@ func (f *xorNonceAEAD) Open(out, nonce, ciphertext, additionalData []byte) ([]by
 	return result, err
 }
 
-func aeadAESGCM(key, noncePrefix []byte) aead {
+func aeadAESGCM(key, noncePrefix []byte) (aead, error) {
 	if len(noncePrefix) != noncePrefixLength {
-		panic("tls: internal error: wrong nonce length")
+		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(noncePrefix), noncePrefixLength)
 	}
-	aes, err := aes.NewCipher(key)
+	aesBlock, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("tls: failed to create AES cipher: %w", err)
 	}
-	var aead cipher.AEAD
+	var gcm cipher.AEAD
 	if boring.Enabled {
-		aead, err = boring.NewGCMTLS(aes)
+		gcm, err = boring.NewGCMTLS(aesBlock)
 	} else {
 		boring.Unreachable()
 		// [uTLS] SECTION BEGIN
-		// aead, err = gcm.NewGCMForTLS12(aes.(*fipsaes.Block))
-		aead, err = cipher.NewGCM(aes)
+		// gcm, err = gcm.NewGCMForTLS12(aesBlock.(*fipsaes.Block))
+		gcm, err = cipher.NewGCM(aesBlock)
 		// [uTLS] SECTION END
 	}
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("tls: failed to create GCM AEAD: %w", err)
 	}
 
-	ret := &prefixNonceAEAD{aead: aead}
+	ret := &prefixNonceAEAD{aead: gcm}
 	copy(ret.nonce[:], noncePrefix)
-	return ret
+	return ret, nil
 }
 
 // aeadAESGCMTLS13 should be an internal detail,
@@ -595,45 +595,45 @@ func aeadAESGCM(key, noncePrefix []byte) aead {
 // See go.dev/issue/67401.
 //
 //go:linkname aeadAESGCMTLS13
-func aeadAESGCMTLS13(key, nonceMask []byte) aead {
+func aeadAESGCMTLS13(key, nonceMask []byte) (aead, error) {
 	if len(nonceMask) != aeadNonceLength {
-		panic("tls: internal error: wrong nonce length")
+		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(nonceMask), aeadNonceLength)
 	}
-	aes, err := aes.NewCipher(key)
+	aesBlock, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("tls: failed to create AES cipher: %w", err)
 	}
-	var aead cipher.AEAD
+	var gcm cipher.AEAD
 	if boring.Enabled {
-		aead, err = boring.NewGCMTLS13(aes)
+		gcm, err = boring.NewGCMTLS13(aesBlock)
 	} else {
 		boring.Unreachable()
 		// [uTLS] SECTION BEGIN
-		// aead, err = gcm.NewGCMForTLS13(aes.(*fipsaes.Block))
-		aead, err = cipher.NewGCM(aes)
+		// gcm, err = gcm.NewGCMForTLS13(aesBlock.(*fipsaes.Block))
+		gcm, err = cipher.NewGCM(aesBlock)
 		// [uTLS] SECTION END
 	}
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("tls: failed to create GCM AEAD for TLS 1.3: %w", err)
 	}
 
-	ret := &xorNonceAEAD{aead: aead}
+	ret := &xorNonceAEAD{aead: gcm}
 	copy(ret.nonceMask[:], nonceMask)
-	return ret
+	return ret, nil
 }
 
-func aeadChaCha20Poly1305(key, nonceMask []byte) aead {
+func aeadChaCha20Poly1305(key, nonceMask []byte) (aead, error) {
 	if len(nonceMask) != aeadNonceLength {
-		panic("tls: internal error: wrong nonce length")
+		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(nonceMask), aeadNonceLength)
 	}
-	aead, err := chacha20poly1305.New(key)
+	chachaAEAD, err := chacha20poly1305.New(key)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("tls: failed to create ChaCha20-Poly1305 AEAD: %w", err)
 	}
 
-	ret := &xorNonceAEAD{aead: aead}
+	ret := &xorNonceAEAD{aead: chachaAEAD}
 	copy(ret.nonceMask[:], nonceMask)
-	return ret
+	return ret, nil
 }
 
 type constantTimeHash interface {

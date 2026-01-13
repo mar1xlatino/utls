@@ -1030,6 +1030,10 @@ func TestCloneNonFuncFields(t *testing.T) {
 			f.Set(reflect.ValueOf(true))
 		case "CTLogs": // [uTLS] Custom CT logs for validation
 			f.Set(reflect.ValueOf(map[[32]byte]*CTLogInfo{{1}: {URL: "test"}}))
+		case "ServerCertCompressionAlgorithms": // [uTLS] RFC 8879 certificate compression
+			f.Set(reflect.ValueOf([]CertCompressionAlgo{CertCompressionBrotli}))
+		case "ServerMaxEarlyData": // [uTLS] 0-RTT server max early data
+			f.Set(reflect.ValueOf(uint32(16384)))
 		default:
 			t.Errorf("all fields must be accounted for, but saw unknown field %q", fn)
 		}

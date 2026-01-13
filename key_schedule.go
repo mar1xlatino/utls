@@ -108,8 +108,9 @@ type keySharePrivateKeys struct {
 	curveID    CurveID
 	ecdhe      *ecdh.PrivateKey
 	mlkem      *mlkem.DecapsulationKey768
-	mlkemEcdhe *ecdh.PrivateKey // [uTLS] seperate ecdhe key for pq keyshare in line with Chrome, instead of reusing ecdhe key like stdlib
-	ffdhe      *ffdhePrivateKey // [uTLS] FFDHE private key for RFC 7919 finite field key exchange
+	mlkem1024  *mlkem.DecapsulationKey1024 // [uTLS] ML-KEM-1024 for SecP384r1MLKEM1024
+	mlkemEcdhe *ecdh.PrivateKey            // [uTLS] seperate ecdhe key for pq keyshare in line with Chrome, instead of reusing ecdhe key like stdlib
+	ffdhe      *ffdhePrivateKey            // [uTLS] FFDHE private key for RFC 7919 finite field key exchange
 }
 
 // ffdhePrivateKey holds the private and public keys for FFDHE key exchange.
@@ -233,6 +234,27 @@ func (k *ffdhePrivateKey) Zero() {
 }
 
 const x25519PublicKeySize = 32
+
+// SecP256r1MLKEM768 size constants (draft-ietf-tls-ecdhe-mlkem-03)
+// Client key share: P-256 uncompressed point (65 bytes) || ML-KEM-768 encapsulation key (1184 bytes) = 1249 bytes
+// Server key share: P-256 uncompressed point (65 bytes) || ML-KEM-768 ciphertext (1088 bytes) = 1153 bytes
+// Shared secret: ECDH x-coordinate (32 bytes) || ML-KEM shared secret (32 bytes) = 64 bytes
+const (
+	p256PublicKeySize               = 65   // Uncompressed point: 0x04 || X (32 bytes) || Y (32 bytes)
+	secP256r1MLKEM768ClientKeyShare = 1249 // p256PublicKeySize + mlkem.EncapsulationKeySize768
+	secP256r1MLKEM768ServerKeyShare = 1153 // p256PublicKeySize + mlkem.CiphertextSize768
+)
+
+// SecP384r1MLKEM1024 size constants (draft-ietf-tls-ecdhe-mlkem-03)
+// Client key share: P-384 uncompressed point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes) = 1665 bytes
+// Server key share: P-384 uncompressed point (97 bytes) || ML-KEM-1024 ciphertext (1568 bytes) = 1665 bytes
+// Shared secret: ECDH x-coordinate (48 bytes) || ML-KEM shared secret (32 bytes) = 80 bytes
+const (
+	p384PublicKeySize            = 97   // Uncompressed point: 0x04 || X (48 bytes) || Y (48 bytes)
+	mlkem1024EncapsulationKeySize = 1568 // ML-KEM-1024 encapsulation key size
+	mlkem1024CiphertextSize       = 1568 // ML-KEM-1024 ciphertext size
+	secP384r1MLKEM1024KeyShareSize = p384PublicKeySize + mlkem1024EncapsulationKeySize // 1665 bytes
+)
 
 // generateECDHEKey returns a PrivateKey that implements Diffie-Hellman
 // according to RFC 8446, Section 4.2.8.2.

@@ -6,6 +6,7 @@ package tls
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto"
 	"crypto/hmac"
@@ -19,6 +20,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"github.com/refraction-networking/utls/internal/byteorder"
 	"github.com/refraction-networking/utls/internal/fips140tls"
 	"github.com/refraction-networking/utls/internal/hkdf"
@@ -169,6 +172,12 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 			c.sendAlert(alertIllegalParameter)
 			return errors.New("tls: early_data without pre_shared_key")
 		}
+	} else if hs.clientHello.earlyData && c.config.ServerMaxEarlyData > 0 {
+		// [uTLS] Non-QUIC 0-RTT support: allow early_data when ServerMaxEarlyData is configured
+		if len(hs.clientHello.pskIdentities) == 0 {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: early_data without pre_shared_key")
+		}
 	} else if hs.clientHello.earlyData {
 		// See RFC 8446, Section 4.2.10 for the complicated behavior required
 		// here. The scenario is that a different server at our address offered
@@ -178,6 +187,14 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		// applies to mixing or replacing with any TLS 1.2 server.
 		c.sendAlert(alertUnsupportedExtension)
 		return errors.New("tls: client sent unexpected early data")
+	}
+
+	// RFC 9001 Section 8.4: A client MUST NOT request the use of the TLS 1.3
+	// compatibility mode. A server SHOULD treat the receipt of a TLS ClientHello
+	// with a non-empty legacy_session_id field as a connection error.
+	if c.quic != nil && len(hs.clientHello.sessionId) > 0 {
+		c.sendAlert(alertIllegalParameter)
+		return errors.New("tls: QUIC client sent non-empty legacy_session_id")
 	}
 
 	hs.hello.sessionId = hs.clientHello.sessionId
@@ -262,6 +279,24 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		}
 		ecdhData = ecdhData[mlkem.EncapsulationKeySize768:]
 	}
+	if selectedGroup == SecP256r1MLKEM768 {
+		// SecP256r1MLKEM768: P-256 point (65 bytes) || ML-KEM encapsulation key (1184 bytes)
+		ecdhGroup = CurveP256
+		if len(ecdhData) != p256PublicKeySize+mlkem.EncapsulationKeySize768 {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP256r1MLKEM768 client key share")
+		}
+		ecdhData = ecdhData[:p256PublicKeySize]
+	}
+	if selectedGroup == SecP384r1MLKEM1024 {
+		// SecP384r1MLKEM1024: P-384 point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes) = 1665 bytes
+		ecdhGroup = CurveP384
+		if len(ecdhData) != p384PublicKeySize+mlkem1024EncapsulationKeySize {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP384r1MLKEM1024 client key share")
+		}
+		ecdhData = ecdhData[:p384PublicKeySize]
+	}
 	if _, ok := curveForCurveID(ecdhGroup); !ok {
 		// RFC 8446 Section 6.2: illegal_parameter - A field in the handshake
 		// was incorrect or inconsistent with other fields. This applies when
@@ -292,17 +327,52 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 			return errors.New("tls: invalid X25519MLKEM768 client key share")
 		}
 		mlkemSharedSecret, ciphertext := k.Encapsulate()
-		// draft-kwiatkowski-tls-ecdhe-mlkem-02, Section 3.1.3: "For
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 3.1.3: "For
 		// X25519MLKEM768, the shared secret is the concatenation of the ML-KEM
 		// shared secret and the X25519 shared secret. The shared secret is 64
 		// bytes (32 bytes for each part)."
 		hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
-		// draft-kwiatkowski-tls-ecdhe-mlkem-02, Section 3.1.2: "When the
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 3.1.2: "When the
 		// X25519MLKEM768 group is negotiated, the server's key exchange value
 		// is the concatenation of an ML-KEM ciphertext returned from
 		// encapsulation to the client's encapsulation key, and the server's
 		// ephemeral X25519 share."
 		hs.hello.serverShare.data = append(ciphertext, hs.hello.serverShare.data...)
+	}
+	if selectedGroup == SecP256r1MLKEM768 {
+		// SecP256r1MLKEM768: ML-KEM encapsulation key is at offset p256PublicKeySize
+		k, err := mlkem.NewEncapsulationKey768(clientKeyShare.data[p256PublicKeySize:])
+		if err != nil {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP256r1MLKEM768 client key share")
+		}
+		mlkemSharedSecret, ciphertext := k.Encapsulate()
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.3: "For SecP256r1MLKEM768,
+		// the shared secret is the concatenation of the ECDHE and ML-KEM shared
+		// secret. The size of the shared secret is 64 bytes (32 bytes for each part)."
+		hs.sharedKey = append(hs.sharedKey, mlkemSharedSecret...)
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.2: "When the SecP256r1MLKEM768
+		// group is negotiated, the server's key exchange value is the concatenation
+		// of the server's ephemeral secp256r1 share and an ML-KEM ciphertext."
+		hs.hello.serverShare.data = append(hs.hello.serverShare.data, ciphertext...)
+	}
+	if selectedGroup == SecP384r1MLKEM1024 {
+		// SecP384r1MLKEM1024: ML-KEM-1024 encapsulation key is at offset p384PublicKeySize
+		k, err := mlkem.NewEncapsulationKey1024(clientKeyShare.data[p384PublicKeySize:])
+		if err != nil {
+			c.sendAlert(alertIllegalParameter)
+			return errors.New("tls: invalid SecP384r1MLKEM1024 client key share")
+		}
+		mlkemSharedSecret, ciphertext := k.Encapsulate()
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.3: "For SecP384r1MLKEM1024,
+		// the shared secret is the concatenation of the ECDHE and ML-KEM shared
+		// secret. The size of the shared secret is 80 bytes (48 bytes for ECDH
+		// part and 32 bytes for the ML-KEM part)."
+		hs.sharedKey = append(hs.sharedKey, mlkemSharedSecret...)
+		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.2: "When the SecP384r1MLKEM1024
+		// group is negotiated, the server's key exchange value is the concatenation
+		// of the server's ephemeral secp384r1 share and an ML-KEM ciphertext."
+		hs.hello.serverShare.data = append(hs.hello.serverShare.data, ciphertext...)
 	}
 
 	selectedProto, err := negotiateALPN(c.config.NextProtos, hs.clientHello.alpnProtocols, c.quic != nil)
@@ -376,10 +446,11 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 
 	// pskCandidate holds pre-validated PSK information for constant-time selection
 	type pskCandidate struct {
-		valid        bool
-		sessionState *SessionState
-		earlySecret  *tls13.EarlySecret
-		pskBinder    []byte // computed expected binder
+		valid             bool
+		sessionState      *SessionState
+		earlySecret       *tls13.EarlySecret
+		pskBinder         []byte // computed expected binder
+		ticketAgeMismatch bool   // RFC 8446 Section 4.2.10: age validation failed
 	}
 
 	candidates := make([]pskCandidate, numIdentities)
@@ -417,8 +488,32 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 		}
 
 		createdAt := time.Unix(int64(sessionState.createdAt), 0)
-		if c.config.time().Sub(createdAt) > maxSessionTicketLifetime {
+		ticketAge := c.config.time().Sub(createdAt)
+		if ticketAge > maxSessionTicketLifetime {
 			continue
+		}
+
+		// RFC 8446 Section 4.2.10: Validate ticket age freshness.
+		// The client sends obfuscated_ticket_age = (ticket_age_ms + ageAdd) mod 2^32.
+		// We verify this matches the actual ticket age within a tolerance.
+		// This is a SHOULD requirement - mismatch rejects 0-RTT but allows handshake.
+		var ticketAgeMismatch bool
+		if ticketAge >= 0 {
+			// Compute claimed age: obfuscated_ticket_age - ageAdd (mod 2^32)
+			claimedAgeMs := identity.obfuscatedTicketAge - sessionState.ageAdd
+			actualAgeMs := uint32(ticketAge.Milliseconds())
+
+			// Allow 10-second tolerance for clock drift per RFC 8446 Section 8.3
+			const ticketAgeTolerance = 10000 // milliseconds
+			var ageDiff int64
+			if actualAgeMs >= claimedAgeMs {
+				ageDiff = int64(actualAgeMs - claimedAgeMs)
+			} else {
+				ageDiff = int64(claimedAgeMs - actualAgeMs)
+			}
+			if ageDiff > int64(ticketAgeTolerance) {
+				ticketAgeMismatch = true
+			}
 		}
 
 		pskSuite := cipherSuiteTLS13ByID(sessionState.cipherSuite)
@@ -475,10 +570,11 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 		}
 
 		candidates[i] = pskCandidate{
-			valid:        true,
-			sessionState: sessionState,
-			earlySecret:  earlySecret,
-			pskBinder:    pskBinder,
+			valid:             true,
+			sessionState:      sessionState,
+			earlySecret:       earlySecret,
+			pskBinder:         pskBinder,
+			ticketAgeMismatch: ticketAgeMismatch,
 		}
 	}
 
@@ -545,9 +641,11 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 	}
 
 	// Handle early data (0-RTT) for QUIC - only allowed for the first PSK identity
+	// RFC 8446 Section 4.2.10: Reject 0-RTT if ticket age mismatch detected
 	if c.quic != nil && hs.clientHello.earlyData && selectedIndex == 0 &&
 		selected.sessionState.EarlyData && selected.sessionState.cipherSuite == hs.suite.id &&
-		selected.sessionState.alpnProtocol == c.clientProtocol {
+		selected.sessionState.alpnProtocol == c.clientProtocol &&
+		!selected.ticketAgeMismatch {
 		hs.earlyData = true
 
 		transcript := hs.suite.hash.New()
@@ -560,6 +658,19 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 			return err
 		}
 		c.quicSetReadSecret(QUICEncryptionLevelEarly, hs.suite.id, earlyTrafficSecret)
+	}
+
+	// [uTLS] Handle early data (0-RTT) for non-QUIC when ServerMaxEarlyData is configured
+	// RFC 8446 Section 4.2.10: Reject 0-RTT if ticket age mismatch detected
+	if c.quic == nil && c.config.ServerMaxEarlyData > 0 && hs.clientHello.earlyData && selectedIndex == 0 &&
+		selected.sessionState.EarlyData && selected.sessionState.cipherSuite == hs.suite.id &&
+		selected.sessionState.alpnProtocol == c.clientProtocol &&
+		!selected.ticketAgeMismatch {
+		hs.earlyData = true
+		// Note: For non-QUIC, the early data traffic secret is derived but the actual
+		// early data reading requires additional implementation in conn.go.
+		// Setting hs.earlyData = true causes the server to send early_data extension
+		// in EncryptedExtensions, signaling acceptance to the client.
 	}
 
 	c.didResume = true
@@ -943,6 +1054,14 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 	encryptedExtensions := new(encryptedExtensionsMsg)
 	encryptedExtensions.alpnProtocol = c.clientProtocol
 
+	// [uTLS] Check if client sent ALPS and server has application settings for the negotiated ALPN
+	if hs.clientHello.alpsCodepoint != 0 && len(c.clientProtocol) > 0 {
+		if alps, ok := c.config.ApplicationSettings[c.clientProtocol]; ok {
+			encryptedExtensions.utls.applicationSettingsCodepoint = hs.clientHello.alpsCodepoint
+			encryptedExtensions.utls.applicationSettings = alps
+		}
+	}
+
 	if c.quic != nil {
 		p, err := c.quicGetTransportParameters()
 		if err != nil {
@@ -1002,8 +1121,26 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 	certMsg.scts = hs.clientHello.scts && len(hs.cert.SignedCertificateTimestamps) > 0
 	certMsg.ocspStapling = hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0
 
-	if _, err := hs.c.writeHandshakeRecord(certMsg, hs.transcript); err != nil {
-		return err
+	// [uTLS] Check if we should compress the certificate (RFC 8879)
+	compressionAlg := hs.negotiateCertCompression()
+	if compressionAlg != 0 {
+		// Send CompressedCertificate instead of Certificate
+		compressedMsg, err := hs.compressCertificate(certMsg, compressionAlg)
+		if err != nil || compressedMsg == nil {
+			// Fall back to uncompressed on error or when compression is not beneficial
+			// (RFC 8879 Section 4.2.1: compression SHOULD NOT be applied if result >= original)
+			if _, err := hs.c.writeHandshakeRecord(certMsg, hs.transcript); err != nil {
+				return err
+			}
+		} else {
+			if _, err := hs.c.writeHandshakeRecord(compressedMsg, hs.transcript); err != nil {
+				return err
+			}
+		}
+	} else {
+		if _, err := hs.c.writeHandshakeRecord(certMsg, hs.transcript); err != nil {
+			return err
+		}
 	}
 
 	certVerifyMsg := new(certificateVerifyMsg)
@@ -1179,10 +1316,22 @@ func (c *Conn) sendSessionTicket(earlyData bool, extra [][]byte) error {
 
 	m := new(newSessionTicketMsgTLS13)
 
+	// ticket_age_add is a random 32-bit value. See RFC 8446, section 4.6.1.
+	// CRITICAL: Generate ageAdd BEFORE creating the session state so it's
+	// included in the encrypted ticket. This is required for 0-RTT ticket
+	// age validation per RFC 8446 Section 4.2.10.
+	ageAdd := make([]byte, 4)
+	if _, err := c.config.rand().Read(ageAdd); err != nil {
+		return err
+	}
+	m.ageAdd = byteorder.LEUint32(ageAdd)
+	m.lifetime = uint32(maxSessionTicketLifetime / time.Second)
+
 	state := c.sessionState()
 	state.secret = psk
 	state.EarlyData = earlyData
 	state.Extra = extra
+	state.ageAdd = m.ageAdd // Store ageAdd in session state for ticket age validation
 	if c.config.WrapSession != nil {
 		var err error
 		m.label, err = c.config.WrapSession(c.connectionStateLocked(), state)
@@ -1200,20 +1349,15 @@ func (c *Conn) sendSessionTicket(earlyData bool, extra [][]byte) error {
 			return err
 		}
 	}
-	m.lifetime = uint32(maxSessionTicketLifetime / time.Second)
-
-	// ticket_age_add is a random 32-bit value. See RFC 8446, section 4.6.1
-	// The value is not stored anywhere; we never need to check the ticket age
-	// because 0-RTT is not supported.
-	ageAdd := make([]byte, 4)
-	if _, err := c.config.rand().Read(ageAdd); err != nil {
-		return err
-	}
-	m.ageAdd = byteorder.LEUint32(ageAdd)
 
 	if earlyData {
 		// RFC 9001, Section 4.6.1
 		m.maxEarlyData = 0xffffffff
+	} else if c.config.ServerMaxEarlyData > 0 {
+		// [uTLS] Non-QUIC 0-RTT support: advertise maxEarlyData in session tickets
+		m.maxEarlyData = c.config.ServerMaxEarlyData
+		state.EarlyData = true
+		state.maxEarlyDataSize = c.config.ServerMaxEarlyData
 	}
 
 	if _, err := c.writeHandshakeRecord(m, nil); err != nil {
@@ -1335,4 +1479,98 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)
 
 	return nil
+}
+
+// [uTLS] negotiateCertCompression finds the first mutually supported certificate
+// compression algorithm between server config and client's compress_certificate extension.
+// Returns 0 if no compression should be used.
+func (hs *serverHandshakeStateTLS13) negotiateCertCompression() uint16 {
+	serverAlgs := hs.c.config.ServerCertCompressionAlgorithms
+	if len(serverAlgs) == 0 {
+		return 0
+	}
+	clientAlgs := hs.clientHello.certCompressionAlgorithms
+	if len(clientAlgs) == 0 {
+		return 0
+	}
+
+	// Server preference order: use first server algorithm that client supports
+	for _, serverAlg := range serverAlgs {
+		for _, clientAlg := range clientAlgs {
+			if uint16(serverAlg) == clientAlg {
+				return uint16(serverAlg)
+			}
+		}
+	}
+	return 0
+}
+
+// [uTLS] compressCertificate compresses a certificate message using the specified algorithm.
+// Returns a CompressedCertificate message ready to be sent, or nil if compression is not beneficial.
+// RFC 8879 Section 4.2.1: If the length of the resulting compressed data is equal to
+// or larger than the original, compression SHOULD NOT be applied.
+func (hs *serverHandshakeStateTLS13) compressCertificate(certMsg *certificateMsgTLS13, algorithm uint16) (*utlsCompressedCertificateMsg, error) {
+	// Marshal the certificate message (without the 4-byte header)
+	certBytes, err := certMsg.marshal()
+	if err != nil {
+		return nil, err
+	}
+	// Skip the 4-byte header (message type + uint24 length)
+	if len(certBytes) < 4 {
+		return nil, errors.New("tls: certificate message too short")
+	}
+	uncompressedPayload := certBytes[4:]
+
+	var compressedPayload []byte
+
+	switch CertCompressionAlgo(algorithm) {
+	case CertCompressionBrotli:
+		compressedPayload = compressBrotli(uncompressedPayload)
+	case CertCompressionZlib:
+		compressedPayload = compressZlib(uncompressedPayload)
+	case CertCompressionZstd:
+		compressedPayload = compressZstd(uncompressedPayload)
+	default:
+		return nil, errors.New("tls: unsupported compression algorithm")
+	}
+
+	// RFC 8879 Section 4.2.1: If the length of the resulting compressed data
+	// is equal to or larger than the original, compression SHOULD NOT be applied.
+	// Return nil to signal that the caller should send uncompressed certificate.
+	if len(compressedPayload) >= len(uncompressedPayload) {
+		return nil, nil
+	}
+
+	return &utlsCompressedCertificateMsg{
+		algorithm:                    algorithm,
+		uncompressedLength:           uint32(len(uncompressedPayload)),
+		compressedCertificateMessage: compressedPayload,
+	}, nil
+}
+
+// [uTLS] compressBrotli compresses data using Brotli algorithm.
+func compressBrotli(data []byte) []byte {
+	var buf bytes.Buffer
+	writer := brotli.NewWriterLevel(&buf, brotli.BestCompression)
+	writer.Write(data)
+	writer.Close()
+	return buf.Bytes()
+}
+
+// [uTLS] compressZlib compresses data using zlib/DEFLATE algorithm.
+func compressZlib(data []byte) []byte {
+	var buf bytes.Buffer
+	writer := zlib.NewWriter(&buf)
+	writer.Write(data)
+	writer.Close()
+	return buf.Bytes()
+}
+
+// [uTLS] compressZstd compresses data using Zstandard algorithm.
+func compressZstd(data []byte) []byte {
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	if err != nil {
+		return nil
+	}
+	return encoder.EncodeAll(data, nil)
 }

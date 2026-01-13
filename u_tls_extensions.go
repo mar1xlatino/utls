@@ -53,8 +53,8 @@ func ExtensionFromID(id uint16) TLSExtension {
 		return &SessionTicketExtension{}
 	case extensionPreSharedKey:
 		return (PreSharedKeyExtension)(&FakePreSharedKeyExtension{}) // To use the result, caller needs further inspection to decide between Fake or Utls.
-	// case extensionEarlyData:
-	// 	return &EarlyDataExtension{}
+	case extensionEarlyData:
+		return &EarlyDataExtension{}
 	case extensionSupportedVersions:
 		return &SupportedVersionsExtension{}
 	case extensionCookie:
@@ -223,6 +223,11 @@ func (e *SNIExtension) Write(b []byte) (int, error) {
 		}
 	}
 	// clientHelloSpec.Extensions = append(clientHelloSpec.Extensions, &SNIExtension{}) // gaukas moved this line out from the loop.
+
+	// Reject trailing data after the name list
+	if !extData.Empty() {
+		return 0, errors.New("tls: trailing data in SNI extension")
+	}
 
 	// don't copy SNI from ClientHello to ClientHelloSpec!
 	return fullLen, nil
@@ -1645,6 +1650,8 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 //   - P-521: 133 bytes (SEC1 uncompressed point: 0x04 || x || y, 1+66+66)
 //   - X25519MLKEM768: 1216 bytes (MLKEM768 encapsulation key (1184) + X25519 (32))
 //   - X25519Kyber768Draft00: 1216 bytes (X25519 (32) + MLKEM768 encapsulation key (1184))
+//   - SecP256r1MLKEM768: 1249 bytes (P-256 (65) + MLKEM768 encapsulation key (1184))
+//   - SecP384r1MLKEM1024: 1665 bytes (P-384 (97) + MLKEM1024 encapsulation key (1568))
 //   - FFDHE groups: prime size in bytes (RFC 7919)
 func expectedKeyShareSize(group CurveID) int {
 	switch group {
@@ -1659,6 +1666,12 @@ func expectedKeyShareSize(group CurveID) int {
 	case X25519MLKEM768, X25519Kyber768Draft00:
 		// MLKEM768 encapsulation key size (1184) + X25519 public key size (32)
 		return 1184 + 32
+	case SecP256r1MLKEM768:
+		// P-256 public key size (65) + MLKEM768 encapsulation key size (1184)
+		return 65 + 1184
+	case SecP384r1MLKEM1024:
+		// P-384 public key size (97) + MLKEM1024 encapsulation key size (1568)
+		return 97 + 1568
 	case CurveFFDHE2048:
 		return 256 // 2048 bits = 256 bytes
 	case CurveFFDHE3072:
@@ -1681,7 +1694,7 @@ func isValidKeyShareGroup(group CurveID) bool {
 	switch group {
 	case X25519, CurveP256, CurveP384, CurveP521:
 		return true
-	case X25519MLKEM768, X25519Kyber768Draft00:
+	case X25519MLKEM768, X25519Kyber768Draft00, SecP256r1MLKEM768, SecP384r1MLKEM1024:
 		return true
 	case CurveFFDHE2048, CurveFFDHE3072, CurveFFDHE4096, CurveFFDHE6144, CurveFFDHE8192:
 		return true
@@ -2357,6 +2370,64 @@ func (e *FakeEncryptThenMACExtension) UnmarshalJSON(_ []byte) error {
 	return nil
 }
 
+// EarlyDataExtension implements early_data (42) for TLS 1.3.
+// RFC 8446 Section 4.2.10: In ClientHello, this is a flag extension with no data.
+// The extension signals the client's intention to send 0-RTT data.
+//
+// Context-specific formats per RFC 8446:
+//   - ClientHello: empty extension (type + length=0), signals intent to send early data
+//   - EncryptedExtensions: empty extension, server acceptance signal
+//   - NewSessionTicket: contains max_early_data_size (uint32)
+//
+// This implementation handles the ClientHello format (empty extension).
+type EarlyDataExtension struct{}
+
+func (e *EarlyDataExtension) writeToUConn(uc *UConn) error {
+	uc.HandshakeState.Hello.EarlyData = true
+	// Initialize early data state if not already present.
+	// The actual max_early_data_size and cipher suite will be set during handshake
+	// when the session is available (see u_handshake_client.go).
+	if uc.earlyData == nil {
+		uc.earlyData = NewEarlyDataState()
+	}
+	// Enable early data - limits will be set from session during handshake
+	uc.earlyData.mu.Lock()
+	uc.earlyData.enabled = true
+	uc.earlyData.mu.Unlock()
+	return nil
+}
+
+func (e *EarlyDataExtension) Len() int {
+	// RFC 8446 Section 4.2.10: In ClientHello, early_data has no extension_data.
+	// Format: extension_type (2 bytes) + extension_data_length (2 bytes, value=0)
+	return 4
+}
+
+func (e *EarlyDataExtension) Read(b []byte) (int, error) {
+	if len(b) < 4 {
+		return 0, io.ErrShortBuffer
+	}
+	// RFC 8446 Section 4.2.10: early_data extension type (42)
+	b[0] = byte(extensionEarlyData >> 8)
+	b[1] = byte(extensionEarlyData)
+	// Zero-length extension data (flag-only in ClientHello)
+	b[2] = 0
+	b[3] = 0
+	return 4, io.EOF
+}
+
+func (e *EarlyDataExtension) Write(b []byte) (int, error) {
+	// RFC 8446 Section 4.2.10: In ClientHello, early_data MUST have zero-length extension_data.
+	if len(b) != 0 {
+		return 0, errors.New("tls: early_data extension in ClientHello must have empty data per RFC 8446")
+	}
+	return 0, nil
+}
+
+func (e *EarlyDataExtension) UnmarshalJSON(_ []byte) error {
+	return nil
+}
+
 // RecordSizeLimitExtension implements record_size_limit (28) per RFC 8449.
 // This extension allows negotiating a smaller maximum record size to reduce
 // memory usage and latency. The Limit specifies the maximum plaintext size
@@ -2379,13 +2450,17 @@ type RecordSizeLimitExtension struct {
 // This value represents what we advertised to the server (our receive limit).
 // The actual negotiated limit for sending will be set when we receive the
 // server's EncryptedExtensions containing their record_size_limit.
+//
+// RFC 8449 Section 4: "A TLS endpoint that receives a record larger than
+// its advertised limit MUST generate a fatal 'record_overflow' alert."
+// We store our advertised limit so we can enforce this on incoming records.
 func (e *RecordSizeLimitExtension) writeToUConn(uc *UConn) error {
 	// Validate the limit before storing
 	if e.Limit < 64 || e.Limit > 16385 {
 		return errors.New("tls: record_size_limit must be between 64 and 16385")
 	}
-	// Store our advertised limit - the server's response will be processed
-	// separately in utlsReadServerParameters() and stored as negotiatedRecordSizeLimit
+	// Store our advertised limit for receiver-side enforcement (RFC 8449 Section 4)
+	uc.Conn.utls.advertisedRecordSizeLimit = e.Limit
 	return nil
 }
 

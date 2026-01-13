@@ -3,6 +3,7 @@ package tls
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -315,6 +316,18 @@ func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
 		return 0, errors.New("tls: pre_shared_key binder count must match identity count")
+	}
+	// RFC 8446 Section 4.2.11: opaque identity<1..2^16-1>
+	for i, identity := range e.Identities {
+		if len(identity.Label) == 0 {
+			return 0, fmt.Errorf("tls: pre_shared_key identity %d has empty label", i)
+		}
+	}
+	// RFC 8446 Section 4.2.11: PskBinderEntry<32..255>
+	for i, binder := range e.Binders {
+		if len(binder) < 32 || len(binder) > 255 {
+			return 0, fmt.Errorf("tls: pre_shared_key binder %d size %d out of range [32,255]", i, len(binder))
+		}
 	}
 	return readPskIntoBytes(b, e.Identities, e.Binders)
 }

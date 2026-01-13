@@ -45,16 +45,20 @@ import (
 )
 
 // CapturedProfile holds TLS fingerprint data from a ClientHello
-// Focused on fingerprint-relevant data only, no bloat
+// Comprehensive capture of all fingerprint-relevant data
 type CapturedProfile struct {
 	// Metadata
 	Timestamp  time.Time `json:"timestamp"`
 	UserAgent  string    `json:"user_agent"`
 	RemoteAddr string    `json:"remote_addr"`
 
+	// TLS Record Layer (fingerprint relevant!)
+	RecordVersion uint16 `json:"record_version"` // TLS record header version (usually 0x0301)
+
 	// ClientHello Core Fields
 	ClientVersion   uint16 `json:"client_version"`    // Legacy version (usually 0x0303)
-	SessionIDLength int    `json:"session_id_length"` // 0 or 32, content doesn't matter
+	SessionIDLength int    `json:"session_id_length"` // 0 or 32
+	SessionID       string `json:"session_id"`        // Hex-encoded session ID (for analysis)
 
 	// Cipher Suites (order matters for fingerprinting)
 	CipherSuites []uint16 `json:"cipher_suites"` // With GREASE
@@ -69,26 +73,73 @@ type CapturedProfile struct {
 	GREASE GREASEInfo `json:"grease"`
 
 	// Parsed Extension Data
-	ServerName      string   `json:"server_name"`
-	SupportedGroups []uint16 `json:"supported_groups"` // With GREASE
-	ECPointFormats  []uint8  `json:"ec_point_formats"`
-	SignatureAlgos  []uint16 `json:"signature_algorithms"`
-	ALPNProtocols   []string `json:"alpn_protocols"`
-	SupportedVers   []uint16 `json:"supported_versions"` // With GREASE
-	KeyShares       []KeyShareEntry `json:"key_shares"`
-	PSKModes        []uint8  `json:"psk_modes"`
-	CertCompressAlgs []uint16 `json:"cert_compression_algs"`
+	ServerName       string          `json:"server_name"`
+	SupportedGroups  []uint16        `json:"supported_groups"`  // With GREASE
+	ECPointFormats   []uint8         `json:"ec_point_formats"`
+	SignatureAlgos   []uint16        `json:"signature_algorithms"`
+	SignatureAlgsCert []uint16       `json:"signature_algorithms_cert"` // 0x0032
+	ALPNProtocols    []string        `json:"alpn_protocols"`
+	SupportedVers    []uint16        `json:"supported_versions"` // With GREASE
+	KeyShares        []KeyShareEntry `json:"key_shares"`
+	PSKModes         []uint8         `json:"psk_modes"`
+	CertCompressAlgs []uint16        `json:"cert_compression_algs"`
 
+	// ===========================================================================
+	// 0-RTT / Session Resumption Extensions (CRITICAL)
+	// ===========================================================================
+	// early_data (0x002a) - TLS 1.3 0-RTT support
+	EarlyDataEnabled bool `json:"early_data_enabled"`
+
+	// pre_shared_key (0x0029) - PSK for session resumption
+	PSKPresent         bool  `json:"psk_present"`
+	PSKIdentitiesCount int   `json:"psk_identities_count"`
+	PSKBindersCount    int   `json:"psk_binders_count"`
+	PSKBinderLengths   []int `json:"psk_binder_lengths,omitempty"`
+
+	// cookie (0x002c) - HRR cookie
+	CookiePresent bool `json:"cookie_present"`
+	CookieLength  int  `json:"cookie_length"`
+
+	// ===========================================================================
 	// Extension Flags (presence detection)
-	StatusRequest        bool `json:"status_request"`         // OCSP (0x0005)
-	SCTEnabled           bool `json:"sct_enabled"`            // SCT (0x0012)
-	ExtendedMasterSecret bool `json:"extended_master_secret"` // EMS (0x0017)
-	PostHandshakeAuth    bool `json:"post_handshake_auth"`    // PHA (0x0031)
-	DelegatedCredentials bool `json:"delegated_credentials"`  // (0x0022)
-	ApplicationSettings  bool `json:"application_settings"`   // ALPS (0x44cd)
-	ECHEnabled           bool `json:"ech_enabled"`            // ECH present
+	// ===========================================================================
+	StatusRequest        bool `json:"status_request"`          // OCSP (0x0005)
+	StatusRequestV2      bool `json:"status_request_v2"`       // OCSP v2 (0x0011)
+	SCTEnabled           bool `json:"sct_enabled"`             // SCT (0x0012)
+	ExtendedMasterSecret bool `json:"extended_master_secret"`  // EMS (0x0017)
+	EncryptThenMAC       bool `json:"encrypt_then_mac"`        // (0x0016)
+	PostHandshakeAuth    bool `json:"post_handshake_auth"`     // PHA (0x0031)
+	DelegatedCredentials bool `json:"delegated_credentials"`   // (0x0022)
+	RenegotiationInfo    bool `json:"renegotiation_info"`      // (0xff01)
+	RenegotiationLen     int  `json:"renegotiation_info_len"`  // Length of renegotiation_info
 
+	// ALPS - Application Layer Protocol Settings
+	ApplicationSettings     bool     `json:"application_settings"`      // ALPS new (0x44cd / 17613)
+	ApplicationSettingsOld  bool     `json:"application_settings_old"`  // ALPS old (0x4469 / 17513)
+	ALPSProtocols           []string `json:"alps_protocols,omitempty"`  // Protocols in ALPS extension
+
+	// ECH - Encrypted Client Hello
+	ECHEnabled       bool   `json:"ech_enabled"`        // Any ECH extension present
+	ECHType          uint16 `json:"ech_type,omitempty"` // Which ECH extension (0xfe0d, etc.)
+	ECHOuterExtsList bool   `json:"ech_outer_exts"`     // ech_outer_extensions (0xfd00)
+	ECHIsGREASE      bool   `json:"ech_is_grease"`      // Is this GREASE ECH (random payload)?
+	ECHConfigID      uint8  `json:"ech_config_id"`      // ECH config_id if present
+
+	// Legacy/Deprecated Extensions
+	NPNEnabled       bool `json:"npn_enabled"`        // NPN (0x3374 / 13172)
+	ChannelIDEnabled bool `json:"channel_id_enabled"` // Channel ID (0x7550 / 30032)
+	TokenBinding     bool `json:"token_binding"`      // Token Binding (0x0018)
+
+	// Certificate Authorities (0x002f)
+	CertAuthoritiesPresent bool `json:"cert_authorities_present"`
+	CertAuthoritiesLength  int  `json:"cert_authorities_length"`
+
+	// QUIC Transport Parameters (0x0039)
+	QUICTransportParams bool `json:"quic_transport_params"`
+
+	// ===========================================================================
 	// Extension Values (when length/value matters)
+	// ===========================================================================
 	PaddingLength       int    `json:"padding_length"`        // Padding ext length
 	RecordSizeLimit     uint16 `json:"record_size_limit"`     // (0x001c)
 	SessionTicketLength int    `json:"session_ticket_length"` // 0 = empty ticket
@@ -132,8 +183,29 @@ type GREASEInfo struct {
 }
 
 const (
-	maxCaptures = 10000 // Limit memory growth
-	maxSeenJA4  = 50000 // Limit deduplication map size
+	// Memory management limits
+	maxCaptures      = 10000 // Limit memory growth
+	maxSeenJA4       = 50000 // Limit deduplication map size
+	maxParseWarnings = 50    // Limit parse warnings to prevent memory exhaustion
+	maxExtensions    = 100   // Maximum number of extensions to parse (safety limit)
+	maxCipherSuites  = 200   // Maximum cipher suites to parse (safety limit)
+
+	// TLS record layer constraints per RFC 8446
+	tlsRecordMaxLength    = 16384 // Maximum TLS record length (2^14)
+	tlsRecordMinLength    = 38    // Minimum: handshake(4) + version(2) + random(32)
+	sessionIDMaxLength    = 32    // Maximum session ID length per TLS spec
+	maxSNINameLength      = 255   // Maximum SNI hostname length per RFC 6066
+	maxALPNProtocolLength = 255   // Maximum ALPN protocol name length
+
+	// HTTP handling limits
+	maxHTTPHeaderLength = 8192 // Maximum HTTP header line length
+	maxHTTPHeaderCount  = 100  // Maximum number of HTTP headers to read
+	maxUserAgentLength  = 1024 // Maximum User-Agent length to store
+
+	// Filename sanitization limits
+	maxFilenameLength    = 200 // Maximum filename length
+	maxBrowserNameLength = 50  // Maximum browser name length for filenames
+	maxVersionLength     = 20  // Maximum version string length for filenames
 )
 
 var (
@@ -144,6 +216,12 @@ var (
 	profilesDir   string
 	autoSave      bool
 	deduplicateUA bool
+
+	// outputMu protects console output to prevent interleaving from concurrent goroutines.
+	outputMu sync.Mutex
+
+	// fileMu protects file writes to prevent concurrent writes to the same file.
+	fileMu sync.Mutex
 )
 
 // BrowserInfo contains parsed browser information
@@ -223,6 +301,12 @@ func main() {
 }
 
 func handleConnection(conn net.Conn, tlsCert tls.Certificate) {
+	// Panic recovery to prevent server crashes from malicious input
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in handleConnection from %s: %v", conn.RemoteAddr(), r)
+		}
+	}()
 	defer conn.Close()
 
 	// Set overall connection deadline to prevent slowloris attacks
@@ -294,35 +378,77 @@ func (c *replayConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// Close implements net.Conn but does NOT close the underlying connection.
+// This prevents double-close: the outer defer conn.Close() handles cleanup,
+// while tlsConn.Close() only sends the TLS close_notify without closing the socket.
+func (c *replayConn) Close() error {
+	// Intentionally do nothing - let the caller's defer conn.Close() handle it.
+	return nil
+}
+
 func readClientHello(conn net.Conn) ([]byte, error) {
 	reader := bufio.NewReader(conn)
 
 	// Read TLS record header (5 bytes)
 	header := make([]byte, 5)
-	if _, err := io.ReadFull(reader, header); err != nil {
-		return nil, fmt.Errorf("read header: %w", err)
+	n, err := io.ReadFull(reader, header)
+	if err != nil {
+		return nil, fmt.Errorf("read header: got %d bytes: %w", n, err)
 	}
 
-	// Verify it's a handshake record
-	if header[0] != 0x16 { // Handshake
-		return nil, fmt.Errorf("not a handshake record: 0x%02x", header[0])
+	// Verify it's a handshake record (content type 0x16)
+	if header[0] != 0x16 {
+		return nil, fmt.Errorf("not a handshake record: content type 0x%02x (expected 0x16)", header[0])
 	}
 
-	// Get record length
+	// Validate record version field (bytes 1-2) - should be TLS 1.0+ for ClientHello
+	recordVersion := uint16(header[1])<<8 | uint16(header[2])
+	if recordVersion < 0x0300 || recordVersion > 0x0304 {
+		// Allow unusual versions but log warning (some implementations vary)
+		log.Printf("WARNING: unusual record version 0x%04x from %s", recordVersion, conn.RemoteAddr())
+	}
+
+	// Get record length (bytes 3-4, big-endian)
 	recordLen := int(header[3])<<8 | int(header[4])
-	if recordLen > 16384 {
-		return nil, fmt.Errorf("record too large: %d", recordLen)
+
+	// Validate record length bounds
+	if recordLen == 0 {
+		return nil, fmt.Errorf("empty record (length 0)")
+	}
+	if recordLen < tlsRecordMinLength {
+		return nil, fmt.Errorf("record too small for ClientHello: %d bytes (minimum %d)",
+			recordLen, tlsRecordMinLength)
+	}
+	if recordLen > tlsRecordMaxLength {
+		return nil, fmt.Errorf("record exceeds maximum TLS size: %d bytes (max %d)",
+			recordLen, tlsRecordMaxLength)
 	}
 
-	// Read the handshake message
+	// Read the handshake message payload
 	payload := make([]byte, recordLen)
-	if _, err := io.ReadFull(reader, payload); err != nil {
-		return nil, fmt.Errorf("read payload: %w", err)
+	n, err = io.ReadFull(reader, payload)
+	if err != nil {
+		return nil, fmt.Errorf("read payload: got %d of %d bytes: %w", n, recordLen, err)
 	}
 
-	// Verify it's a ClientHello
-	if len(payload) < 4 || payload[0] != 0x01 { // ClientHello
-		return nil, fmt.Errorf("not a ClientHello: 0x%02x", payload[0])
+	// Verify handshake message type (byte 0 = ClientHello type 0x01)
+	if payload[0] != 0x01 {
+		return nil, fmt.Errorf("not a ClientHello: handshake type 0x%02x (expected 0x01)", payload[0])
+	}
+
+	// Validate handshake message length field (bytes 1-3, 24-bit big-endian)
+	handshakeLen := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
+	expectedLen := recordLen - 4 // Record length minus handshake header (4 bytes)
+	if handshakeLen != expectedLen {
+		return nil, fmt.Errorf("handshake length mismatch: header says %d, record has %d bytes",
+			handshakeLen, expectedLen)
+	}
+
+	// Sanity check: handshake length should accommodate at least minimal ClientHello
+	minClientHelloBody := 2 + 32 + 1 // version(2) + random(32) + session_id_len(1)
+	if handshakeLen < minClientHelloBody {
+		return nil, fmt.Errorf("handshake message too small: %d bytes (minimum %d)",
+			handshakeLen, minClientHelloBody)
 	}
 
 	// Return the complete record (header + payload)
@@ -347,6 +473,14 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		},
 	}
 
+	// =========================================================================
+	// TLS Record Layer (bytes 0-4)
+	// =========================================================================
+	// Byte 0: Content type (0x16 = handshake)
+	// Bytes 1-2: Record version (fingerprint relevant!)
+	// Bytes 3-4: Record length
+	profile.RecordVersion = uint16(raw[1])<<8 | uint16(raw[2])
+
 	// Skip TLS record header (5 bytes) + handshake header (4 bytes)
 	data := raw[9:]
 
@@ -361,25 +495,51 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 	// Skip random (32 bytes) - no fingerprint value
 	data = data[32:]
 
-	// Session ID - only length matters
+	// Session ID - capture both length AND content (for analysis)
 	profile.SessionIDLength = int(data[0])
+
+	// Validate session ID length per TLS spec (max 32 bytes)
+	if profile.SessionIDLength > sessionIDMaxLength {
+		addParseWarning(profile, fmt.Sprintf("session ID length %d exceeds max %d, truncating",
+			profile.SessionIDLength, sessionIDMaxLength))
+		profile.SessionIDLength = sessionIDMaxLength
+	}
+
 	if len(data) < 1+profile.SessionIDLength {
-		return nil, fmt.Errorf("session ID length overflow")
+		return nil, fmt.Errorf("session ID length overflow: need %d bytes, have %d",
+			1+profile.SessionIDLength, len(data))
+	}
+	if profile.SessionIDLength > 0 {
+		profile.SessionID = hex.EncodeToString(data[1 : 1+profile.SessionIDLength])
 	}
 	data = data[1+profile.SessionIDLength:]
 
 	// Cipher suites
 	if len(data) < 2 {
-		return nil, fmt.Errorf("too short for cipher suites")
+		return nil, fmt.Errorf("too short for cipher suites length field")
 	}
 	cipherLen := int(data[0])<<8 | int(data[1])
 	data = data[2:]
 
-	if len(data) < cipherLen || cipherLen%2 != 0 {
-		return nil, fmt.Errorf("invalid cipher suites")
+	// Validate cipher suites length
+	if cipherLen == 0 {
+		addParseWarning(profile, "cipher suites length is 0 (no cipher suites)")
+	}
+	if cipherLen%2 != 0 {
+		return nil, fmt.Errorf("invalid cipher suites length %d: must be even", cipherLen)
+	}
+	if len(data) < cipherLen {
+		return nil, fmt.Errorf("cipher suites truncated: need %d bytes, have %d", cipherLen, len(data))
 	}
 
-	for i := 0; i < cipherLen; i += 2 {
+	// Limit cipher suite count to prevent memory exhaustion
+	numCiphers := cipherLen / 2
+	if numCiphers > maxCipherSuites {
+		addParseWarning(profile, fmt.Sprintf("too many cipher suites: %d, limiting to %d", numCiphers, maxCipherSuites))
+		numCiphers = maxCipherSuites
+	}
+
+	for i := 0; i < numCiphers*2; i += 2 {
 		cs := uint16(data[i])<<8 | uint16(data[i+1])
 		profile.CipherSuites = append(profile.CipherSuites, cs)
 		if isGREASE(cs) && profile.GREASE.CipherSuite == 0 {
@@ -391,13 +551,20 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 
 	// Compression methods
 	if len(data) < 1 {
-		return nil, fmt.Errorf("too short for compression")
+		return nil, fmt.Errorf("too short for compression methods length field")
 	}
 	compLen := int(data[0])
-	if len(data) < 1+compLen {
-		return nil, fmt.Errorf("compression overflow")
+
+	// Validate compression methods
+	if compLen == 0 {
+		addParseWarning(profile, "compression methods length is 0 (no compression methods)")
 	}
-	for i := 1; i <= compLen; i++ {
+	if len(data) < 1+compLen {
+		return nil, fmt.Errorf("compression methods truncated: need %d bytes, have %d", 1+compLen, len(data))
+	}
+
+	// Limit compression methods to prevent memory exhaustion (reasonable max: 255)
+	for i := 1; i <= compLen && i < 256; i++ {
 		profile.CompressionMethods = append(profile.CompressionMethods, data[i])
 	}
 	data = data[1+compLen:]
@@ -415,13 +582,20 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 
 	extData := data[:extLen]
 	extIndex := 0
-	for len(extData) >= 4 {
+
+	// Parse extensions with safety limits
+	for len(extData) >= 4 && extIndex < maxExtensions {
 		extType := uint16(extData[0])<<8 | uint16(extData[1])
 		extDataLen := int(extData[2])<<8 | int(extData[3])
 		extData = extData[4:]
 
+		// Validate extension length
+		if extDataLen < 0 {
+			addParseWarning(profile, fmt.Sprintf("extension 0x%04x has negative length", extType))
+			break
+		}
 		if len(extData) < extDataLen {
-			profile.ParseWarnings = append(profile.ParseWarnings,
+			addParseWarning(profile,
 				fmt.Sprintf("extension 0x%04x truncated: need %d bytes, have %d", extType, extDataLen, len(extData)))
 			break
 		}
@@ -438,11 +612,31 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		// Parse specific extensions
 		switch extType {
 		case 0x0000: // SNI
-			if len(extPayload) >= 5 && extPayload[2] == 0 {
+			// SNI format: list_length(2) + name_type(1) + name_length(2) + name
+			if len(extPayload) >= 5 {
+				listLen := int(extPayload[0])<<8 | int(extPayload[1])
+				// Validate list length
+				if listLen > len(extPayload)-2 {
+					addParseWarning(profile, fmt.Sprintf("SNI list length %d exceeds available data %d", listLen, len(extPayload)-2))
+					break
+				}
+				nameType := extPayload[2]
+				if nameType != 0 { // Only host_name (0) is valid per RFC 6066
+					addParseWarning(profile, fmt.Sprintf("SNI has unsupported name type %d (expected 0)", nameType))
+				}
 				nameLen := int(extPayload[3])<<8 | int(extPayload[4])
+				// Validate name length
+				if nameLen > maxSNINameLength {
+					addParseWarning(profile, fmt.Sprintf("SNI name length %d exceeds max %d", nameLen, maxSNINameLength))
+					nameLen = maxSNINameLength
+				}
 				if len(extPayload) >= 5+nameLen {
 					profile.ServerName = string(extPayload[5 : 5+nameLen])
+				} else {
+					addParseWarning(profile, fmt.Sprintf("SNI name truncated: need %d bytes, have %d", 5+nameLen, len(extPayload)))
 				}
+			} else if len(extPayload) > 0 {
+				addParseWarning(profile, fmt.Sprintf("SNI extension too short: %d bytes", len(extPayload)))
 			}
 
 		case 0x0005: // status_request
@@ -451,8 +645,20 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		case 0x000a: // supported_groups
 			if len(extPayload) >= 2 {
 				groupLen := int(extPayload[0])<<8 | int(extPayload[1])
+				// Validate group list length
+				if groupLen%2 != 0 {
+					addParseWarning(profile, fmt.Sprintf("supported_groups length %d is odd, truncating", groupLen))
+					groupLen-- // Make it even
+				}
+				if groupLen > len(extPayload)-2 {
+					addParseWarning(profile, fmt.Sprintf("supported_groups truncated: need %d, have %d", groupLen, len(extPayload)-2))
+					groupLen = len(extPayload) - 2
+					if groupLen%2 != 0 {
+						groupLen--
+					}
+				}
 				groupIdx := 0
-				for i := 2; i < 2+groupLen && i+1 < len(extPayload); i += 2 {
+				for i := 2; i < 2+groupLen; i += 2 {
 					g := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
 					profile.SupportedGroups = append(profile.SupportedGroups, g)
 					if isGREASE(g) && profile.GREASE.SupportedGroup == 0 {
@@ -474,7 +680,19 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		case 0x000d: // signature_algorithms
 			if len(extPayload) >= 2 {
 				sigLen := int(extPayload[0])<<8 | int(extPayload[1])
-				for i := 2; i < 2+sigLen && i+1 < len(extPayload); i += 2 {
+				// Validate signature algorithms list length
+				if sigLen%2 != 0 {
+					addParseWarning(profile, fmt.Sprintf("signature_algorithms length %d is odd, truncating", sigLen))
+					sigLen-- // Make it even
+				}
+				if sigLen > len(extPayload)-2 {
+					addParseWarning(profile, fmt.Sprintf("signature_algorithms truncated: need %d, have %d", sigLen, len(extPayload)-2))
+					sigLen = len(extPayload) - 2
+					if sigLen%2 != 0 {
+						sigLen--
+					}
+				}
+				for i := 2; i < 2+sigLen; i += 2 {
 					profile.SignatureAlgos = append(profile.SignatureAlgos, uint16(extPayload[i])<<8|uint16(extPayload[i+1]))
 				}
 			}
@@ -482,17 +700,32 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		case 0x0010: // ALPN
 			if len(extPayload) >= 2 {
 				alpnLen := int(extPayload[0])<<8 | int(extPayload[1])
-				if len(extPayload) >= 2+alpnLen {
+				if alpnLen > len(extPayload)-2 {
+					addParseWarning(profile, fmt.Sprintf("ALPN list truncated: need %d, have %d", alpnLen, len(extPayload)-2))
+					alpnLen = len(extPayload) - 2
+				}
+				if alpnLen > 0 {
 					alpnData := extPayload[2 : 2+alpnLen]
-					for len(alpnData) > 0 {
+					protocolCount := 0
+					for len(alpnData) > 0 && protocolCount < 50 { // Limit protocols
 						protoLen := int(alpnData[0])
+						if protoLen == 0 {
+							addParseWarning(profile, "ALPN protocol has zero length")
+							alpnData = alpnData[1:]
+							continue
+						}
+						if protoLen > maxALPNProtocolLength {
+							addParseWarning(profile, fmt.Sprintf("ALPN protocol length %d exceeds max %d", protoLen, maxALPNProtocolLength))
+							break
+						}
 						if len(alpnData) < 1+protoLen {
-							profile.ParseWarnings = append(profile.ParseWarnings,
+							addParseWarning(profile,
 								fmt.Sprintf("ALPN protocol truncated: need %d bytes, have %d", 1+protoLen, len(alpnData)))
 							break
 						}
 						profile.ALPNProtocols = append(profile.ALPNProtocols, string(alpnData[1:1+protoLen]))
 						alpnData = alpnData[1+protoLen:]
+						protocolCount++
 					}
 				}
 			}
@@ -530,8 +763,20 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 		case 0x002b: // supported_versions
 			if len(extPayload) >= 1 {
 				versLen := int(extPayload[0])
+				// Validate versions list length
+				if versLen%2 != 0 {
+					addParseWarning(profile, fmt.Sprintf("supported_versions length %d is odd, truncating", versLen))
+					versLen-- // Make it even
+				}
+				if versLen > len(extPayload)-1 {
+					addParseWarning(profile, fmt.Sprintf("supported_versions truncated: need %d, have %d", versLen, len(extPayload)-1))
+					versLen = len(extPayload) - 1
+					if versLen%2 != 0 {
+						versLen--
+					}
+				}
 				versIdx := 0
-				for i := 1; i < 1+versLen && i+1 < len(extPayload); i += 2 {
+				for i := 1; i < 1+versLen; i += 2 {
 					v := uint16(extPayload[i])<<8 | uint16(extPayload[i+1])
 					profile.SupportedVers = append(profile.SupportedVers, v)
 					if isGREASE(v) && profile.GREASE.SupportedVersion == 0 {
@@ -564,7 +809,7 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 						keyLen := int(ksData[2])<<8 | int(ksData[3])
 						// Validate bounds BEFORE appending to avoid partial entries
 						if len(ksData) < 4+keyLen {
-							profile.ParseWarnings = append(profile.ParseWarnings,
+							addParseWarning(profile,
 								fmt.Sprintf("key_share entry truncated: group 0x%04x needs %d bytes, have %d", group, 4+keyLen, len(ksData)))
 							break
 						}
@@ -579,11 +824,223 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 				}
 			}
 
-		case 0x44cd: // ALPS
-			profile.ApplicationSettings = true
+		// =====================================================================
+		// 0-RTT / Session Resumption Extensions (CRITICAL)
+		// =====================================================================
 
-		case 0xfe0d, 0xfe09, 0xfe0a, 0xfe08: // ECH variants
+		case 0x0029: // pre_shared_key (41) - CRITICAL for session resumption
+			profile.PSKPresent = true
+			// Parse PSK identities and binders
+			// Format: identities_length (2) + identities + binders_length (2) + binders
+			if len(extPayload) >= 2 {
+				identitiesLen := int(extPayload[0])<<8 | int(extPayload[1])
+				offset := 2
+				// Count identities
+				identitiesData := extPayload[offset:]
+				if len(identitiesData) >= identitiesLen {
+					pos := 0
+					for pos < identitiesLen && pos+2 <= len(identitiesData) {
+						// Each identity: length (2) + identity + obfuscated_ticket_age (4)
+						idLen := int(identitiesData[pos])<<8 | int(identitiesData[pos+1])
+						requiredLen := 2 + idLen + 4 // identity_length + identity + obfuscated_ticket_age
+						// Validate that the full identity record exists before counting
+						if pos+requiredLen > identitiesLen || pos+requiredLen > len(identitiesData) {
+							addParseWarning(profile, fmt.Sprintf("PSK identity truncated: need %d bytes at pos %d, have %d", requiredLen, pos, identitiesLen-pos))
+							break
+						}
+						pos += requiredLen
+						profile.PSKIdentitiesCount++
+					}
+					offset += identitiesLen
+				}
+				// Parse binders
+				if offset+2 <= len(extPayload) {
+					bindersLen := int(extPayload[offset])<<8 | int(extPayload[offset+1])
+					offset += 2
+					bindersData := extPayload[offset:]
+					if len(bindersData) >= bindersLen {
+						pos := 0
+						for pos < bindersLen && pos < len(bindersData) {
+							binderLen := int(bindersData[pos])
+							requiredLen := 1 + binderLen // length_field + binder
+							// Validate that the full binder record exists before counting
+							if pos+requiredLen > bindersLen || pos+requiredLen > len(bindersData) {
+								addParseWarning(profile, fmt.Sprintf("PSK binder truncated: need %d bytes at pos %d, have %d", requiredLen, pos, bindersLen-pos))
+								break
+							}
+							profile.PSKBinderLengths = append(profile.PSKBinderLengths, binderLen)
+							profile.PSKBindersCount++
+							pos += requiredLen
+						}
+					}
+				}
+			}
+
+		case 0x002a: // early_data (42) - CRITICAL for 0-RTT
+			profile.EarlyDataEnabled = true
+
+		case 0x002c: // cookie (44) - HRR cookie
+			profile.CookiePresent = true
+			profile.CookieLength = extDataLen
+
+		// =====================================================================
+		// Signature and Certificate Extensions
+		// =====================================================================
+
+		case 0x0011: // status_request_v2 (17)
+			profile.StatusRequestV2 = true
+
+		case 0x0016: // encrypt_then_mac (22)
+			profile.EncryptThenMAC = true
+
+		case 0x0018: // token_binding (24)
+			profile.TokenBinding = true
+
+		case 0x002f: // certificate_authorities (47)
+			profile.CertAuthoritiesPresent = true
+			profile.CertAuthoritiesLength = extDataLen
+
+		case 0x0032: // signature_algorithms_cert (50)
+			if len(extPayload) >= 2 {
+				sigLen := int(extPayload[0])<<8 | int(extPayload[1])
+				// Validate and adjust length if truncated
+				if sigLen > len(extPayload)-2 {
+					addParseWarning(profile, fmt.Sprintf("signature_algorithms_cert truncated: claimed %d, available %d", sigLen, len(extPayload)-2))
+					sigLen = len(extPayload) - 2
+				}
+				// Ensure even length for 2-byte scheme parsing
+				if sigLen%2 != 0 {
+					sigLen--
+				}
+				for i := 2; i < 2+sigLen && i+1 < len(extPayload); i += 2 {
+					profile.SignatureAlgsCert = append(profile.SignatureAlgsCert,
+						uint16(extPayload[i])<<8|uint16(extPayload[i+1]))
+				}
+			}
+
+		case 0x0039: // quic_transport_parameters (57)
+			profile.QUICTransportParams = true
+
+		// =====================================================================
+		// ALPS - Application Layer Protocol Settings
+		// =====================================================================
+
+		case 0x4469: // ALPS old codepoint (17513) - Chrome <133
+			profile.ApplicationSettingsOld = true
+			// Parse ALPS protocols (same format as ALPN: length-prefixed list)
+			if len(extPayload) >= 2 {
+				alpsLen := int(extPayload[0])<<8 | int(extPayload[1])
+				if len(extPayload) >= 2+alpsLen {
+					alpsData := extPayload[2 : 2+alpsLen]
+					protocolCount := 0
+					for len(alpsData) > 0 && protocolCount < 50 { // Limit protocols (DoS protection)
+						protoLen := int(alpsData[0])
+						if protoLen == 0 {
+							alpsData = alpsData[1:] // Skip empty protocol
+							continue
+						}
+						if len(alpsData) < 1+protoLen {
+							break
+						}
+						profile.ALPSProtocols = append(profile.ALPSProtocols, string(alpsData[1:1+protoLen]))
+						alpsData = alpsData[1+protoLen:]
+						protocolCount++
+					}
+				}
+			}
+
+		case 0x44cd: // ALPS new codepoint (17613) - Chrome 133+
+			profile.ApplicationSettings = true
+			// Parse ALPS protocols (same format as 0x4469)
+			if len(extPayload) >= 2 {
+				alpsLen := int(extPayload[0])<<8 | int(extPayload[1])
+				if len(extPayload) >= 2+alpsLen {
+					alpsData := extPayload[2 : 2+alpsLen]
+					protocolCount := 0
+					for len(alpsData) > 0 && protocolCount < 50 { // Limit protocols (DoS protection)
+						protoLen := int(alpsData[0])
+						if protoLen == 0 {
+							alpsData = alpsData[1:] // Skip empty protocol
+							continue
+						}
+						if len(alpsData) < 1+protoLen {
+							break
+						}
+						profile.ALPSProtocols = append(profile.ALPSProtocols, string(alpsData[1:1+protoLen]))
+						alpsData = alpsData[1+protoLen:]
+						protocolCount++
+					}
+				}
+			}
+
+		// =====================================================================
+		// Renegotiation
+		// =====================================================================
+
+		case 0xff01: // renegotiation_info (65281)
+			profile.RenegotiationInfo = true
+			profile.RenegotiationLen = extDataLen
+
+		// =====================================================================
+		// ECH - Encrypted Client Hello
+		// =====================================================================
+
+		case 0xfe0d: // encrypted_client_hello (draft-ietf-tls-esni-17+)
 			profile.ECHEnabled = true
+			profile.ECHType = 0xfe0d
+			// ECH format per draft-ietf-tls-esni:
+			// type (1) + kdf_id (2) + aead_id (2) + config_id (1) + enc_len (2) + enc + payload
+			// GREASE ECH: type=0, random cipher suite, enc_len typically 0 or 1
+			// Real ECH: proper enc with HPKE encapsulated key
+			if len(extPayload) >= 9 {
+				echType := extPayload[0]
+				if echType == 0 { // ClientHelloOuter
+					profile.ECHConfigID = extPayload[5]
+					encLen := int(extPayload[6])<<8 | int(extPayload[7])
+					// GREASE ECH detection:
+					// 1. enc_len is 0 or 1 (GREASE uses minimal/empty enc)
+					// 2. Real ECH has enc_len >= 32 for HPKE public key
+					if encLen <= 1 {
+						profile.ECHIsGREASE = true
+					}
+				}
+			} else if len(extPayload) >= 6 {
+				// Partial ECH data - extract what we can
+				if extPayload[0] == 0 {
+					profile.ECHConfigID = extPayload[5]
+					profile.ECHIsGREASE = true // Short = likely GREASE
+				}
+			}
+
+		case 0xfe09, 0xfe0a, 0xfe08: // ECH older drafts
+			profile.ECHEnabled = true
+			profile.ECHType = extType
+			// Older drafts: similar structure but different offsets
+			// For older drafts, check enc length if available
+			if len(extPayload) >= 8 {
+				encLen := int(extPayload[5])<<8 | int(extPayload[6])
+				if encLen <= 1 {
+					profile.ECHIsGREASE = true
+				}
+			} else if len(extPayload) < 20 {
+				profile.ECHIsGREASE = true // Very short = likely GREASE
+			}
+
+		case 0xfd00: // ech_outer_extensions
+			profile.ECHOuterExtsList = true
+
+		// =====================================================================
+		// Legacy/Deprecated Extensions
+		// =====================================================================
+
+		case 0x3374: // next_protocol_negotiation (13172) - NPN, deprecated
+			profile.NPNEnabled = true
+
+		case 0x7550: // channel_id (30032) - deprecated
+			profile.ChannelIDEnabled = true
+
+		case 0x754f: // channel_id old (30031) - deprecated
+			profile.ChannelIDEnabled = true
 		}
 
 		extData = extData[extDataLen:]
@@ -595,6 +1052,16 @@ func parseClientHello(raw []byte) (*CapturedProfile, error) {
 	profile.JA4, profile.JA4r, profile.JA4o, profile.JA4ro = calculateJA4Full(profile)
 
 	return profile, nil
+}
+
+// addParseWarning safely adds a warning with a limit to prevent memory exhaustion
+func addParseWarning(profile *CapturedProfile, warning string) {
+	if len(profile.ParseWarnings) < maxParseWarnings {
+		profile.ParseWarnings = append(profile.ParseWarnings, warning)
+	} else if len(profile.ParseWarnings) == maxParseWarnings {
+		profile.ParseWarnings = append(profile.ParseWarnings, "... additional warnings truncated")
+	}
+	// Beyond maxParseWarnings+1, silently ignore
 }
 
 // calculateJA3Full returns both JA3 hash and raw string
@@ -640,16 +1107,18 @@ func calculateJA4Full(p *CapturedProfile) (ja4, ja4r, ja4o, ja4ro string) {
 		realVersion = p.ClientVersion
 	}
 	switch realVersion {
-	case 0x0304:
+	case 0x0304: // TLS 1.3
 		tlsVer = "13"
-	case 0x0303:
+	case 0x0303: // TLS 1.2
 		tlsVer = "12"
-	case 0x0302:
+	case 0x0302: // TLS 1.1
 		tlsVer = "11"
-	case 0x0301:
+	case 0x0301: // TLS 1.0
 		tlsVer = "10"
+	case 0x0300: // SSL 3.0
+		tlsVer = "s3"
 	default:
-		// Handle draft TLS 1.3 versions (0x7f01 - 0x7f1c)
+		// Handle draft TLS 1.3 versions (0x7f01 - 0x7f1c = drafts 1-28)
 		if realVersion >= 0x7f01 && realVersion <= 0x7f1c {
 			tlsVer = "13"
 		} else {
@@ -676,11 +1145,29 @@ func calculateJA4Full(p *CapturedProfile) (ja4, ja4r, ja4o, ja4ro string) {
 	}
 
 	// ALPN first+last char
+	// Per JA4 spec: if alphanumeric, use the character directly
+	// If non-alphanumeric, use first/last char of hex representation
 	alpn := "00"
 	if len(p.ALPNProtocols) > 0 {
 		first := p.ALPNProtocols[0]
 		if len(first) > 0 {
-			alpn = string(first[0]) + string(first[len(first)-1])
+			firstByte := first[0]
+			lastByte := first[len(first)-1]
+
+			var firstChar, lastChar string
+			if isAlphanumeric(firstByte) {
+				firstChar = string(firstByte)
+			} else {
+				// Use first character of hex representation
+				firstChar = fmt.Sprintf("%02x", firstByte)[:1]
+			}
+			if isAlphanumeric(lastByte) {
+				lastChar = string(lastByte)
+			} else {
+				// Use second (last) character of hex representation
+				lastChar = fmt.Sprintf("%02x", lastByte)[1:]
+			}
+			alpn = firstChar + lastChar
 		}
 	}
 
@@ -771,6 +1258,12 @@ func isGREASE(v uint16) bool {
 	return (v&0x0f0f) == 0x0a0a && (v&0xf000)>>8 == (v&0x00f0)
 }
 
+// isAlphanumeric returns true if the byte is 0-9, A-Z, or a-z.
+// Used for JA4 ALPN character handling per the specification.
+func isAlphanumeric(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
 func joinUint16(values []uint16, sep string) string {
 	strs := make([]string, len(values))
 	for i, v := range values {
@@ -796,23 +1289,61 @@ func joinUint16Hex(values []uint16, sep string) string {
 }
 
 func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
-	reader := bufio.NewReader(conn)
+	// Use a limited reader to prevent memory exhaustion from overly long lines
+	reader := bufio.NewReaderSize(conn, maxHTTPHeaderLength)
 
-	// Read HTTP request line
-	_, err := reader.ReadString('\n')
+	// Read HTTP request line with length limit
+	requestLine, err := reader.ReadString('\n')
 	if err != nil {
+		// Check if this is a timeout error for better debugging
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			log.Printf("HTTP request read timeout from %s", conn.RemoteAddr())
+		} else if err != io.EOF {
+			log.Printf("HTTP request read error from %s: %v", conn.RemoteAddr(), err)
+		}
+		// Still try to output captured profile even if HTTP read failed
+		outputProfile(profile)
 		return
 	}
+	// Warn about excessively long request lines
+	if len(requestLine) > maxHTTPHeaderLength {
+		log.Printf("HTTP request line very long from %s: %d bytes", conn.RemoteAddr(), len(requestLine))
+	}
 
-	// Read headers to get User-Agent
-	for {
+	// Read headers to get User-Agent with limits to prevent DoS
+	headerCount := 0
+	for headerCount < maxHTTPHeaderCount {
 		header, err := reader.ReadString('\n')
-		if err != nil || header == "\r\n" || header == "\n" {
+		if err != nil {
+			if err != io.EOF {
+				// Log non-EOF errors that occur during header reading
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					log.Printf("HTTP header read timeout from %s", conn.RemoteAddr())
+				}
+			}
 			break
 		}
-		if strings.HasPrefix(strings.ToLower(header), "user-agent:") {
-			profile.UserAgent = strings.TrimSpace(header[11:])
+		if header == "\r\n" || header == "\n" {
+			break
 		}
+		// Skip overly long headers to prevent memory exhaustion
+		if len(header) > maxHTTPHeaderLength {
+			log.Printf("HTTP header too long from %s: %d bytes, skipping", conn.RemoteAddr(), len(header))
+			headerCount++
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(header), "user-agent:") {
+			ua := strings.TrimSpace(header[11:])
+			// Truncate User-Agent if too long to prevent memory issues
+			if len(ua) > maxUserAgentLength {
+				ua = ua[:maxUserAgentLength]
+			}
+			profile.UserAgent = ua
+		}
+		headerCount++
+	}
+	if headerCount >= maxHTTPHeaderCount {
+		log.Printf("Too many HTTP headers from %s: reached limit of %d", conn.RemoteAddr(), maxHTTPHeaderCount)
 	}
 
 	// Send response with proper CRLF per HTTP/1.1 RFC 2616
@@ -836,7 +1367,18 @@ func handleHTTP(conn *tls.Conn, profile *CapturedProfile) {
 		"\r\n" +
 		body
 
-	conn.Write([]byte(response))
+	// Handle write errors properly
+	responseBytes := []byte(response)
+	n, writeErr := conn.Write(responseBytes)
+	if writeErr != nil {
+		if netErr, ok := writeErr.(net.Error); ok && netErr.Timeout() {
+			log.Printf("HTTP response write timeout to %s", conn.RemoteAddr())
+		} else {
+			log.Printf("HTTP response write error to %s: %v", conn.RemoteAddr(), writeErr)
+		}
+	} else if n < len(responseBytes) {
+		log.Printf("HTTP response partial write to %s: wrote %d of %d bytes", conn.RemoteAddr(), n, len(responseBytes))
+	}
 
 	// Store and output (with memory limit)
 	capturesMu.Lock()
@@ -886,16 +1428,46 @@ func outputProfile(profile *CapturedProfile) {
 		seenJA4Mu.Unlock()
 	}
 
+	// Protect console output from interleaving with concurrent goroutines
+	outputMu.Lock()
+	defer outputMu.Unlock()
+
 	fmt.Println("\n" + strings.Repeat("=", 80))
 	fmt.Printf("CAPTURED: %s %s on %s\n", browser, version, platform)
 	fmt.Printf("JA3: %s\n", profile.JA3)
 	fmt.Printf("JA4: %s\n", profile.JA4)
+	fmt.Printf("Record Version: 0x%04x | Client Version: 0x%04x\n", profile.RecordVersion, profile.ClientVersion)
+
+	// Display important feature flags
+	var features []string
 	if info.Mobile {
-		fmt.Println("Mobile: Yes")
+		features = append(features, "Mobile")
+	}
+	if profile.EarlyDataEnabled {
+		features = append(features, "0-RTT")
+	}
+	if profile.PSKPresent {
+		features = append(features, fmt.Sprintf("PSK(%d ids)", profile.PSKIdentitiesCount))
 	}
 	if profile.ECHEnabled {
-		fmt.Println("ECH: Yes")
+		features = append(features, fmt.Sprintf("ECH(0x%04x)", profile.ECHType))
 	}
+	if profile.RenegotiationInfo {
+		features = append(features, "Renegotiation")
+	}
+	if profile.ApplicationSettings {
+		features = append(features, "ALPS-new")
+	}
+	if profile.ApplicationSettingsOld {
+		features = append(features, "ALPS-old")
+	}
+	if profile.CookiePresent {
+		features = append(features, "Cookie/HRR")
+	}
+	if len(features) > 0 {
+		fmt.Printf("Features: %s\n", strings.Join(features, ", "))
+	}
+
 	if len(profile.ParseWarnings) > 0 {
 		fmt.Printf("WARNINGS: %d parse issues\n", len(profile.ParseWarnings))
 		for _, w := range profile.ParseWarnings {
@@ -906,8 +1478,13 @@ func outputProfile(profile *CapturedProfile) {
 
 	// JSON output
 	fmt.Println("\n--- JSON ---")
-	j, _ := json.MarshalIndent(profile, "", "  ")
-	fmt.Println(string(j))
+	j, jsonErr := json.MarshalIndent(profile, "", "  ")
+	if jsonErr != nil {
+		log.Printf("Failed to marshal profile to JSON: %v", jsonErr)
+		fmt.Println("{\"error\": \"JSON marshaling failed\"}")
+	} else {
+		fmt.Println(string(j))
+	}
 
 	// Filter GREASE for Go code
 	ciphersClean := filterGREASE(profile.CipherSuites)
@@ -1007,15 +1584,15 @@ var %s = &tls.FingerprintProfile{
 		strings.ToLower(platform),
 		browser, version,
 		profile.ClientVersion,
-		formatUint16Slice("\t\t", ciphersClean),
-		formatUint16Slice("\t\t", extsClean),
-		formatUint16SliceCurveID("\t\t", groupsClean),
-		formatUint16SliceSigScheme("\t\t", profile.SignatureAlgos),
+		formatUint16Slice(ciphersClean),
+		formatUint16Slice(extsClean),
+		formatUint16SliceCurveID(groupsClean),
+		formatUint16SliceSigScheme(profile.SignatureAlgos),
 		formatStringSlice(profile.ALPNProtocols),
-		formatUint16Slice("\t\t", versClean),
-		formatUint16SliceCurveID("\t\t", keyShareGroupsClean),
+		formatUint16Slice(versClean),
+		formatUint16SliceCurveID(keyShareGroupsClean),
 		formatUint8Slice(profile.PSKModes),
-		formatUint16SliceCertComp("\t\t", profile.CertCompressAlgs),
+		formatUint16SliceCertComp(profile.CertCompressAlgs),
 		profile.SessionIDLength,
 		shuffleLine,
 		profile.GREASE.CipherSuite != 0,
@@ -1042,27 +1619,86 @@ var %s = &tls.FingerprintProfile{
 
 // saveProfile saves the captured profile to files
 func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
+	// Protect file writes from concurrent goroutines writing to the same file.
+	// Even with deduplication, different JA4 hashes can generate the same
+	// browser/version/platform filename.
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	// Verify profilesDir exists before each save operation
+	// This handles cases where the directory might have been deleted since startup
+	if err := os.MkdirAll(profilesDir, 0755); err != nil {
+		log.Printf("Failed to create/verify profiles directory %s: %v", profilesDir, err)
+		return
+	}
+
+	// Sanitize browser name and version to prevent path traversal and filesystem issues
+	safeBrowser := sanitizeFilename(info.Browser, maxBrowserNameLength)
+	safeVersion := sanitizeFilename(fmt.Sprintf("%d", info.Version), maxVersionLength)
+	safePlatform := sanitizeFilename(info.Platform, maxBrowserNameLength)
+
+	if safeBrowser == "" {
+		safeBrowser = "unknown"
+	}
+	if safePlatform == "" {
+		safePlatform = "unknown"
+	}
+
 	// CamelCase filename to avoid Go GOOS build constraints
-	filename := toCamelCase(info.Browser) + fmt.Sprintf("%d", info.Version) + toCamelCase(info.Platform)
+	filename := toCamelCase(safeBrowser) + safeVersion + toCamelCase(safePlatform)
+	// Ensure filename is not too long for filesystem
+	if len(filename) > maxFilenameLength {
+		filename = filename[:maxFilenameLength]
+	}
 
 	// Save JSON (with original snake_case name for readability)
-	jsonName := fmt.Sprintf("%s_%d_%s", strings.ToLower(info.Browser), info.Version, strings.ToLower(info.Platform))
-	jsonName = strings.ReplaceAll(jsonName, " ", "_")
+	jsonName := fmt.Sprintf("%s_%s_%s", strings.ToLower(safeBrowser), safeVersion, strings.ToLower(safePlatform))
+	if len(jsonName) > maxFilenameLength {
+		jsonName = jsonName[:maxFilenameLength]
+	}
 	jsonPath := filepath.Join(profilesDir, jsonName+".json")
-	jsonData, _ := json.MarshalIndent(profile, "", "  ")
-	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
-		log.Printf("Failed to save JSON: %v", err)
+	jsonData, jsonErr := json.MarshalIndent(profile, "", "  ")
+	if jsonErr != nil {
+		log.Printf("Failed to marshal profile to JSON for %s: %v", jsonPath, jsonErr)
 	} else {
-		log.Printf("Saved JSON: %s", jsonPath)
+		if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
+			log.Printf("Failed to save JSON %s: %v", jsonPath, err)
+		} else {
+			log.Printf("Saved JSON: %s", jsonPath)
+		}
 	}
 
 	// Save Go code with CamelCase filename
 	goPath := filepath.Join(profilesDir, filename+".go")
 	if err := os.WriteFile(goPath, []byte(goCode), 0644); err != nil {
-		log.Printf("Failed to save Go code: %v", err)
+		log.Printf("Failed to save Go code %s: %v", goPath, err)
 	} else {
 		log.Printf("Saved Go code: %s", goPath)
 	}
+}
+
+// sanitizeFilename removes or replaces characters that are problematic for filenames.
+// This prevents path traversal attacks and filesystem errors from malicious input.
+func sanitizeFilename(s string, maxLen int) string {
+	if s == "" {
+		return ""
+	}
+	var result strings.Builder
+	for _, r := range s {
+		// Only allow alphanumeric, dash, underscore, and dot (but not leading dots)
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || (r == '.' && result.Len() > 0) {
+			result.WriteRune(r)
+		} else if r == ' ' {
+			result.WriteRune('_')
+		}
+		// Skip path separators, control characters, and other problematic chars
+		if result.Len() >= maxLen {
+			break
+		}
+	}
+	// Remove any trailing dots or spaces
+	return strings.TrimRight(result.String(), ". ")
 }
 
 // toCamelCase converts a string to CamelCase
@@ -1090,19 +1726,8 @@ func isChromiumBrowser(browser string) bool {
 	return false
 }
 
-// dedentOne removes one level of indentation (tab or 4 spaces)
-func dedentOne(indent string) string {
-	if strings.HasSuffix(indent, "\t") {
-		return strings.TrimSuffix(indent, "\t")
-	}
-	if len(indent) >= 4 {
-		return indent[:len(indent)-4]
-	}
-	return ""
-}
-
 // formatUint16SliceCurveID formats as tls.CurveID type
-func formatUint16SliceCurveID(indent string, values []uint16) string {
+func formatUint16SliceCurveID(values []uint16) string {
 	if len(values) == 0 {
 		return "[]tls.CurveID{}"
 	}
@@ -1110,22 +1735,24 @@ func formatUint16SliceCurveID(indent string, values []uint16) string {
 	sb.WriteString("[]tls.CurveID{\n")
 	for i, v := range values {
 		if i%8 == 0 {
-			sb.WriteString(indent)
+			sb.WriteString("\t\t\t")
 		}
-		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		sb.WriteString(fmt.Sprintf("0x%04x,", v))
 		if (i+1)%8 == 0 {
 			sb.WriteString("\n")
+		} else if i < len(values)-1 {
+			sb.WriteString(" ")
 		}
 	}
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(dedentOne(indent) + "}")
+	sb.WriteString("\t\t}")
 	return sb.String()
 }
 
 // formatUint16SliceSigScheme formats as tls.SignatureScheme type
-func formatUint16SliceSigScheme(indent string, values []uint16) string {
+func formatUint16SliceSigScheme(values []uint16) string {
 	if len(values) == 0 {
 		return "[]tls.SignatureScheme{}"
 	}
@@ -1133,22 +1760,24 @@ func formatUint16SliceSigScheme(indent string, values []uint16) string {
 	sb.WriteString("[]tls.SignatureScheme{\n")
 	for i, v := range values {
 		if i%8 == 0 {
-			sb.WriteString(indent)
+			sb.WriteString("\t\t\t")
 		}
-		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		sb.WriteString(fmt.Sprintf("0x%04x,", v))
 		if (i+1)%8 == 0 {
 			sb.WriteString("\n")
+		} else if i < len(values)-1 {
+			sb.WriteString(" ")
 		}
 	}
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(dedentOne(indent) + "}")
+	sb.WriteString("\t\t}")
 	return sb.String()
 }
 
 // formatUint16SliceCertComp formats as tls.CertCompressionAlgo type
-func formatUint16SliceCertComp(indent string, values []uint16) string {
+func formatUint16SliceCertComp(values []uint16) string {
 	if len(values) == 0 {
 		return "[]tls.CertCompressionAlgo{}"
 	}
@@ -1156,17 +1785,19 @@ func formatUint16SliceCertComp(indent string, values []uint16) string {
 	sb.WriteString("[]tls.CertCompressionAlgo{\n")
 	for i, v := range values {
 		if i%8 == 0 {
-			sb.WriteString(indent)
+			sb.WriteString("\t\t\t")
 		}
-		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		sb.WriteString(fmt.Sprintf("0x%04x,", v))
 		if (i+1)%8 == 0 {
 			sb.WriteString("\n")
+		} else if i < len(values)-1 {
+			sb.WriteString(" ")
 		}
 	}
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(dedentOne(indent) + "}")
+	sb.WriteString("\t\t}")
 	return sb.String()
 }
 
@@ -1275,15 +1906,11 @@ func detectPlatform(ua, uaLower string) (platform, os, osVersion, arch string) {
 		os = "Windows"
 		// Windows NT version mapping
 		if strings.Contains(ua, "Windows NT 10.0") {
-			// Windows 10 or 11 - hard to distinguish, but recent builds are likely 11
-			// Windows 11 build numbers start at 22000
-			if strings.Contains(ua, "Windows NT 10.0; Win64") {
-				platform = "Windows_11"
-				osVersion = "11"
-			} else {
-				platform = "Windows_10"
-				osVersion = "10"
-			}
+			// Windows 10 and 11 both report "Windows NT 10.0" - indistinguishable via UA
+			// Using "Windows_10" as default since it's the more common fingerprint target
+			// Note: "Win64" is present on BOTH Windows 10 and 11 64-bit, not a differentiator
+			platform = "Windows_10"
+			osVersion = "10"
 		} else if strings.Contains(ua, "Windows NT 6.3") {
 			platform = "Windows_8.1"
 			osVersion = "8.1"
@@ -1578,7 +2205,7 @@ func extractVersionAfter(s, prefix string) string {
 	return result
 }
 
-func formatUint16Slice(indent string, values []uint16) string {
+func formatUint16Slice(values []uint16) string {
 	if len(values) == 0 {
 		return "[]uint16{}"
 	}
@@ -1586,17 +2213,19 @@ func formatUint16Slice(indent string, values []uint16) string {
 	sb.WriteString("[]uint16{\n")
 	for i, v := range values {
 		if i%8 == 0 {
-			sb.WriteString(indent)
+			sb.WriteString("\t\t\t")
 		}
-		sb.WriteString(fmt.Sprintf("0x%04x, ", v))
+		sb.WriteString(fmt.Sprintf("0x%04x,", v))
 		if (i+1)%8 == 0 {
 			sb.WriteString("\n")
+		} else if i < len(values)-1 {
+			sb.WriteString(" ")
 		}
 	}
 	if len(values)%8 != 0 {
 		sb.WriteString("\n")
 	}
-	sb.WriteString(dedentOne(indent) + "}")
+	sb.WriteString("\t\t}")
 	return sb.String()
 }
 
@@ -1617,7 +2246,9 @@ func formatStringSlice(values []string) string {
 	}
 	strs := make([]string, len(values))
 	for i, v := range values {
-		strs[i] = fmt.Sprintf(`"%s"`, v)
+		// Use %q for proper escaping of special characters (quotes, backslashes, etc.)
+		// This ensures the generated Go code is syntactically valid
+		strs[i] = fmt.Sprintf("%q", v)
 	}
 	return "[]string{" + strings.Join(strs, ", ") + "}"
 }

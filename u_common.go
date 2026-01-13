@@ -566,14 +566,8 @@ func (chs *ClientHelloSpec) RemoveFFDHEGroups() int {
 // This function exists for convenience when you prefer a functional style or when
 // working with specs that might be nil (this function handles nil safely).
 //
-// CRITICAL SECURITY CONTEXT:
-// Firefox profiles advertise FFDHE groups (FakeCurveFFDHE2048-8192) for fingerprint
-// accuracy. However, uTLS cannot perform actual FFDHE key exchange. If a server
-// selects FFDHE via HelloRetryRequest, the handshake FAILS with 100% certainty.
-// This creates a trivial detection vector for fingerprint-aware servers.
-//
-// Use this function or the safer profile variants (HelloFirefox_*_NoFFDHE) when
-// connecting to servers that might intentionally probe for fake TLS fingerprints.
+// Use this function to avoid HelloRetryRequest overhead when a server selects FFDHE,
+// or for fingerprint customization.
 //
 // Returns the number of FFDHE groups removed, or 0 if spec is nil.
 func RemoveFFDHEGroups(spec *ClientHelloSpec) int {
@@ -581,6 +575,53 @@ func RemoveFFDHEGroups(spec *ClientHelloSpec) int {
 		return 0
 	}
 	return spec.RemoveFFDHEGroups()
+}
+
+// EnsureMinSessionIDLength ensures the SessionIDLength is at least minLen bytes.
+// This is useful for protocols that embed data in the session ID field and require
+// a minimum length (e.g., 32 bytes for middlebox compatibility or authentication).
+//
+// Browser fingerprint note:
+//   - Chrome always sends 32-byte session IDs (TLS 1.3 middlebox compatibility)
+//   - Firefox/Safari send 0-byte session IDs for fresh TLS 1.3 connections
+//
+// Calling this method on Firefox/Safari profiles will cause a fingerprint deviation
+// from real browsers, but enables compatibility with servers requiring longer session IDs.
+//
+// Returns true if SessionIDLength was modified, false if it was already >= minLen.
+func (chs *ClientHelloSpec) EnsureMinSessionIDLength(minLen int) bool {
+	// Get effective current length
+	currentLen := chs.SessionIDLength
+	if currentLen == SessionIDLengthNone {
+		currentLen = 0
+	} else if currentLen == SessionIDLengthAuto {
+		currentLen = 32 // Auto defaults to 32
+	}
+
+	if currentLen < minLen {
+		chs.SessionIDLength = minLen
+		return true
+	}
+	return false
+}
+
+// EnsureMinSessionIDLength is a standalone helper that ensures a ClientHelloSpec
+// has at least minLen bytes for the session ID. It is equivalent to calling
+// spec.EnsureMinSessionIDLength(minLen).
+//
+// This function handles nil specs safely (returns false without panic).
+//
+// Common usage:
+//
+//	spec, _ := UTLSIdToSpec(HelloFirefox_145)
+//	EnsureMinSessionIDLength(&spec, 32)  // Now compatible with 32-byte session ID servers
+//
+// Returns true if the spec was modified, false otherwise.
+func EnsureMinSessionIDLength(spec *ClientHelloSpec, minLen int) bool {
+	if spec == nil {
+		return false
+	}
+	return spec.EnsureMinSessionIDLength(minLen)
 }
 
 // Import TLS ClientHello data from client.tlsfingerprint.io:8443
@@ -941,15 +982,8 @@ var (
 
 	// Firefox profiles (106+ have extension shuffling)
 	HelloFirefox_Auto = HelloFirefox_145
-	HelloFirefox_120  = ClientHelloID{helloFirefox, "120", nil, nil}
-	HelloFirefox_145  = ClientHelloID{helloFirefox, "145", nil, nil} // Extension shuffling (NSS 3.84+)
-
-	// Firefox profiles WITHOUT FFDHE groups (safer variants)
-	// These profiles are identical to their counterparts but with FFDHE groups removed.
-	// Use these if you are concerned about detection by servers that probe for FFDHE support.
-	// Trade-off: fingerprint deviates from real Firefox, but avoids 100% detection via FFDHE HRR.
-	HelloFirefox_120_NoFFDHE = ClientHelloID{helloFirefox, "120_NoFFDHE", nil, nil}
-	HelloFirefox_145_NoFFDHE = ClientHelloID{helloFirefox, "145_NoFFDHE", nil, nil}
+	HelloFirefox_120 = ClientHelloID{helloFirefox, "120", nil, nil}
+	HelloFirefox_145 = ClientHelloID{helloFirefox, "145", nil, nil} // Extension shuffling (NSS 3.84+)
 
 	// Chrome profiles (106+ have extension shuffling)
 	HelloChrome_Auto        = HelloChrome_142

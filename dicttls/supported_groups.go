@@ -45,6 +45,9 @@ const (
 	SupportedGroups_GC512B                          uint16 = 39
 	SupportedGroups_GC512C                          uint16 = 40
 	SupportedGroups_curveSM2                        uint16 = 41
+	SupportedGroups_SecP256r1MLKEM768               uint16 = 4587
+	SupportedGroups_X25519MLKEM768                  uint16 = 4588
+	SupportedGroups_SecP384r1MLKEM1024              uint16 = 4589
 	SupportedGroups_ffdhe2048                       uint16 = 256
 	SupportedGroups_ffdhe3072                       uint16 = 257
 	SupportedGroups_ffdhe4096                       uint16 = 258
@@ -96,6 +99,9 @@ var DictSupportedGroupsValueIndexed = map[uint16]string{
 	39:    "GC512B",
 	40:    "GC512C",
 	41:    "curveSM2",
+	4587:  "SecP256r1MLKEM768",
+	4588:  "X25519MLKEM768",
+	4589:  "SecP384r1MLKEM1024",
 	256:   "ffdhe2048",
 	257:   "ffdhe3072",
 	258:   "ffdhe4096",
@@ -147,6 +153,9 @@ var DictSupportedGroupsNameIndexed = map[string]uint16{
 	"GC512B":                          39,
 	"GC512C":                          40,
 	"curveSM2":                        41,
+	"SecP256r1MLKEM768":               4587,
+	"X25519MLKEM768":                  4588,
+	"SecP384r1MLKEM1024":              4589,
 	"ffdhe2048":                       256,
 	"ffdhe3072":                       257,
 	"ffdhe4096":                       258,

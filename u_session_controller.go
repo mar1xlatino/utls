@@ -3,6 +3,7 @@ package tls
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/refraction-networking/utls/internal/tls13"
 )
@@ -30,6 +31,12 @@ const PskExtAllSet sessionControllerState = 4
 //
 // Users should never construct sessionController by themselves, use the function `newSessionController` instead.
 type sessionController struct {
+	// mu protects all mutable fields in sessionController from concurrent access.
+	// This prevents race conditions when sessionController methods are called
+	// from multiple goroutines (e.g., during concurrent handshakes or when
+	// user code accesses session state while handshake is in progress).
+	mu sync.Mutex
+
 	// sessionTicketExt logically owns the session ticket extension
 	sessionTicketExt ISessionTicketExtension
 
@@ -66,6 +73,8 @@ func newSessionController(uconn *UConn) *sessionController {
 }
 
 func (s *sessionController) isSessionLocked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.locked
 }
 
@@ -82,7 +91,11 @@ const shouldLoad shouldLoadSessionResult = 3
 //   - If a pre-shared key (PSK) is already initialized, typically via the `overridePskExt()` function, the PSK should be set in the client hello.
 //   - If both the `sessionTicketExt` and `pskExtension` are nil, which might occur if the client hello spec does not include them, we should skip the loadSession().
 //   - In all other cases, the function proceeds to load the session.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) shouldLoadSession() shouldLoadSessionResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.sessionTicketExt == nil && s.pskExtension == nil || s.uconnRef.clientHelloBuildStatus != NotBuilt {
 		// No need to load session since we don't have the related extensions.
 		return shouldReturn
@@ -98,7 +111,11 @@ func (s *sessionController) shouldLoadSession() shouldLoadSessionResult {
 
 // utlsAboutToLoadSession updates the loadSessionTracker to `UtlsAboutToCall` to signal the initiation of a session loading operation,
 // provided that the preconditions are met.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) utlsAboutToLoadSession() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !(s.state == NoSession && !s.locked) {
 		return errors.New("tls: aboutToLoadSession failed: must only load session when the session of the client hello is not locked and when there's currently no session")
 	}
@@ -106,6 +123,8 @@ func (s *sessionController) utlsAboutToLoadSession() error {
 	return nil
 }
 
+// assertHelloNotBuilt checks if ClientHello has not been built yet.
+// Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertHelloNotBuilt(caller string) error {
 	if s.uconnRef.clientHelloBuildStatus != NotBuilt {
 		return fmt.Errorf("tls: %s failed: we can't modify the session after the clientHello is built", caller)
@@ -113,6 +132,8 @@ func (s *sessionController) assertHelloNotBuilt(caller string) error {
 	return nil
 }
 
+// assertControllerState verifies the controller is in one of the desired states.
+// Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertControllerState(caller string, desired sessionControllerState, moreDesiredStates ...sessionControllerState) error {
 	if s.state != desired && !anyTrue(moreDesiredStates, func(_ int, state *sessionControllerState) bool {
 		return s.state == *state
@@ -122,6 +143,8 @@ func (s *sessionController) assertControllerState(caller string, desired session
 	return nil
 }
 
+// assertNotLocked verifies the session is not yet locked.
+// Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertNotLocked(caller string) error {
 	if s.locked {
 		return fmt.Errorf("tls: %s failed: you must not modify the session after it's locked", caller)
@@ -129,6 +152,8 @@ func (s *sessionController) assertNotLocked(caller string) error {
 	return nil
 }
 
+// assertCanSkip checks if session resumption can be skipped.
+// Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertCanSkip(caller, extensionName string) error {
 	if !s.uconnRef.skipResumptionOnNilExtension {
 		return fmt.Errorf("tls: %s failed: session resumption is enabled, but there is no %s in the ClientHelloSpec; Please consider provide one in the ClientHelloSpec; If this is intentional, you may consider disable resumption by setting Config.SessionTicketsDisabled to true, or set Config.PreferSkipResumptionOnNilExtension to true to suppress this exception", caller, extensionName)
@@ -140,7 +165,11 @@ func (s *sessionController) assertCanSkip(caller, extensionName string) error {
 // If the checks pass successfully, the sessionController's state will be locked.
 // Any failure in passing the tests indicates incorrect implementations in the utls.
 // Refer to the documentation for the `locked` field for more detailed information.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) finalCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.assertControllerState("SessionController.finalCheck", PskExtAllSet, SessionTicketExtAllSet, NoSession); err != nil {
 		return err
 	}
@@ -177,7 +206,11 @@ func initializationGuardWithErr[E Initializable, I func(E)](extension E, initial
 }
 
 // initSessionTicketExt initializes the ticket and sets the state to `TicketInitialized`.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) initSessionTicketExt(session *SessionState, ticket []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.assertNotLocked("initSessionTicketExt"); err != nil {
 		return err
 	}
@@ -207,7 +240,11 @@ func (s *sessionController) initSessionTicketExt(session *SessionState, ticket [
 
 // initPSK initializes the PSK extension using a valid session. The PSK extension
 // should not be initialized previously, and the parameters must not be nil.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) initPskExt(session *SessionState, earlySecret *tls13.EarlySecret, binderKey []byte, pskIdentities []pskIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.assertNotLocked("initPskExt"); err != nil {
 		return err
 	}
@@ -242,7 +279,11 @@ func (s *sessionController) initPskExt(session *SessionState, earlySecret *tls13
 }
 
 // setSessionTicketToUConn write the ticket states from the session ticket extension to the client hello and handshake state.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) setSessionTicketToUConn() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !(s.sessionTicketExt != nil && s.state == SessionTicketExtInitialized) {
 		return errors.New("tls: setSessionTicketExt failed: invalid state")
 	}
@@ -253,7 +294,11 @@ func (s *sessionController) setSessionTicketToUConn() error {
 }
 
 // setPskToUConn sets the psk to the handshake state and client hello.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) setPskToUConn() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !(s.pskExtension != nil && (s.state == PskExtInitialized || s.state == PskExtAllSet)) {
 		return errors.New("tls: setPskToUConn failed: invalid state")
 	}
@@ -282,21 +327,38 @@ func (s *sessionController) setPskToUConn() error {
 // This function returns true if an initialized psk extension exists. Binders are allowed to be updated when the state is `PskAllSet`,
 // as the `BuildHandshakeState` function can be called multiple times in this case. However, it's important to note that
 // the session state, apart from binders, should not be altered more than once.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) shouldUpdateBinders() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shouldUpdateBindersLocked()
+}
+
+// shouldUpdateBindersLocked is the internal version that requires caller to hold the lock.
+// Internal helper - caller must hold s.mu lock.
+func (s *sessionController) shouldUpdateBindersLocked() bool {
 	if s.pskExtension == nil {
 		return false
 	}
 	return (s.state == PskExtInitialized || s.state == PskExtAllSet)
 }
 
+// updateBinders updates the PSK binders in the ClientHello.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) updateBinders() error {
-	if !s.shouldUpdateBinders() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.shouldUpdateBindersLocked() {
 		return errors.New("tls: updateBinders failed: shouldn't update binders")
 	}
 	return s.pskExtension.PatchBuiltHello(s.uconnRef.HandshakeState.Hello)
 }
 
-func (s *sessionController) overrideExtension(extension Initializable, override func(), initializedState sessionControllerState) error {
+// overrideExtensionLocked is the internal implementation of extension override.
+// Internal helper - caller must hold s.mu lock.
+func (s *sessionController) overrideExtensionLocked(extension Initializable, override func(), initializedState sessionControllerState) error {
 	if err := errOnNil("overrideExtension", extension); err != nil {
 		return err
 	}
@@ -314,13 +376,21 @@ func (s *sessionController) overrideExtension(extension Initializable, override 
 }
 
 // overridePskExt allows the user of utls to customize the psk extension.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) overridePskExt(pskExt PreSharedKeyExtension) error {
-	return s.overrideExtension(pskExt, func() { s.pskExtension = pskExt }, PskExtInitialized)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overrideExtensionLocked(pskExt, func() { s.pskExtension = pskExt }, PskExtInitialized)
 }
 
-// overridePskExt allows the user of utls to customize the session ticket extension.
+// overrideSessionTicketExt allows the user of utls to customize the session ticket extension.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) overrideSessionTicketExt(sessionTicketExt ISessionTicketExtension) error {
-	return s.overrideExtension(sessionTicketExt, func() { s.sessionTicketExt = sessionTicketExt }, SessionTicketExtInitialized)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overrideExtensionLocked(sessionTicketExt, func() { s.sessionTicketExt = sessionTicketExt }, SessionTicketExtInitialized)
 }
 
 // syncSessionExts synchronizes the sessionController with the session-related
@@ -336,7 +406,11 @@ func (s *sessionController) overrideSessionTicketExt(sessionTicketExt ISessionTi
 // This function ensures that there is only one session ticket extension or PSK
 // extension, and that the PSK extension is the last extension in the extension
 // list.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) syncSessionExts() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.uconnRef.clientHelloBuildStatus != NotBuilt {
 		return errors.New("tls: checkSessionExts failed: we can't modify the session after the clientHello is built")
 	}
@@ -403,7 +477,11 @@ func (s *sessionController) syncSessionExts() error {
 
 // onEnterLoadSessionCheck is intended to be invoked upon entering the `conn.loadSession` function.
 // It is designed to ensure the correctness of the utls implementation.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) onEnterLoadSessionCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.locked {
 		return errors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: session is set and locked, no call to loadSession is allowed")
 	}
@@ -420,7 +498,11 @@ func (s *sessionController) onEnterLoadSessionCheck() error {
 
 // onLoadSessionReturn is intended to be invoked upon returning from the `conn.loadSession` function.
 // It serves as a validation step for the correctness of the underlying utls implementation.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) onLoadSessionReturn() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.callingLoadSession {
 		return errors.New("tls: LoadSessionCoordinator.onLoadSessionReturn failed: it's not loading sessions, perhaps this function is not being called by loadSession")
 	}
@@ -437,7 +519,11 @@ func (s *sessionController) onLoadSessionReturn() error {
 }
 
 // shouldLoadSessionWriteBinders checks if `conn.loadSession` should proceed to write binders and marshal the client hello.
+//
+// Thread-safe: Protected by mu.
 func (s *sessionController) shouldLoadSessionWriteBinders() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.callingLoadSession {
 		return false, errors.New("tls: shouldWriteBinders failed: LoadSessionCoordinator isn't loading sessions, perhaps this function is not being called by loadSession")
 	}

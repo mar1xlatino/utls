@@ -88,6 +88,9 @@ type clientHelloMsg struct {
 	extendedMasterSecret             bool
 	alpnProtocols                    []string
 	scts                             bool
+	certCompressionAlgorithms        []uint16 // RFC 8879: compress_certificate extension
+	alpsProtocols                    []string // ALPS: application_settings extension protocols
+	alpsCodepoint                    uint16   // ALPS: which codepoint was used (17513 or 17613)
 	// ems                              bool // [uTLS] actually implemented due to its prevalence // removed since crypto/tls implements it
 	supportedVersions       []uint16
 	cookie                  []byte
@@ -442,6 +445,13 @@ func (m *clientHelloMsg) marshalWithoutBinders() ([]byte, error) {
 			return nil, err
 		}
 	}
+
+	// RFC 8446 Section 4.2.11.2: Validate that binders length does not exceed
+	// message length to prevent slice bounds panic from malformed messages.
+	if bindersLen > len(fullMessage) {
+		return nil, errors.New("tls: binders length exceeds message length")
+	}
+
 	return fullMessage[:len(fullMessage)-bindersLen], nil
 }
 
@@ -631,6 +641,19 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		case extensionSCT:
 			// RFC 6962, Section 3.3.1
 			m.scts = true
+		case extensionCompressCertificate:
+			// RFC 8879: compress_certificate
+			var algList cryptobyte.String
+			if !extData.ReadUint8LengthPrefixed(&algList) || algList.Empty() {
+				return false
+			}
+			for !algList.Empty() {
+				var alg uint16
+				if !algList.ReadUint16(&alg) {
+					return false
+				}
+				m.certCompressionAlgorithms = append(m.certCompressionAlgorithms, alg)
+			}
 		case extensionSupportedVersions:
 			// RFC 8446, Section 4.2.1
 			var versList cryptobyte.String
@@ -712,6 +735,20 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			if !extData.ReadBytes(&m.encryptedClientHello, len(extData)) {
 				return false
 			}
+		case utlsExtensionApplicationSettings, utlsExtensionApplicationSettingsNew:
+			// ALPS: application_settings extension (Chrome/BoringSSL specific)
+			m.alpsCodepoint = extension
+			var protoList cryptobyte.String
+			if !extData.ReadUint16LengthPrefixed(&protoList) {
+				return false
+			}
+			for !protoList.Empty() {
+				var proto cryptobyte.String
+				if !protoList.ReadUint8LengthPrefixed(&proto) || proto.Empty() {
+					return false
+				}
+				m.alpsProtocols = append(m.alpsProtocols, string(proto))
+			}
 		default:
 			// Ignore unknown extensions.
 			continue
@@ -774,6 +811,9 @@ func (m *clientHelloMsg) clone() *clientHelloMsg {
 		extendedMasterSecret:             m.extendedMasterSecret,
 		alpnProtocols:                    slices.Clone(m.alpnProtocols),
 		scts:                             m.scts,
+		certCompressionAlgorithms:        slices.Clone(m.certCompressionAlgorithms),
+		alpsProtocols:                    slices.Clone(m.alpsProtocols),
+		alpsCodepoint:                    m.alpsCodepoint,
 		supportedVersions:                slices.Clone(m.supportedVersions),
 		cookie:                           slices.Clone(m.cookie),
 		keyShares:                        clonedKeyShares,
@@ -813,6 +853,14 @@ type serverHelloMsg struct {
 	// HelloRetryRequest extensions
 	cookie        []byte
 	selectedGroup CurveID
+
+	// RFC 8449: record_size_limit extension (for TLS 1.2)
+	// This is the server's advertised limit - what we must respect when sending.
+	recordSizeLimit uint16
+
+	// RFC 8449 Section 5: Track if max_fragment_length was received.
+	// max_fragment_length and record_size_limit are mutually exclusive.
+	hasMaxFragmentLength bool
 
 	// [uTLS]
 	nextProtoNeg bool
@@ -1066,6 +1114,21 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 				return false
 			}
 			m.serverNameAck = true
+		case extensionMaxFragmentLength:
+			// RFC 6066: Track that server sent max_fragment_length.
+			// RFC 8449 Section 5: This is mutually exclusive with record_size_limit.
+			m.hasMaxFragmentLength = true
+		case extensionRecordSizeLimit:
+			// RFC 8449: record_size_limit extension for TLS 1.2
+			// The server sends its receive limit, which we must respect when sending.
+			if !extData.ReadUint16(&m.recordSizeLimit) {
+				return false
+			}
+			// RFC 8449: Valid range is 64-16384 for TLS 1.2 (no content type byte)
+			// TLS 1.3 allows up to 16385 but that's handled via EncryptedExtensions
+			if m.recordSizeLimit < 64 || m.recordSizeLimit > 16384 {
+				return false
+			}
 		default:
 			// Ignore unknown extensions.
 			continue
@@ -1125,6 +1188,13 @@ func (m *encryptedExtensionsMsg) marshal() ([]byte, error) {
 					b.AddBytes(m.echRetryConfigs)
 				})
 			}
+			// [uTLS] Add ALPS (application_settings) extension if configured
+			if m.utls.applicationSettingsCodepoint != 0 && len(m.utls.applicationSettings) > 0 {
+				b.AddUint16(m.utls.applicationSettingsCodepoint)
+				b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+					b.AddBytes(m.utls.applicationSettings)
+				})
+			}
 		})
 	})
 
@@ -1141,6 +1211,7 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) bool {
 		return false
 	}
 
+	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
 		var extension uint16
 		var extData cryptobyte.String
@@ -1148,6 +1219,12 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) bool {
 			!extensions.ReadUint16LengthPrefixed(&extData) {
 			return false
 		}
+
+		// RFC 8446: There MUST NOT be more than one extension of the same type
+		if seenExts[extension] {
+			return false
+		}
+		seenExts[extension] = true
 
 		switch extension {
 		case extensionALPN:
@@ -1201,7 +1278,11 @@ func (m *endOfEarlyDataMsg) marshal() ([]byte, error) {
 }
 
 func (m *endOfEarlyDataMsg) unmarshal(data []byte) bool {
-	return len(data) == 4
+	// RFC 8446 Section 4.5: EndOfEarlyData has no content.
+	// Format: message_type (1 byte) + length (3 bytes, must be 0)
+	return len(data) == 4 &&
+		data[0] == typeEndOfEarlyData &&
+		data[1] == 0 && data[2] == 0 && data[3] == 0
 }
 
 type keyUpdateMsg struct {
@@ -1290,6 +1371,7 @@ func (m *newSessionTicketMsgTLS13) unmarshal(data []byte) bool {
 		return false
 	}
 
+	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
 		var extension uint16
 		var extData cryptobyte.String
@@ -1297,6 +1379,12 @@ func (m *newSessionTicketMsgTLS13) unmarshal(data []byte) bool {
 			!extensions.ReadUint16LengthPrefixed(&extData) {
 			return false
 		}
+
+		// RFC 8446: There MUST NOT be more than one extension of the same type
+		if seenExts[extension] {
+			return false
+		}
+		seenExts[extension] = true
 
 		switch extension {
 		case extensionEarlyData:
@@ -1397,6 +1485,7 @@ func (m *certificateRequestMsgTLS13) unmarshal(data []byte) bool {
 		return false
 	}
 
+	seenExts := make(map[uint16]bool)
 	for !extensions.Empty() {
 		var extension uint16
 		var extData cryptobyte.String
@@ -1404,6 +1493,12 @@ func (m *certificateRequestMsgTLS13) unmarshal(data []byte) bool {
 			!extensions.ReadUint16LengthPrefixed(&extData) {
 			return false
 		}
+
+		// RFC 8446: There MUST NOT be more than one extension of the same type
+		if seenExts[extension] {
+			return false
+		}
+		seenExts[extension] = true
 
 		switch extension {
 		case extensionStatusRequest:

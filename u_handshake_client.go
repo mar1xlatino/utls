@@ -126,6 +126,17 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		}
 		return nil, err
 	}
+
+	// RFC 8879 Section 5: Implementations MUST limit the size of the resulting
+	// decompressed chain to the specified uncompressed length, and they MUST abort
+	// the connection if the size of the output of the decompression function exceeds
+	// that limit. Verify no excess data remains after reading the declared length.
+	extraByte := make([]byte, 1)
+	if extraN, _ := decompressed.Read(extraByte); extraN > 0 {
+		c.sendAlert(alertBadCertificate)
+		return nil, errors.New("tls: decompressed certificate data exceeds declared uncompressed_length")
+	}
+
 	certMsg := new(certificateMsgTLS13)
 	if !certMsg.unmarshal(rawMsg) {
 		return nil, c.sendAlert(alertUnexpectedMessage)
@@ -178,10 +189,31 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 		}
 	}
 
+	// RFC 8449 Section 5: max_fragment_length and record_size_limit are mutually exclusive.
+	// A client MUST treat receipt of both extensions as a fatal error and generate
+	// an "illegal_parameter" alert.
+	if encryptedExtensions.utls.hasMaxFragmentLength && encryptedExtensions.utls.recordSizeLimit > 0 {
+		hs.c.sendAlert(alertIllegalParameter)
+		return errors.New("tls: server sent both max_fragment_length and record_size_limit extensions")
+	}
+
 	// RFC 8449: Process record_size_limit from server's EncryptedExtensions.
 	// The server's limit tells us the maximum plaintext size we can SEND to the server.
 	// We only honor this if we advertised record_size_limit in our ClientHello.
 	if encryptedExtensions.utls.recordSizeLimit > 0 {
+		// RFC 8449 Section 4: Version-specific maximum limits.
+		// TLS 1.2 and earlier: max is 2^14 (16384)
+		// TLS 1.3: max is 2^14+1 (16385) to account for content type byte
+		maxLimit := uint16(16385)
+		if hs.c.vers < VersionTLS13 {
+			maxLimit = 16384
+		}
+		serverLimit := encryptedExtensions.utls.recordSizeLimit
+		if serverLimit > maxLimit {
+			hs.c.sendAlert(alertIllegalParameter)
+			return fmt.Errorf("tls: server record_size_limit %d exceeds maximum %d for negotiated version", serverLimit, maxLimit)
+		}
+
 		// Verify we actually advertised record_size_limit extension
 		advertisedLimit := uint16(0)
 		for _, ext := range hs.uconn.Extensions {
@@ -194,7 +226,6 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 			// Server responded with its limit - this is what we must respect when sending.
 			// Per RFC 8449 Section 4: The server MUST NOT send a value larger than
 			// the value the client offered. If it does, we should use our advertised value.
-			serverLimit := encryptedExtensions.utls.recordSizeLimit
 			if serverLimit > advertisedLimit {
 				// Server violated RFC 8449 by sending larger limit than we offered.
 				// Use our advertised limit as a safety measure.
@@ -550,7 +581,41 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		return err
 	}
 
-	if hello.earlyData {
+	// [uTLS] Early data (0-RTT) transmission block.
+	// Per RFC 8446 Section 4.2.10, early data requires:
+	// 1. A valid TLS 1.3 session with EarlyData support
+	// 2. Matching cipher suite
+	// 3. Matching ALPN protocol (if used)
+	// 4. Derived early traffic secret
+	//
+	// Validation is critical because EarlyDataExtension.writeToUConn() sets
+	// hello.earlyData=true unconditionally, but session may be nil or invalid.
+	canSendEarlyData := hello.earlyData &&
+		session != nil &&
+		session.EarlyData &&
+		earlySecret != nil
+
+	// Additional validation: verify cipher suite and ALPN match
+	if canSendEarlyData {
+		suite := cipherSuiteTLS13ByID(session.cipherSuite)
+		if suite == nil {
+			canSendEarlyData = false
+		} else if session.alpnProtocol != "" {
+			// If session has ALPN, verify client is offering the same protocol
+			alpnMatch := false
+			for _, alpn := range hello.alpnProtocols {
+				if alpn == session.alpnProtocol {
+					alpnMatch = true
+					break
+				}
+			}
+			if !alpnMatch {
+				canSendEarlyData = false
+			}
+		}
+	}
+
+	if canSendEarlyData {
 		suite := cipherSuiteTLS13ByID(session.cipherSuite)
 		transcript := suite.hash.New()
 		if err := transcriptMsg(hello, transcript); err != nil {
@@ -562,6 +627,48 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 			return err
 		}
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
+
+		// [uTLS] For non-QUIC connections, transmit any buffered early data as 0-RTT records.
+		// This happens after ClientHello is sent but before we read ServerHello.
+		// Per RFC 8446 Section 4.2.10, early data is encrypted with client_early_traffic_secret
+		// and sent using application_data content type (0x17).
+		//
+		// For QUIC connections, early data is handled at the transport layer via
+		// quicSetWriteSecret() above, not through this path.
+		if c.quic == nil {
+			// Initialize early data state with session limits if not already set
+			if c.earlyData == nil {
+				c.earlyData = NewEarlyDataState()
+			}
+			// Enable with the session's max_early_data_size limit
+			c.earlyData.EnableWithCipherSuite(session.maxEarlyDataSize, earlyTrafficSecret, suite.id)
+
+			if err := c.transmitEarlyData(suite, earlyTrafficSecret); err != nil {
+				// Log the error but don't fail the handshake - early data is optional
+				// and the server may reject it anyway. The data is still buffered
+				// for potential fallback transmission after handshake.
+				if c.config.KeyLogWriter != nil {
+					// Only log if key logging is enabled (indicates debug mode)
+					c.config.writeKeyLog("EARLY_DATA_ERROR", hello.random, []byte(err.Error()))
+				}
+			}
+		}
+	} else if hello.earlyData {
+		// hello.earlyData was set (EarlyDataExtension present) but we cannot send early data.
+		// This is not an error - the server will see early_data extension but no early data,
+		// which is allowed per RFC 8446 (server may reject or accept empty early data).
+		// Log for debugging if key logging is enabled.
+		if c.config.KeyLogWriter != nil && c.quic == nil {
+			reason := "unknown"
+			if session == nil {
+				reason = "no_session"
+			} else if !session.EarlyData {
+				reason = "session_no_early_data"
+			} else if earlySecret == nil {
+				reason = "no_early_secret"
+			}
+			c.config.writeKeyLog("EARLY_DATA_SKIPPED", hello.random, []byte(reason))
+		}
 	}
 
 	// serverHelloMsg is not included in the transcript
@@ -608,15 +715,23 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		hs13.hello = hello
 		hs13.echContext = ech
 		if c.HandshakeState.State13.EarlySecret != nil && session.cipherSuite != 0 {
+			suite := cipherSuiteTLS13ByID(session.cipherSuite)
+			if suite == nil {
+				return errors.New("tls: unknown cipher suite for early secret session resumption")
+			}
 			var esErr error
-			hs13.earlySecret, esErr = tls13.NewEarlySecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.State13.EarlySecret)
+			hs13.earlySecret, esErr = tls13.NewEarlySecretFromSecret(suite.hash.New, c.HandshakeState.State13.EarlySecret)
 			if esErr != nil {
 				return esErr
 			}
 		}
 		if c.HandshakeState.MasterSecret != nil && session.cipherSuite != 0 {
+			suite := cipherSuiteTLS13ByID(session.cipherSuite)
+			if suite == nil {
+				return errors.New("tls: unknown cipher suite for master secret session resumption")
+			}
 			var msErr error
-			hs13.masterSecret, msErr = tls13.NewMasterSecretFromSecret(cipherSuiteTLS13ByID(session.cipherSuite).hash.New, c.HandshakeState.MasterSecret)
+			hs13.masterSecret, msErr = tls13.NewMasterSecretFromSecret(suite.hash.New, c.HandshakeState.MasterSecret)
 			if msErr != nil {
 				return msErr
 			}

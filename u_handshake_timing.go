@@ -278,6 +278,31 @@ func FirefoxHandshakeTimingConfig() *HandshakeTimingConfig {
 	}
 }
 
+// TimingConfigForClientHelloID returns the appropriate HandshakeTimingConfig
+// for a given ClientHelloID. Returns nil for custom/golang/randomized profiles
+// where timing should be manually configured, and browser-specific configs for
+// browser-mimicking profiles.
+//
+// This is used internally to enable timing jitter by default for browser profiles.
+func TimingConfigForClientHelloID(id ClientHelloID) *HandshakeTimingConfig {
+	switch id.Client {
+	case helloChrome:
+		return ChromeHandshakeTimingConfig()
+	case helloFirefox:
+		return FirefoxHandshakeTimingConfig()
+	case helloSafari, helloIOS:
+		// Safari/iOS: use default config (no browser-specific data yet)
+		return DefaultHandshakeTimingConfig()
+	case helloEdge:
+		// Edge is Chromium-based, use Chrome timing
+		return ChromeHandshakeTimingConfig()
+	default:
+		// For custom, golang, randomized profiles: no default timing
+		// Users can enable it manually if desired
+		return nil
+	}
+}
+
 // handshakeTimingController manages timing delays during a single handshake.
 // It is NOT thread-safe and should only be used within a single handshake goroutine.
 type handshakeTimingController struct {

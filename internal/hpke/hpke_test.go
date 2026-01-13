@@ -9,6 +9,8 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"sync"
 	"testing"
 )
 
@@ -353,7 +355,7 @@ func TestUnsupportedIDs(t *testing.T) {
 		_, _, err = SetupSender(
 			DHKEM_X25519_HKDF_SHA256,
 			KDF_HKDF_SHA256,
-			0xFFFF, // Invalid AEAD ID
+			0xFFFE, // Invalid AEAD ID (0xFFFF is now valid Export-only mode)
 			recipientPub,
 			nil,
 		)
@@ -361,6 +363,357 @@ func TestUnsupportedIDs(t *testing.T) {
 			t.Error("Expected error for unsupported AEAD ID")
 		}
 	})
+}
+
+// TestExportOnlyMode tests the Export-only AEAD mode (0xFFFF) per RFC 9180 Section 7.3
+func TestExportOnlyMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("SetupSucceeds", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		recipientPub := recipientPriv.PublicKey()
+
+		enc, sender, err := SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPub,
+			[]byte("test info"),
+		)
+		if err != nil {
+			t.Fatalf("SetupSender with Export-only failed: %v", err)
+		}
+		if enc == nil {
+			t.Error("Encapsulated key should not be nil")
+		}
+		if sender == nil {
+			t.Error("Sender should not be nil")
+		}
+		if !sender.IsExportOnly() {
+			t.Error("Sender should report IsExportOnly() = true")
+		}
+
+		recipient, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv,
+			[]byte("test info"),
+			enc,
+		)
+		if err != nil {
+			t.Fatalf("SetupRecipient with Export-only failed: %v", err)
+		}
+		if recipient == nil {
+			t.Error("Recipient should not be nil")
+		}
+		if !recipient.IsExportOnly() {
+			t.Error("Recipient should report IsExportOnly() = true")
+		}
+	})
+
+	t.Run("SealFails", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		recipientPub := recipientPriv.PublicKey()
+
+		_, sender, err := SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPub,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSender failed: %v", err)
+		}
+
+		_, err = sender.Seal([]byte("aad"), []byte("plaintext"))
+		if err != ErrExportOnlyMode {
+			t.Errorf("Seal should return ErrExportOnlyMode, got: %v", err)
+		}
+	})
+
+	t.Run("OpenFails", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+
+		enc, _, err := SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv.PublicKey(),
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSender failed: %v", err)
+		}
+
+		recipient, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv,
+			nil,
+			enc,
+		)
+		if err != nil {
+			t.Fatalf("SetupRecipient failed: %v", err)
+		}
+
+		_, err = recipient.Open([]byte("aad"), []byte("ciphertext"))
+		if err != ErrExportOnlyMode {
+			t.Errorf("Open should return ErrExportOnlyMode, got: %v", err)
+		}
+	})
+
+	t.Run("ExportWorks", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		recipientPub := recipientPriv.PublicKey()
+
+		info := []byte("test info")
+		exporterContext := []byte("exporter context")
+
+		enc, sender, err := SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPub,
+			info,
+		)
+		if err != nil {
+			t.Fatalf("SetupSender failed: %v", err)
+		}
+
+		recipient, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv,
+			info,
+			enc,
+		)
+		if err != nil {
+			t.Fatalf("SetupRecipient failed: %v", err)
+		}
+
+		// Export secrets of various lengths
+		for _, length := range []uint16{16, 32, 64, 128} {
+			senderSecret, err := sender.Export(exporterContext, length)
+			if err != nil {
+				t.Fatalf("Sender Export(%d) failed: %v", length, err)
+			}
+			if len(senderSecret) != int(length) {
+				t.Errorf("Sender Export length = %d, want %d", len(senderSecret), length)
+			}
+
+			recipientSecret, err := recipient.Export(exporterContext, length)
+			if err != nil {
+				t.Fatalf("Recipient Export(%d) failed: %v", length, err)
+			}
+			if len(recipientSecret) != int(length) {
+				t.Errorf("Recipient Export length = %d, want %d", len(recipientSecret), length)
+			}
+
+			// Sender and recipient should derive the same secret
+			if !bytes.Equal(senderSecret, recipientSecret) {
+				t.Errorf("Export secrets mismatch for length %d:\n  sender:    %x\n  recipient: %x",
+					length, senderSecret, recipientSecret)
+			}
+		}
+
+		// Different contexts should produce different secrets
+		ctx1, _ := sender.Export([]byte("context1"), 32)
+		ctx2, _ := sender.Export([]byte("context2"), 32)
+		if bytes.Equal(ctx1, ctx2) {
+			t.Error("Different export contexts should produce different secrets")
+		}
+	})
+
+	t.Run("OverheadIsZero", func(t *testing.T) {
+		t.Parallel()
+		recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+
+		enc, sender, err := SetupSender(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv.PublicKey(),
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("SetupSender failed: %v", err)
+		}
+
+		recipient, err := SetupRecipient(
+			DHKEM_X25519_HKDF_SHA256,
+			KDF_HKDF_SHA256,
+			AEAD_EXPORT_ONLY,
+			recipientPriv,
+			nil,
+			enc,
+		)
+		if err != nil {
+			t.Fatalf("SetupRecipient failed: %v", err)
+		}
+
+		if sender.Overhead() != 0 {
+			t.Errorf("Sender Overhead() = %d, want 0 for export-only mode", sender.Overhead())
+		}
+		if recipient.Overhead() != 0 {
+			t.Errorf("Recipient Overhead() = %d, want 0 for export-only mode", recipient.Overhead())
+		}
+	})
+
+	t.Run("DifferentKEMs", func(t *testing.T) {
+		t.Parallel()
+
+		kems := []struct {
+			name  string
+			kemID uint16
+			kdfID uint16
+			curve ecdh.Curve
+		}{
+			{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519()},
+			{"P-256", DHKEM_P256_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.P256()},
+			{"P-384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384()},
+		}
+
+		for _, kem := range kems {
+			t.Run(kem.name, func(t *testing.T) {
+				t.Parallel()
+
+				recipientPriv, err := kem.curve.GenerateKey(rand.Reader)
+				if err != nil {
+					t.Fatalf("GenerateKey failed: %v", err)
+				}
+
+				enc, sender, err := SetupSender(
+					kem.kemID,
+					kem.kdfID,
+					AEAD_EXPORT_ONLY,
+					recipientPriv.PublicKey(),
+					[]byte("test"),
+				)
+				if err != nil {
+					t.Fatalf("SetupSender failed: %v", err)
+				}
+
+				recipient, err := SetupRecipient(
+					kem.kemID,
+					kem.kdfID,
+					AEAD_EXPORT_ONLY,
+					recipientPriv,
+					[]byte("test"),
+					enc,
+				)
+				if err != nil {
+					t.Fatalf("SetupRecipient failed: %v", err)
+				}
+
+				// Verify Export works
+				senderSecret, err := sender.Export([]byte("ctx"), 32)
+				if err != nil {
+					t.Fatalf("Sender Export failed: %v", err)
+				}
+				recipientSecret, err := recipient.Export([]byte("ctx"), 32)
+				if err != nil {
+					t.Fatalf("Recipient Export failed: %v", err)
+				}
+				if !bytes.Equal(senderSecret, recipientSecret) {
+					t.Error("Sender and recipient should derive same secret")
+				}
+
+				// Verify Seal fails
+				_, err = sender.Seal(nil, []byte("test"))
+				if err != ErrExportOnlyMode {
+					t.Errorf("Seal should fail with ErrExportOnlyMode")
+				}
+			})
+		}
+	})
+}
+
+// TestExportFunction tests the Export function with regular AEAD modes
+func TestExportFunction(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	enc, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM, // Regular AEAD mode
+		recipientPub,
+		[]byte("test info"),
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	recipient, err := SetupRecipient(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPriv,
+		[]byte("test info"),
+		enc,
+	)
+	if err != nil {
+		t.Fatalf("SetupRecipient failed: %v", err)
+	}
+
+	// Test that Export works even with regular AEAD
+	exporterContext := []byte("exporter context")
+	senderSecret, err := sender.Export(exporterContext, 32)
+	if err != nil {
+		t.Fatalf("Sender Export failed: %v", err)
+	}
+	recipientSecret, err := recipient.Export(exporterContext, 32)
+	if err != nil {
+		t.Fatalf("Recipient Export failed: %v", err)
+	}
+	if !bytes.Equal(senderSecret, recipientSecret) {
+		t.Error("Export secrets should match between sender and recipient")
+	}
+
+	// Test that Seal/Open still work (not export-only mode)
+	if sender.IsExportOnly() {
+		t.Error("Regular AEAD sender should not be export-only")
+	}
+	plaintext := []byte("hello world")
+	ciphertext, err := sender.Seal(nil, plaintext)
+	if err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+	decrypted, err := recipient.Open(nil, ciphertext)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Error("Decrypted plaintext mismatch")
+	}
 }
 
 // TestUint128Operations tests uint128 arithmetic
@@ -968,6 +1321,145 @@ func TestP384RoundTrip(t *testing.T) {
 	}
 }
 
+// TestP521RoundTrip verifies P-521 KEM encryption/decryption
+// RFC 9180 Section 7.1: P-521 has Nenc=133 (uncompressed point = 1 + 2*66 = 133 bytes)
+func TestP521RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.P521().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	info := []byte("P-521 test info")
+
+	enc, sender, err := SetupSender(
+		DHKEM_P521_HKDF_SHA512,
+		KDF_HKDF_SHA512,
+		AEAD_AES_256_GCM,
+		recipientPub,
+		info,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	// Verify encapsulated key is 133 bytes (uncompressed P-521 point)
+	// RFC 9180 Table 2: Nenc = 133 for P-521
+	if len(enc) != 133 {
+		t.Errorf("enc length = %d, want 133 for P-521", len(enc))
+	}
+
+	// Verify enc starts with 0x04 (uncompressed point indicator)
+	if enc[0] != 0x04 {
+		t.Errorf("enc[0] = 0x%02x, want 0x04 for uncompressed point", enc[0])
+	}
+
+	recipient, err := SetupRecipient(
+		DHKEM_P521_HKDF_SHA512,
+		KDF_HKDF_SHA512,
+		AEAD_AES_256_GCM,
+		recipientPriv,
+		info,
+		enc,
+	)
+	if err != nil {
+		t.Fatalf("SetupRecipient failed: %v", err)
+	}
+
+	// Verify sender and recipient derived the same keys
+	if !bytes.Equal(sender.key, recipient.key) {
+		t.Errorf("key mismatch: sender=%x, recipient=%x", sender.key, recipient.key)
+	}
+
+	// Test encryption/decryption
+	plaintext := []byte("Hello P-521 HPKE!")
+	aad := []byte("additional data")
+
+	ciphertext, err := sender.Seal(aad, plaintext)
+	if err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	decrypted, err := recipient.Open(aad, ciphertext)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Errorf("Decryption mismatch:\n  got:  %s\n  want: %s", decrypted, plaintext)
+	}
+}
+
+// TestP521WithDifferentKDFs tests P-521 KEM with different KDF algorithms
+func TestP521WithDifferentKDFs(t *testing.T) {
+	t.Parallel()
+
+	kdfs := []struct {
+		name  string
+		kdfID uint16
+	}{
+		{"HKDF-SHA256", KDF_HKDF_SHA256},
+		{"HKDF-SHA384", KDF_HKDF_SHA384},
+		{"HKDF-SHA512", KDF_HKDF_SHA512},
+	}
+
+	for _, kdf := range kdfs {
+		t.Run(kdf.name, func(t *testing.T) {
+			t.Parallel()
+
+			recipientPriv, err := ecdh.P521().GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("GenerateKey failed: %v", err)
+			}
+			recipientPub := recipientPriv.PublicKey()
+
+			info := []byte("P-521 test with " + kdf.name)
+
+			enc, sender, err := SetupSender(
+				DHKEM_P521_HKDF_SHA512,
+				kdf.kdfID,
+				AEAD_AES_256_GCM,
+				recipientPub,
+				info,
+			)
+			if err != nil {
+				t.Fatalf("SetupSender failed: %v", err)
+			}
+
+			recipient, err := SetupRecipient(
+				DHKEM_P521_HKDF_SHA512,
+				kdf.kdfID,
+				AEAD_AES_256_GCM,
+				recipientPriv,
+				info,
+				enc,
+			)
+			if err != nil {
+				t.Fatalf("SetupRecipient failed: %v", err)
+			}
+
+			plaintext := []byte("Test message for P-521 with " + kdf.name)
+			aad := []byte("aad")
+
+			ciphertext, err := sender.Seal(aad, plaintext)
+			if err != nil {
+				t.Fatalf("Seal failed: %v", err)
+			}
+
+			decrypted, err := recipient.Open(aad, ciphertext)
+			if err != nil {
+				t.Fatalf("Open failed: %v", err)
+			}
+
+			if !bytes.Equal(decrypted, plaintext) {
+				t.Errorf("Decryption mismatch:\n  got:  %s\n  want: %s", decrypted, plaintext)
+			}
+		})
+	}
+}
+
 // TestAllKEMsWithAllAEADs tests all supported KEM/AEAD combinations
 // In -short mode, only X25519 with AES-128-GCM is tested.
 func TestAllKEMsWithAllAEADs(t *testing.T) {
@@ -983,6 +1475,7 @@ func TestAllKEMsWithAllAEADs(t *testing.T) {
 		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519(), 32},
 		{"P-256", DHKEM_P256_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.P256(), 65},
 		{"P-384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384(), 97},
+		{"P-521", DHKEM_P521_HKDF_SHA512, KDF_HKDF_SHA512, ecdh.P521(), 133},
 	}
 
 	aeads := []struct {
@@ -1104,6 +1597,26 @@ func TestInvalidPublicKeys(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("P521", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name string
+			key  []byte
+		}{
+			{"empty", []byte{}},
+			{"too short", make([]byte, 97)},
+			{"wrong prefix", append([]byte{0x02}, make([]byte, 132)...)},
+			{"too long", make([]byte, 200)},
+		}
+
+		for _, tc := range tests {
+			_, err := ParseHPKEPublicKey(DHKEM_P521_HKDF_SHA512, tc.key)
+			if err == nil {
+				t.Errorf("%s: Expected error for invalid P-521 public key", tc.name)
+			}
+		}
+	})
 }
 
 // TestParseHPKEKeys tests key parsing for all supported KEMs
@@ -1117,6 +1630,7 @@ func TestParseHPKEKeys(t *testing.T) {
 	}{
 		{"P-256", DHKEM_P256_HKDF_SHA256, ecdh.P256()},
 		{"P-384", DHKEM_P384_HKDF_SHA384, ecdh.P384()},
+		{"P-521", DHKEM_P521_HKDF_SHA512, ecdh.P521()},
 		{"X25519", DHKEM_X25519_HKDF_SHA256, ecdh.X25519()},
 	}
 
@@ -1167,6 +1681,7 @@ func TestMultipleMessages(t *testing.T) {
 		{"X25519", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519()},
 		{"P-256", DHKEM_P256_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.P256()},
 		{"P-384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384()},
+		{"P-521", DHKEM_P521_HKDF_SHA512, KDF_HKDF_SHA512, ecdh.P521()},
 	}
 
 	numMessages := 100
@@ -1382,5 +1897,525 @@ func BenchmarkSetupRecipientP384(b *testing.B) {
 			info,
 			enc,
 		)
+	}
+}
+
+func BenchmarkSetupSenderP521(b *testing.B) {
+	recipientPriv, _ := ecdh.P521().GenerateKey(rand.Reader)
+	recipientPub := recipientPriv.PublicKey()
+	info := []byte("benchmark info")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = SetupSender(
+			DHKEM_P521_HKDF_SHA512,
+			KDF_HKDF_SHA512,
+			AEAD_AES_256_GCM,
+			recipientPub,
+			info,
+		)
+	}
+}
+
+func BenchmarkSetupRecipientP521(b *testing.B) {
+	recipientPriv, _ := ecdh.P521().GenerateKey(rand.Reader)
+	recipientPub := recipientPriv.PublicKey()
+	info := []byte("benchmark info")
+
+	enc, _, _ := SetupSender(
+		DHKEM_P521_HKDF_SHA512,
+		KDF_HKDF_SHA512,
+		AEAD_AES_256_GCM,
+		recipientPub,
+		info,
+	)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = SetupRecipient(
+			DHKEM_P521_HKDF_SHA512,
+			KDF_HKDF_SHA512,
+			AEAD_AES_256_GCM,
+			recipientPriv,
+			info,
+			enc,
+		)
+	}
+}
+
+// TestConcurrentSeal tests that concurrent Seal operations are thread-safe.
+// Without proper mutex protection, concurrent calls would cause nonce reuse,
+// which is a catastrophic security failure for AEAD encryption.
+func TestConcurrentSeal(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	_, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	const numGoroutines = 100
+	const messagesPerGoroutine = 10
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines*messagesPerGoroutine)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < messagesPerGoroutine; j++ {
+				plaintext := []byte("message from goroutine")
+				_, err := sender.Seal(nil, plaintext)
+				if err != nil {
+					errCh <- err
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("Seal failed: %v", err)
+	}
+}
+
+// TestConcurrentSenderRecipientPairs tests that multiple sender/recipient pairs
+// can be used concurrently without issues.
+func TestConcurrentSenderRecipientPairs(t *testing.T) {
+	t.Parallel()
+
+	const numPairs = 50
+	const messagesPerPair = 20
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numPairs*messagesPerPair)
+
+	for i := 0; i < numPairs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			recipientPub := recipientPriv.PublicKey()
+
+			enc, sender, err := SetupSender(
+				DHKEM_X25519_HKDF_SHA256,
+				KDF_HKDF_SHA256,
+				AEAD_AES_128_GCM,
+				recipientPub,
+				nil,
+			)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			recipient, err := SetupRecipient(
+				DHKEM_X25519_HKDF_SHA256,
+				KDF_HKDF_SHA256,
+				AEAD_AES_128_GCM,
+				recipientPriv,
+				nil,
+				enc,
+			)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			plaintext := []byte("test message for concurrent pair")
+			for j := 0; j < messagesPerPair; j++ {
+				ciphertext, err := sender.Seal(nil, plaintext)
+				if err != nil {
+					errCh <- err
+					continue
+				}
+
+				decrypted, err := recipient.Open(nil, ciphertext)
+				if err != nil {
+					errCh <- err
+					continue
+				}
+
+				if !bytes.Equal(decrypted, plaintext) {
+					errCh <- errors.New("decrypted plaintext mismatch")
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("Concurrent operation failed: %v", err)
+	}
+}
+
+// TestRFC9180Export tests the Export function against RFC 9180 Appendix A.1 test vectors.
+// DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM (Base Mode)
+// NOTE: This test modifies testingOnlyGenerateKey global, so it cannot run in parallel.
+func TestRFC9180Export(t *testing.T) {
+	// RFC 9180 A.1 Base Setup Information
+	skEm := mustHex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736")
+	pkRm := mustHex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d")
+	info := mustHex("4f6465206f6e2061204772656369616e2055726e") // "Ode on a Grecian Urn"
+
+	// Expected exporter_secret from RFC 9180 A.1
+	expectedExporterSecret := mustHex("45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8")
+
+	// Export test vectors from RFC 9180 A.1
+	exportTests := []struct {
+		name            string
+		exporterContext string // hex
+		length          uint16
+		expected        string // hex
+	}{
+		{
+			name:            "empty_context",
+			exporterContext: "",
+			length:          32,
+			expected:        "3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee",
+		},
+		{
+			name:            "single_byte_context",
+			exporterContext: "00",
+			length:          32,
+			expected:        "2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5",
+		},
+		{
+			name:            "TestContext",
+			exporterContext: "54657374436f6e74657874", // "TestContext"
+			length:          32,
+			expected:        "e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931",
+		},
+	}
+
+	// Set up deterministic ephemeral key from skEm
+	ephPriv, err := ecdh.X25519().NewPrivateKey(skEm)
+	if err != nil {
+		t.Fatalf("NewPrivateKey(skEm) failed: %v", err)
+	}
+	testingOnlyGenerateKey = func() (*ecdh.PrivateKey, error) {
+		return ephPriv, nil
+	}
+	defer func() { testingOnlyGenerateKey = nil }()
+
+	// Parse recipient public key
+	recipientPub, err := ParseHPKEPublicKey(DHKEM_X25519_HKDF_SHA256, pkRm)
+	if err != nil {
+		t.Fatalf("ParseHPKEPublicKey failed: %v", err)
+	}
+
+	// Setup sender
+	_, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		info,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	// Verify the exporter secret matches the expected value from RFC 9180
+	if !bytes.Equal(sender.exporterSecret, expectedExporterSecret) {
+		t.Errorf("exporter_secret mismatch:\n  got:  %x\n  want: %x", sender.exporterSecret, expectedExporterSecret)
+	}
+
+	// Run export test vectors
+	for _, tc := range exportTests {
+		t.Run(tc.name, func(t *testing.T) {
+			exporterContext := mustHex(tc.exporterContext)
+			expected := mustHex(tc.expected)
+
+			exported, err := sender.Export(exporterContext, tc.length)
+			if err != nil {
+				t.Fatalf("Export failed: %v", err)
+			}
+
+			if !bytes.Equal(exported, expected) {
+				t.Errorf("exported value mismatch:\n  got:  %x\n  want: %x", exported, expected)
+			}
+		})
+	}
+}
+
+// TestExportSenderRecipientMatch verifies that sender and recipient derive
+// the same exported secrets.
+func TestExportSenderRecipientMatch(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	info := []byte("export test info")
+
+	enc, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		info,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	recipient, err := SetupRecipient(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPriv,
+		info,
+		enc,
+	)
+	if err != nil {
+		t.Fatalf("SetupRecipient failed: %v", err)
+	}
+
+	testCases := []struct {
+		name            string
+		exporterContext []byte
+		length          uint16
+	}{
+		{"empty_context_32", nil, 32},
+		{"empty_context_64", []byte{}, 64},
+		{"simple_context", []byte("test"), 32},
+		{"long_context", []byte("a longer context string for testing"), 48},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			senderExport, err := sender.Export(tc.exporterContext, tc.length)
+			if err != nil {
+				t.Fatalf("sender.Export failed: %v", err)
+			}
+
+			recipientExport, err := recipient.Export(tc.exporterContext, tc.length)
+			if err != nil {
+				t.Fatalf("recipient.Export failed: %v", err)
+			}
+
+			if !bytes.Equal(senderExport, recipientExport) {
+				t.Errorf("sender and recipient exports don't match:\n  sender:    %x\n  recipient: %x",
+					senderExport, recipientExport)
+			}
+
+			if len(senderExport) != int(tc.length) {
+				t.Errorf("export length = %d, want %d", len(senderExport), tc.length)
+			}
+		})
+	}
+}
+
+// TestExportDifferentContexts verifies that different exporter contexts
+// produce different (independent) secrets.
+func TestExportDifferentContexts(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	_, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	// Export with different contexts
+	export1, err := sender.Export([]byte("context1"), 32)
+	if err != nil {
+		t.Fatalf("Export context1 failed: %v", err)
+	}
+
+	export2, err := sender.Export([]byte("context2"), 32)
+	if err != nil {
+		t.Fatalf("Export context2 failed: %v", err)
+	}
+
+	export3, err := sender.Export(nil, 32)
+	if err != nil {
+		t.Fatalf("Export nil context failed: %v", err)
+	}
+
+	// All exports should be different
+	if bytes.Equal(export1, export2) {
+		t.Error("export1 and export2 should be different")
+	}
+	if bytes.Equal(export1, export3) {
+		t.Error("export1 and export3 should be different")
+	}
+	if bytes.Equal(export2, export3) {
+		t.Error("export2 and export3 should be different")
+	}
+}
+
+// TestExportIdempotent verifies that calling Export multiple times with
+// the same parameters produces the same result (Export doesn't modify state).
+func TestExportIdempotent(t *testing.T) {
+	t.Parallel()
+
+	recipientPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	recipientPub := recipientPriv.PublicKey()
+
+	_, sender, err := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SetupSender failed: %v", err)
+	}
+
+	context := []byte("test context")
+
+	// Call Export multiple times
+	export1, err := sender.Export(context, 32)
+	if err != nil {
+		t.Fatalf("Export 1 failed: %v", err)
+	}
+
+	export2, err := sender.Export(context, 32)
+	if err != nil {
+		t.Fatalf("Export 2 failed: %v", err)
+	}
+
+	export3, err := sender.Export(context, 32)
+	if err != nil {
+		t.Fatalf("Export 3 failed: %v", err)
+	}
+
+	if !bytes.Equal(export1, export2) {
+		t.Error("export1 and export2 should be equal")
+	}
+	if !bytes.Equal(export2, export3) {
+		t.Error("export2 and export3 should be equal")
+	}
+}
+
+// TestExportAllKDFs tests Export functionality with all supported KDFs.
+func TestExportAllKDFs(t *testing.T) {
+	t.Parallel()
+
+	kdfTests := []struct {
+		name  string
+		kemID uint16
+		kdfID uint16
+		curve ecdh.Curve
+	}{
+		{"SHA256", DHKEM_X25519_HKDF_SHA256, KDF_HKDF_SHA256, ecdh.X25519()},
+		{"SHA384", DHKEM_P384_HKDF_SHA384, KDF_HKDF_SHA384, ecdh.P384()},
+	}
+
+	for _, tc := range kdfTests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			recipientPriv, err := tc.curve.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("GenerateKey failed: %v", err)
+			}
+			recipientPub := recipientPriv.PublicKey()
+
+			enc, sender, err := SetupSender(
+				tc.kemID,
+				tc.kdfID,
+				AEAD_AES_128_GCM,
+				recipientPub,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("SetupSender failed: %v", err)
+			}
+
+			recipient, err := SetupRecipient(
+				tc.kemID,
+				tc.kdfID,
+				AEAD_AES_128_GCM,
+				recipientPriv,
+				nil,
+				enc,
+			)
+			if err != nil {
+				t.Fatalf("SetupRecipient failed: %v", err)
+			}
+
+			exporterContext := []byte("KDF test")
+			senderExport, err := sender.Export(exporterContext, 64)
+			if err != nil {
+				t.Fatalf("sender.Export failed: %v", err)
+			}
+
+			recipientExport, err := recipient.Export(exporterContext, 64)
+			if err != nil {
+				t.Fatalf("recipient.Export failed: %v", err)
+			}
+
+			if !bytes.Equal(senderExport, recipientExport) {
+				t.Errorf("sender and recipient exports don't match")
+			}
+
+			if len(senderExport) != 64 {
+				t.Errorf("export length = %d, want 64", len(senderExport))
+			}
+		})
+	}
+}
+
+// BenchmarkExport benchmarks the Export function.
+func BenchmarkExport(b *testing.B) {
+	recipientPriv, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	recipientPub := recipientPriv.PublicKey()
+
+	_, sender, _ := SetupSender(
+		DHKEM_X25519_HKDF_SHA256,
+		KDF_HKDF_SHA256,
+		AEAD_AES_128_GCM,
+		recipientPub,
+		nil,
+	)
+
+	exporterContext := []byte("benchmark context")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = sender.Export(exporterContext, 32)
 	}
 }

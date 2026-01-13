@@ -590,18 +590,8 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			}),
 		}, nil
 	case HelloFirefox_120:
-		// =============================================================================
-		// CRITICAL: FFDHE DETECTION VECTOR - READ BEFORE USING THIS PROFILE
-		// =============================================================================
-		// This profile advertises FFDHE groups (FakeCurveFFDHE2048, FakeCurveFFDHE3072) to
-		// match real Firefox. However, uTLS CANNOT generate FFDHE key shares.
-		//
-		// DETECTION RISK: If a server selects FFDHE via HelloRetryRequest, handshake FAILS.
-		// This provides 100% detection for fingerprint-aware servers.
-		//
-		// MITIGATION: Call spec.RemoveFFDHEGroups() to remove FFDHE groups (with fingerprint
-		// deviation trade-off). See IsFFDHEGroup() and RemoveFFDHEGroups() in u_common.go.
-		// =============================================================================
+		// Firefox 120 with FFDHE groups matching real Firefox.
+		// FFDHE key exchange is fully implemented - HelloRetryRequest works correctly.
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
@@ -613,8 +603,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&ExtendedMasterSecretExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&SupportedCurvesExtension{Curves: []CurveID{
-					// FFDHE groups below are FAKE - use RemoveFFDHEGroups() to remove them
-					X25519, CurveP256, CurveP384, CurveP521, FakeCurveFFDHE2048, FakeCurveFFDHE3072,
+					X25519, CurveP256, CurveP384, CurveP521, CurveFFDHE2048, CurveFFDHE3072,
 				}},
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
 				&SessionTicketExtension{},
@@ -642,22 +631,12 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		}, nil
 	case HelloFirefox_145:
 		// Firefox 145 (November 2025) with extension shuffling and X25519MLKEM768
-		// =============================================================================
-		// CRITICAL: FFDHE DETECTION VECTOR - READ BEFORE USING THIS PROFILE
-		// =============================================================================
-		// This profile advertises FFDHE groups (FakeCurveFFDHE2048, FakeCurveFFDHE3072) to
-		// match real Firefox. However, uTLS CANNOT generate FFDHE key shares.
-		//
-		// DETECTION RISK: If a server selects FFDHE via HelloRetryRequest, handshake FAILS.
-		// This provides 100% detection for fingerprint-aware servers.
-		//
-		// MITIGATION: Call spec.RemoveFFDHEGroups() to remove FFDHE groups (with fingerprint
-		// deviation trade-off). See IsFFDHEGroup() and RemoveFFDHEGroups() in u_common.go.
-		// =============================================================================
+		// Includes FFDHE groups (CurveFFDHE2048, CurveFFDHE3072) matching real Firefox.
+		// FFDHE key exchange is fully implemented - HelloRetryRequest works correctly.
 		return ClientHelloSpec{
 			TLSVersMin:         VersionTLS12,
 			TLSVersMax:         VersionTLS13,
-			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
+			SessionIDLength:    32, // Firefox sends 32-byte session ID for TLS 1.3 middlebox compatibility (RFC 8446 Appendix D.4)
 			CipherSuites:       firefoxCipherSuites,
 			CompressionMethods: []uint8{0x0},
 			Extensions: ShuffleFirefoxTLSExtensions([]TLSExtension{
@@ -665,8 +644,7 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&ExtendedMasterSecretExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&SupportedCurvesExtension{Curves: []CurveID{
-					// FFDHE groups below are FAKE - use RemoveFFDHEGroups() to remove them
-					X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521, FakeCurveFFDHE2048, FakeCurveFFDHE3072,
+					X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521, CurveFFDHE2048, CurveFFDHE3072,
 				}},
 				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
 				&SessionTicketExtension{},
@@ -683,108 +661,6 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
 				// SHA1 removed from Firefox 145+: Modern Firefox no longer includes deprecated SHA1
 				// signature algorithms (ECDSAWithSHA1, PKCS1WithSHA1) as they are cryptographically weak.
-				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsModern},
-				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
-				&FakeRecordSizeLimitExtension{Limit: 0x4001},
-				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{
-					CertCompressionZlib, CertCompressionBrotli, CertCompressionZstd,
-				}},
-				&GREASEEncryptedClientHelloExtension{
-					CandidateCipherSuites: []HPKESymmetricCipherSuite{
-						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_AES_128_GCM},
-						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_CHACHA20_POLY1305},
-					},
-					CandidatePayloadLens: []uint16{223},
-				},
-			}),
-		}, nil
-	case HelloFirefox_120_NoFFDHE:
-		// Firefox 120 WITHOUT FFDHE groups (safer variant)
-		// =============================================================================
-		// This profile is identical to HelloFirefox_120 but with FFDHE groups removed
-		// from supported_groups. This prevents the 100% detection vector that occurs
-		// when a server selects FFDHE via HelloRetryRequest.
-		//
-		// TRADE-OFF: The TLS fingerprint deviates from real Firefox (which includes
-		// FFDHE groups). However, this deviation is much safer than the guaranteed
-		// detection that occurs when FFDHE is selected by a probing server.
-		// =============================================================================
-		return ClientHelloSpec{
-			TLSVersMin:         VersionTLS12,
-			TLSVersMax:         VersionTLS13,
-			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
-			CipherSuites:       firefoxCipherSuites,
-			CompressionMethods: []uint8{0x0},
-			Extensions: []TLSExtension{
-				&SNIExtension{},
-				&ExtendedMasterSecretExtension{},
-				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
-				&SupportedCurvesExtension{Curves: []CurveID{
-					// FFDHE groups intentionally omitted for safety
-					X25519, CurveP256, CurveP384, CurveP521,
-				}},
-				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
-				&SessionTicketExtension{},
-				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-				&StatusRequestExtension{},
-				&FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
-					ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512, ECDSAWithSHA1,
-				}},
-				&KeyShareExtension{KeyShares: []KeyShare{{Group: X25519}, {Group: CurveP256}}},
-				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
-				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
-				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsLegacy},
-				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
-				&FakeRecordSizeLimitExtension{Limit: 0x4001},
-				&UtlsCompressCertExtension{Algorithms: []CertCompressionAlgo{CertCompressionBrotli, CertCompressionZlib}},
-				&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle},
-				&GREASEEncryptedClientHelloExtension{
-					CandidateCipherSuites: []HPKESymmetricCipherSuite{
-						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_AES_128_GCM},
-						{KdfId: dicttls.HKDF_SHA256, AeadId: dicttls.AEAD_CHACHA20_POLY1305},
-					},
-					CandidatePayloadLens: []uint16{223},
-				},
-			},
-		}, nil
-	case HelloFirefox_145_NoFFDHE:
-		// Firefox 145 WITHOUT FFDHE groups (safer variant)
-		// =============================================================================
-		// This profile is identical to HelloFirefox_145 but with FFDHE groups removed
-		// from supported_groups. This prevents the 100% detection vector that occurs
-		// when a server selects FFDHE via HelloRetryRequest.
-		//
-		// TRADE-OFF: The TLS fingerprint deviates from real Firefox (which includes
-		// FFDHE groups). However, this deviation is much safer than the guaranteed
-		// detection that occurs when FFDHE is selected by a probing server.
-		// =============================================================================
-		return ClientHelloSpec{
-			TLSVersMin:         VersionTLS12,
-			TLSVersMax:         VersionTLS13,
-			SessionIDLength:    SessionIDLengthNone, // Firefox sends empty session ID for fresh TLS 1.3 connections
-			CipherSuites:       firefoxCipherSuites,
-			CompressionMethods: []uint8{0x0},
-			Extensions: ShuffleFirefoxTLSExtensions([]TLSExtension{
-				&SNIExtension{},
-				&ExtendedMasterSecretExtension{},
-				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
-				&SupportedCurvesExtension{Curves: []CurveID{
-					// FFDHE groups intentionally omitted for safety
-					X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521,
-				}},
-				&SupportedPointsExtension{SupportedPoints: []uint8{0x0}},
-				&SessionTicketExtension{},
-				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-				&StatusRequestExtension{},
-				&FakeDelegatedCredentialsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
-					ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512,
-				}},
-				&SCTExtension{},
-				&KeyShareExtension{KeyShares: []KeyShare{
-					{Group: X25519MLKEM768}, {Group: X25519}, {Group: CurveP256},
-				}},
-				&SupportedVersionsExtension{Versions: []uint16{VersionTLS13, VersionTLS12}},
-				&CookieExtension{}, // Placeholder for HRR - Firefox places after supported_versions
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: firefoxSignatureAlgorithmsModern},
 				&PSKKeyExchangeModesExtension{Modes: []uint8{PskModeDHE}},
 				&FakeRecordSizeLimitExtension{Limit: 0x4001},
@@ -1929,6 +1805,13 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	if err != nil {
 		return errors.New("tls: short read from Rand: " + err.Error())
 	}
+	// Defensive check: ensure grease_bytes has sufficient length for greaseSeed.
+	// Each greaseSeed element requires 2 bytes. This validates the allocation
+	// matches the array size to prevent index out of bounds if constants change.
+	requiredBytes := 2 * len(uconn.greaseSeed)
+	if len(grease_bytes) < requiredBytes {
+		return errors.New("tls: insufficient random bytes for GREASE seed initialization")
+	}
 	for i := range uconn.greaseSeed {
 		uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
 	}
@@ -2080,9 +1963,11 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 		case *UtlsGREASEExtension:
 			switch grease_extensions_seen {
 			case 0:
-				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension1)
+				// [uTLS] Chrome correlation: First GREASE extension uses same value as supported_versions
+				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_version)
 			case 1:
-				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2)
+				// [uTLS] Chrome correlation: Second GREASE extension uses same value as supported_groups/key_share
+				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group)
 				ext.Body = []byte{0}
 			default:
 				return errors.New("tls: too many reserved extensions")
@@ -2153,6 +2038,45 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 					}
 					uconn.HandshakeState.State13.KeyShareKeys.Mlkem = mlkemKey
 					uconn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe = ecdheKey
+				} else if curveID == SecP256r1MLKEM768 {
+					// SecP256r1MLKEM768: P-256 + ML-KEM-768 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+					// Key share format: P-256 point (65 bytes) || ML-KEM encapsulation key (1184 bytes)
+					ecdheKey, err := generateECDHEKey(uconn.config.rand(), CurveP256)
+					if err != nil {
+						return err
+					}
+					seed := make([]byte, mlkem.SeedSize)
+					if _, err := io.ReadFull(uconn.config.rand(), seed); err != nil {
+						return err
+					}
+					mlkemKey, err := mlkem.NewDecapsulationKey768(seed)
+					if err != nil {
+						return err
+					}
+					// SecP256r1MLKEM768 format: P-256 point (65 bytes) || ML-KEM encapsulation key (1184 bytes)
+					ext.KeyShares[i].Data = append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
+					uconn.HandshakeState.State13.KeyShareKeys.Mlkem = mlkemKey
+					uconn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe = ecdheKey
+				} else if curveID == SecP384r1MLKEM1024 {
+					// SecP384r1MLKEM1024: P-384 + ML-KEM-1024 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+					// Key share format: P-384 point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes) = 1665 bytes
+					// Shared secret: ECDH_SS (48 bytes) || ML-KEM_SS (32 bytes) = 80 bytes
+					ecdheKey, err := generateECDHEKey(uconn.config.rand(), CurveP384)
+					if err != nil {
+						return err
+					}
+					seed := make([]byte, mlkem.SeedSize)
+					if _, err := io.ReadFull(uconn.config.rand(), seed); err != nil {
+						return err
+					}
+					mlkemKey, err := mlkem.NewDecapsulationKey1024(seed)
+					if err != nil {
+						return err
+					}
+					// SecP384r1MLKEM1024 format: P-384 point (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes)
+					ext.KeyShares[i].Data = append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
+					uconn.HandshakeState.State13.KeyShareKeys.Mlkem1024 = mlkemKey
+					uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
 				} else if IsFFDHEGroup(curveID) {
 					// Generate FFDHE key pair for RFC 7919 finite field groups
 					ffdheKey, err := generateFFDHEKey(uconn.config.rand(), curveID)

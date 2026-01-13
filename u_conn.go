@@ -18,6 +18,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/refraction-networking/utls/memcontrol"
 )
@@ -121,6 +122,19 @@ type UConn struct {
 	// timing-based fingerprinting. When nil, no timing jitter is applied.
 	// See HandshakeTimingConfig for configuration options.
 	handshakeTimingConfig *HandshakeTimingConfig
+
+	// handshakeTimeouts configures per-phase timeouts for the TLS handshake.
+	// When nil, no per-phase timeouts are applied (relies on context deadline).
+	// See HandshakeTimeouts for configuration options.
+	handshakeTimeouts *HandshakeTimeouts
+
+	// handshakeProgressCallback is called during handshake to report progress.
+	// Can be used for progress indicators or logging.
+	handshakeProgressCallback HandshakeProgressCallback
+
+	// handshakeTimeoutCtrl is the timeout controller for the current handshake.
+	// Protected by handshakeMutex (only accessed during handshake).
+	handshakeTimeoutCtrl *handshakeTimeoutController
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
@@ -180,6 +194,14 @@ func uClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) *UConn 
 	uconn.sessionController = newSessionController(&uconn)
 	uconn.utls.sessionController = uconn.sessionController
 	uconn.skipResumptionOnNilExtension = config.PreferSkipResumptionOnNilExtension || clientHelloID.Client != helloCustom
+
+	// [uTLS] Enable timing jitter by default for browser profiles to resist timing-based fingerprinting.
+	// Real browsers have 1-20ms+ variance from CPU work, crypto operations, etc.
+	// Users can disable with: uconn.SetHandshakeTimingConfig(nil)
+	if uconn.handshakeTimingConfig == nil {
+		uconn.handshakeTimingConfig = TimingConfigForClientHelloID(clientHelloID)
+	}
+
 	return &uconn
 }
 
@@ -659,7 +681,17 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 		return nil
 	}
 
-	handshakeCtx, cancel := context.WithCancel(ctx)
+	// [uTLS section begins]
+	// Apply overall handshake timeout if configured
+	baseCtx := ctx
+	var overallCancel context.CancelFunc
+	if c.handshakeTimeouts != nil && c.handshakeTimeouts.Overall > 0 {
+		baseCtx, overallCancel = context.WithTimeout(ctx, c.handshakeTimeouts.Overall)
+		defer overallCancel()
+	}
+	// [uTLS section ends]
+
+	handshakeCtx, cancel := context.WithCancel(baseCtx)
 	// Note: defer this before starting the "interrupter" goroutine
 	// so that we can tell the difference between the input being canceled and
 	// this cancellation. In the former case, we need to close the connection.
@@ -673,7 +705,7 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	if c.quic != nil {
 		c.quic.cancelc = handshakeCtx.Done()
 		c.quic.cancel = cancel
-	} else if ctx.Done() != nil {
+	} else if handshakeCtx.Done() != nil {
 		done := make(chan struct{})
 		interruptRes := make(chan error, 1)
 		defer func() {
@@ -709,6 +741,18 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	defer c.in.Unlock()
 
 	// [uTLS section begins]
+	// Initialize timeout controller if per-phase timeouts are configured
+	if c.handshakeTimeouts != nil {
+		c.handshakeTimeoutCtrl = newHandshakeTimeoutController(handshakeCtx, c.handshakeTimeouts, c.Conn)
+		if c.handshakeProgressCallback != nil {
+			c.handshakeTimeoutCtrl.setProgressCallback(c.handshakeProgressCallback)
+		}
+		defer func() {
+			c.handshakeTimeoutCtrl.cleanup()
+			c.handshakeTimeoutCtrl = nil
+		}()
+	}
+
 	if c.isClient {
 		err := c.BuildHandshakeState()
 		if err != nil {
@@ -837,8 +881,14 @@ func (c *UConn) Write(b []byte) (int, error) {
 // Each extension's writeToUConn method is invoked to transfer its settings
 // (such as SNI hostname, supported curves, ALPN protocols, etc.) to the connection.
 //
+// Thread-safe: Protected by extensionsMu RLock to prevent race conditions with
+// concurrent modification of Extensions slice. The lock is held for the entire
+// iteration to ensure consistency.
+//
 // Returns an error if any extension fails to apply its configuration.
 func (uconn *UConn) ApplyConfig() error {
+	uconn.extensionsMu.RLock()
+	defer uconn.extensionsMu.RUnlock()
 	for _, ext := range uconn.Extensions {
 		err := ext.writeToUConn(uconn)
 		if err != nil {
@@ -965,6 +1015,97 @@ func (uconn *UConn) CloseNotifyJitter() *CloseNotifyConfig {
 		return nil
 	}
 	return uconn.config.CloseNotifyJitter
+}
+
+// SetHandshakeTimeouts configures per-phase timeouts for the TLS handshake.
+// This allows fine-grained control over timing during different handshake phases,
+// and enables graceful timeout handling with alert sending.
+//
+// When set, timeouts are enforced for each handshake phase:
+//   - ClientHello: Time to send the ClientHello message
+//   - ServerResponse: Time to receive ServerHello
+//   - Certificate: Time for certificate exchange
+//   - KeyExchange: Time for key exchange operations
+//   - Finished: Time for Finished message exchange
+//
+// On timeout, the connection attempts to send a user_canceled alert before
+// closing, and returns a HandshakeTimeoutError with detailed phase information.
+//
+// Use nil to disable per-phase timeouts (relies on context deadline only).
+// Use DefaultHandshakeTimeouts() for sensible defaults.
+//
+// Example:
+//
+//	uconn.SetHandshakeTimeouts(tls.DefaultHandshakeTimeouts())  // Enable defaults
+//	uconn.SetHandshakeTimeouts(tls.FastHandshakeTimeouts())     // Aggressive timeouts
+//	uconn.SetHandshakeTimeouts(nil)                              // Disable (context only)
+//	uconn.SetHandshakeTimeouts(&tls.HandshakeTimeouts{          // Custom
+//	    Overall:        10 * time.Second,
+//	    ServerResponse: 5 * time.Second,
+//	})
+func (uconn *UConn) SetHandshakeTimeouts(t *HandshakeTimeouts) {
+	uconn.handshakeTimeouts = t.Clone()
+}
+
+// HandshakeTimeouts returns the current handshake timeout configuration.
+// Returns nil if per-phase timeouts are disabled.
+func (uconn *UConn) HandshakeTimeouts() *HandshakeTimeouts {
+	return uconn.handshakeTimeouts.Clone()
+}
+
+// SetHandshakeProgressCallback sets a callback that is invoked during handshake
+// to report progress through handshake phases. This is useful for:
+//   - Progress indicators for long handshakes
+//   - Debugging/logging handshake timing
+//   - Monitoring handshake performance
+//
+// The callback receives the current phase and elapsed time since handshake start.
+// It is called from the handshake goroutine, so it should be fast and non-blocking.
+//
+// Use nil to disable progress callbacks.
+//
+// Example:
+//
+//	uconn.SetHandshakeProgressCallback(func(phase tls.HandshakePhase, elapsed time.Duration) {
+//	    log.Printf("Handshake phase %s at %v", phase, elapsed)
+//	})
+func (uconn *UConn) SetHandshakeProgressCallback(cb HandshakeProgressCallback) {
+	uconn.handshakeProgressCallback = cb
+}
+
+// HandshakeProgressCallback returns the current progress callback, or nil if none set.
+func (uconn *UConn) HandshakeProgressCallback() HandshakeProgressCallback {
+	return uconn.handshakeProgressCallback
+}
+
+// enterHandshakePhase transitions to a new handshake phase and returns a
+// context with the phase-specific timeout. Returns the base context if
+// no timeout controller is configured.
+// This is called internally during handshake.
+func (uconn *UConn) enterHandshakePhase(phase HandshakePhase) (context.Context, error) {
+	if uconn.handshakeTimeoutCtrl == nil {
+		return context.Background(), nil
+	}
+	return uconn.handshakeTimeoutCtrl.enterPhase(phase)
+}
+
+// checkHandshakePhaseTimeout wraps an error with phase timeout information
+// if the error is a context timeout/cancellation error.
+// This is called internally during handshake to enhance error reporting.
+func (uconn *UConn) checkHandshakePhaseTimeout(err error) error {
+	if uconn.handshakeTimeoutCtrl == nil {
+		return err
+	}
+	return uconn.handshakeTimeoutCtrl.checkPhaseTimeout(err)
+}
+
+// handshakeElapsed returns the elapsed time since handshake started.
+// Returns 0 if no timeout controller is active.
+func (uconn *UConn) handshakeElapsed() time.Duration {
+	if uconn.handshakeTimeoutCtrl == nil {
+		return 0
+	}
+	return uconn.handshakeTimeoutCtrl.elapsed()
 }
 
 // GreaseSeed returns a copy of the GREASE seed array.
@@ -1137,7 +1278,11 @@ func (uconn *UConn) EchRetryConfigs() []byte {
 
 // extensionsList returns the list of extension type IDs from the current Extensions.
 // This is used for ECH outer extensions compression.
+//
+// Thread-safe: Protected by extensionsMu RLock.
 func (uconn *UConn) extensionsList() []uint16 {
+	uconn.extensionsMu.RLock()
+	defer uconn.extensionsMu.RUnlock()
 	outerExts := make([]uint16, 0, len(uconn.Extensions))
 	for _, ext := range uconn.Extensions {
 		// Allocate buffer for extension data
@@ -1489,6 +1634,41 @@ func (uconn *UConn) GetUnderlyingConn() net.Conn {
 	return uconn.Conn.conn
 }
 
+// isClosed returns true if Close() has been called on this connection.
+// This checks the low bit of the activeCall atomic field which is set by Close().
+// Thread-safe: uses atomic operations internally.
+func (uconn *UConn) isClosed() bool {
+	if uconn == nil || uconn.Conn == nil {
+		return true
+	}
+	return uconn.Conn.activeCall.Load()&1 != 0
+}
+
+// IsHealthy returns true if the connection appears usable for TLS operations.
+// A connection is considered healthy if:
+//   - The UConn and underlying Conn are not nil
+//   - The TLS handshake has completed successfully
+//   - Close() has not been called on the connection
+//
+// This is a lightweight check and does not perform any I/O operations.
+// For active connection health verification, use GracefulConn.Ping() instead.
+//
+// Thread-safe: uses atomic operations for all checks.
+func (uconn *UConn) IsHealthy() bool {
+	if uconn == nil || uconn.Conn == nil {
+		return false
+	}
+	// Check if handshake completed
+	if !uconn.isHandshakeComplete.Load() {
+		return false
+	}
+	// Check if connection is closed
+	if uconn.isClosed() {
+		return false
+	}
+	return true
+}
+
 // MakeConnWithCompleteHandshake allows to forge both server and client side TLS connections.
 // Major Hack Alert.
 func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite uint16, masterSecret []byte, clientRandom []byte, serverRandom []byte, isClient bool) *Conn {
@@ -1516,8 +1696,17 @@ func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite
 			}
 			serverHash = cs.mac(serverMAC)
 		} else {
-			clientCipher = cs.aead(clientKey, clientIV)
-			serverCipher = cs.aead(serverKey, serverIV)
+			var err error
+			clientCipher, err = cs.aead(clientKey, clientIV)
+			if err != nil {
+				// AEAD creation failed (invalid key length)
+				return nil
+			}
+			serverCipher, err = cs.aead(serverKey, serverIV)
+			if err != nil {
+				// AEAD creation failed (invalid key length)
+				return nil
+			}
 		}
 
 		if isClient {
@@ -1597,6 +1786,13 @@ type utlsConnExtraFields struct {
 	// the maximum plaintext size of TLS records sent to the peer.
 	// This is stored in Conn (not UConn) so maxPayloadSizeForWrite can access it.
 	negotiatedRecordSizeLimit uint16
+
+	// advertisedRecordSizeLimit stores the record size limit WE advertised to
+	// the peer (what we told them we can receive). Per RFC 8449 Section 4:
+	// "A TLS endpoint that receives a record larger than its advertised limit
+	// MUST generate a fatal 'record_overflow' alert."
+	// This is used for receiver-side enforcement of RFC 8449.
+	advertisedRecordSizeLimit uint16
 }
 
 // Read reads data from the connection.

@@ -14,6 +14,7 @@ import (
 	_ "crypto/sha512" // Register SHA-384 and SHA-512 hashes for HKDF
 	"errors"
 	"math/bits"
+	"sync"
 
 	"github.com/refraction-networking/utls/internal/byteorder"
 	"github.com/refraction-networking/utls/internal/hkdf"
@@ -21,11 +22,17 @@ import (
 )
 
 // ErrMessageLimitReached is returned when the HPKE message limit has been reached.
-// Per RFC 9180, the message limit is 2^(8*Nn - 1) where Nn is the nonce size.
-// For 12-byte nonces (AES-GCM, ChaCha20-Poly1305), this is 2^95 messages.
+// Per RFC 9180 Section 7.2.1, the message limit is 2^(8*Nn) - 1 where Nn is the nonce size.
+// For 12-byte nonces (AES-GCM, ChaCha20-Poly1305), this is 2^96 - 1 messages.
 // This error indicates a catastrophic failure - reaching this limit means
 // continuing would result in nonce reuse and complete security compromise.
 var ErrMessageLimitReached = errors.New("hpke: message limit reached")
+
+// ErrExportOnlyMode is returned when Seal or Open is called on a context
+// configured with Export-only AEAD (0xFFFF). Per RFC 9180 Section 7.3,
+// Export-only mode does not provide encryption/decryption capabilities
+// and MUST NOT be used with Seal or Open.
+var ErrExportOnlyMode = errors.New("hpke: seal/open not available in export-only mode")
 
 // testingOnlyGenerateKey is only used during testing, to provide
 // a fixed test key to use when checking the RFC 9180 vectors.
@@ -69,7 +76,7 @@ type KemID uint16
 const (
 	DHKEM_P256_HKDF_SHA256   uint16 = 0x0010
 	DHKEM_P384_HKDF_SHA384   uint16 = 0x0011
-	DHKEM_P521_HKDF_SHA512   uint16 = 0x0012 // Not implemented yet
+	DHKEM_P521_HKDF_SHA512   uint16 = 0x0012
 	DHKEM_X25519_HKDF_SHA256 uint16 = 0x0020
 )
 
@@ -83,6 +90,9 @@ var SupportedKEMs = map[uint16]struct {
 	DHKEM_P256_HKDF_SHA256: {ecdh.P256(), crypto.SHA256, 32},
 	// P-384: 48-byte shared secret, uses SHA-384 for key derivation
 	DHKEM_P384_HKDF_SHA384: {ecdh.P384(), crypto.SHA384, 48},
+	// P-521: 64-byte shared secret, uses SHA-512 for key derivation
+	// RFC 9180 Table 2: Nsecret=64, Nenc=133, Npk=133, Nsk=66
+	DHKEM_P521_HKDF_SHA512: {ecdh.P521(), crypto.SHA512, 64},
 	// X25519: 32-byte shared secret, uses SHA-256 for key derivation
 	DHKEM_X25519_HKDF_SHA256: {ecdh.X25519(), crypto.SHA256, 32},
 }
@@ -150,6 +160,7 @@ func (dh *dhKEM) Decap(encPubEph []byte, secRecipient *ecdh.PrivateKey) ([]byte,
 
 type context struct {
 	aead cipher.AEAD
+	kdf  *hkdfKDF
 
 	sharedSecret []byte
 
@@ -160,6 +171,15 @@ type context struct {
 	exporterSecret []byte
 
 	seqNum uint128
+
+	// exportOnly indicates this context is configured with Export-only AEAD (0xFFFF).
+	// When true, Seal and Open operations are not available; only Export works.
+	exportOnly bool
+
+	// mu protects seqNum from concurrent access. Concurrent Seal/Open calls
+	// without synchronization would cause nonce reuse - a catastrophic AEAD
+	// security failure that completely compromises confidentiality.
+	mu sync.Mutex
 }
 
 type Sender struct {
@@ -168,9 +188,17 @@ type Sender struct {
 
 // Overhead returns the maximum difference between the lengths of a
 // plaintext and its ciphertext for this AEAD. This value corresponds
-// to the AEAD tag length.
+// to the AEAD tag length. Returns 0 for Export-only mode.
 func (s *Sender) Overhead() int {
+	if s.exportOnly {
+		return 0
+	}
 	return s.aead.Overhead()
+}
+
+// IsExportOnly returns true if this sender is configured for Export-only mode.
+func (s *Sender) IsExportOnly() bool {
+	return s.exportOnly
 }
 
 type Recipient struct {
@@ -179,9 +207,17 @@ type Recipient struct {
 
 // Overhead returns the maximum difference between the lengths of a
 // plaintext and its ciphertext for this AEAD. This value corresponds
-// to the AEAD tag length.
+// to the AEAD tag length. Returns 0 for Export-only mode.
 func (r *Recipient) Overhead() int {
+	if r.exportOnly {
+		return 0
+	}
 	return r.aead.Overhead()
+}
+
+// IsExportOnly returns true if this recipient is configured for Export-only mode.
+func (r *Recipient) IsExportOnly() bool {
+	return r.exportOnly
 }
 
 var aesGCMNew = func(key []byte) (cipher.AEAD, error) {
@@ -194,10 +230,16 @@ var aesGCMNew = func(key []byte) (cipher.AEAD, error) {
 
 type AEADID uint16
 
+// AEAD identifiers from RFC 9180 Section 7.3
 const (
-	AEAD_AES_128_GCM      = 0x0001
-	AEAD_AES_256_GCM      = 0x0002
-	AEAD_ChaCha20Poly1305 = 0x0003
+	AEAD_AES_128_GCM      uint16 = 0x0001
+	AEAD_AES_256_GCM      uint16 = 0x0002
+	AEAD_ChaCha20Poly1305 uint16 = 0x0003
+	// AEAD_EXPORT_ONLY is the Export-only AEAD identifier from RFC 9180 Section 7.3.
+	// Applications that do not require encryption may use this AEAD ID.
+	// This AEAD does not provide any encryption or decryption capabilities
+	// and MUST NOT be used with Seal or Open. Only Export is available.
+	AEAD_EXPORT_ONLY uint16 = 0xFFFF
 )
 
 var SupportedAEADs = map[uint16]struct {
@@ -209,6 +251,9 @@ var SupportedAEADs = map[uint16]struct {
 	AEAD_AES_128_GCM:      {keySize: 16, nonceSize: 12, aead: aesGCMNew},
 	AEAD_AES_256_GCM:      {keySize: 32, nonceSize: 12, aead: aesGCMNew},
 	AEAD_ChaCha20Poly1305: {keySize: chacha20poly1305.KeySize, nonceSize: chacha20poly1305.NonceSize, aead: chacha20poly1305.New},
+	// Export-only mode: Nk=0, Nn=0, Nt=0 per RFC 9180 Section 7.3
+	// No AEAD cipher is initialized; only Export() is available.
+	AEAD_EXPORT_ONLY: {keySize: 0, nonceSize: 0, aead: nil},
 }
 
 type KDFID uint16
@@ -217,13 +262,14 @@ type KDFID uint16
 const (
 	KDF_HKDF_SHA256 uint16 = 0x0001
 	KDF_HKDF_SHA384 uint16 = 0x0002
-	KDF_HKDF_SHA512 uint16 = 0x0003 // Not implemented yet
+	KDF_HKDF_SHA512 uint16 = 0x0003
 )
 
 var SupportedKDFs = map[uint16]func() *hkdfKDF{
 	// RFC 9180, Section 7.2
 	KDF_HKDF_SHA256: func() *hkdfKDF { return &hkdfKDF{crypto.SHA256} },
 	KDF_HKDF_SHA384: func() *hkdfKDF { return &hkdfKDF{crypto.SHA384} },
+	KDF_HKDF_SHA512: func() *hkdfKDF { return &hkdfKDF{crypto.SHA512} },
 }
 
 func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (*context, error) {
@@ -239,6 +285,9 @@ func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (
 	if !ok {
 		return nil, errors.New("unsupported AEAD id")
 	}
+
+	// Check if this is export-only mode
+	exportOnly := aeadID == AEAD_EXPORT_ONLY
 
 	pskIDHash, err := kdf.LabeledExtract(sid, nil, "psk_id_hash", nil)
 	if err != nil {
@@ -256,15 +305,32 @@ func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (
 		return nil, err
 	}
 
+	// Derive exporter secret (always needed, including export-only mode)
+	exporterSecret, err := kdf.LabeledExpand(sid, secret, "exp", ksContext, uint16(kdf.hash.Size()))
+	if err != nil {
+		return nil, err
+	}
+
+	// For export-only mode, we don't derive key/nonce or initialize AEAD
+	if exportOnly {
+		return &context{
+			aead:           nil,
+			kdf:            kdf,
+			sharedSecret:   sharedSecret,
+			suiteID:        sid,
+			key:            nil,
+			baseNonce:      nil,
+			exporterSecret: exporterSecret,
+			exportOnly:     true,
+		}, nil
+	}
+
+	// Standard AEAD mode: derive key and nonce, initialize AEAD
 	key, err := kdf.LabeledExpand(sid, secret, "key", ksContext, uint16(aeadInfo.keySize))
 	if err != nil {
 		return nil, err
 	}
 	baseNonce, err := kdf.LabeledExpand(sid, secret, "base_nonce", ksContext, uint16(aeadInfo.nonceSize))
-	if err != nil {
-		return nil, err
-	}
-	exporterSecret, err := kdf.LabeledExpand(sid, secret, "exp", ksContext, uint16(kdf.hash.Size()))
 	if err != nil {
 		return nil, err
 	}
@@ -276,11 +342,13 @@ func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (
 
 	return &context{
 		aead:           aead,
+		kdf:            kdf,
 		sharedSecret:   sharedSecret,
 		suiteID:        sid,
 		key:            key,
 		baseNonce:      baseNonce,
 		exporterSecret: exporterSecret,
+		exportOnly:     false,
 	}, nil
 }
 
@@ -365,7 +433,18 @@ func (ctx *context) incrementNonce() error {
 
 // Seal encrypts and authenticates plaintext with associated additional data.
 // Returns ErrMessageLimitReached if the HPKE message limit has been exceeded.
+// Returns ErrExportOnlyMode if the context is configured for Export-only mode.
+//
+// Seal is safe for concurrent use. The internal sequence number is protected
+// by a mutex to prevent nonce reuse, which would be catastrophic for AEAD security.
 func (s *Sender) Seal(aad, plaintext []byte) ([]byte, error) {
+	if s.exportOnly {
+		return nil, ErrExportOnlyMode
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	ciphertext := s.aead.Seal(nil, s.nextNonce(), plaintext, aad)
 	if err := s.incrementNonce(); err != nil {
 		return nil, err
@@ -375,7 +454,18 @@ func (s *Sender) Seal(aad, plaintext []byte) ([]byte, error) {
 
 // Open decrypts and authenticates ciphertext with associated additional data.
 // Returns ErrMessageLimitReached if the HPKE message limit has been exceeded.
+// Returns ErrExportOnlyMode if the context is configured for Export-only mode.
+//
+// Open is safe for concurrent use. The internal sequence number is protected
+// by a mutex to prevent nonce reuse, which would be catastrophic for AEAD security.
 func (r *Recipient) Open(aad, ciphertext []byte) ([]byte, error) {
+	if r.exportOnly {
+		return nil, ErrExportOnlyMode
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	plaintext, err := r.aead.Open(nil, r.nextNonce(), ciphertext, aad)
 	if err != nil {
 		return nil, err
@@ -384,6 +474,34 @@ func (r *Recipient) Open(aad, ciphertext []byte) ([]byte, error) {
 		return nil, err
 	}
 	return plaintext, nil
+}
+
+// Export derives a secret of the specified length from the HPKE context.
+// This implements RFC 9180 Section 5.3 Secret Export functionality.
+//
+// The exporterContext is an application-supplied context string that
+// ensures different export calls produce independent secrets.
+// The length parameter specifies the desired output length in bytes.
+//
+// Per RFC 9180, the maximum length is 255*Nh where Nh is the hash output
+// size of the KDF (32 for SHA-256, 48 for SHA-384, 64 for SHA-512).
+//
+// Export is safe for concurrent use and does not affect the encryption
+// sequence counter.
+func (ctx *context) Export(exporterContext []byte, length uint16) ([]byte, error) {
+	return ctx.kdf.LabeledExpand(ctx.suiteID, ctx.exporterSecret, "sec", exporterContext, length)
+}
+
+// Export derives a secret from the sender's HPKE context.
+// See context.Export for details on the parameters and RFC 9180 compliance.
+func (s *Sender) Export(exporterContext []byte, length uint16) ([]byte, error) {
+	return s.context.Export(exporterContext, length)
+}
+
+// Export derives a secret from the recipient's HPKE context.
+// See context.Export for details on the parameters and RFC 9180 compliance.
+func (r *Recipient) Export(exporterContext []byte, length uint16) ([]byte, error) {
+	return r.context.Export(exporterContext, length)
 }
 
 func suiteID(kemID, kdfID, aeadID uint16) []byte {

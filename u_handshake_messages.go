@@ -59,6 +59,9 @@ type utlsEncryptedExtensionsMsgExtraFields struct {
 	// recordSizeLimit is the server's record size limit from RFC 8449.
 	// When non-zero, this is the maximum plaintext size we can send to the server.
 	recordSizeLimit uint16
+	// hasMaxFragmentLength tracks whether the server sent max_fragment_length extension.
+	// RFC 8449 Section 5: max_fragment_length and record_size_limit are mutually exclusive.
+	hasMaxFragmentLength bool
 }
 
 func (m *encryptedExtensionsMsg) utlsUnmarshal(extension uint16, extData cryptobyte.String) bool {
@@ -75,11 +78,15 @@ func (m *encryptedExtensionsMsg) utlsUnmarshal(extension uint16, extData cryptob
 		if !extData.ReadUint16(&limit) {
 			return false
 		}
-		// RFC 8449: Valid range is 64-16385
+		// RFC 8449: Valid range is 64-16385 (version-specific validation done later)
 		if limit < 64 || limit > 16385 {
 			return false
 		}
 		m.utls.recordSizeLimit = limit
+	case extensionMaxFragmentLength:
+		// RFC 6066: Track that server sent max_fragment_length.
+		// RFC 8449 Section 5: This is mutually exclusive with record_size_limit.
+		m.utls.hasMaxFragmentLength = true
 	}
 	return true // success/unknown extension
 }

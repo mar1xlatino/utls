@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 )
 
@@ -157,6 +158,15 @@ type quicState struct {
 	cancelc  <-chan struct{} // handshake has been canceled
 	cancel   context.CancelFunc
 
+	// closed indicates that signalc and blockedc have been closed.
+	// Used to prevent send-on-closed-channel panics in quicWaitForSignal.
+	closed atomic.Bool
+
+	// closeOnce ensures signalc and blockedc are closed exactly once,
+	// preventing double-close panics when multiple goroutines may
+	// attempt to close the channels concurrently.
+	closeOnce sync.Once
+
 	waitingForDrain atomic.Bool
 
 	// readbuf is shared between HandleData and the handshake goroutine.
@@ -167,6 +177,17 @@ type quicState struct {
 	transportParams []byte // to send to the peer
 
 	enableSessionEvents bool
+}
+
+// closeChannels safely closes the signalc and blockedc channels exactly once.
+// This method is thread-safe and can be called from multiple goroutines.
+// After this call, closed.Load() will return true.
+func (qs *quicState) closeChannels() {
+	qs.closeOnce.Do(func() {
+		qs.closed.Store(true)
+		close(qs.blockedc)
+		close(qs.signalc)
+	})
 }
 
 // QUICClient returns a new TLS client side connection using QUICTransport as the
@@ -220,11 +241,11 @@ func (q *QUICConn) Start(ctx context.Context) error {
 // It returns an event with a Kind of [QUICNoEvent] when no events are available.
 func (q *QUICConn) NextEvent() QUICEvent {
 	qs := q.conn.quic
-	if last := qs.nextEvent - 1; last >= 0 && len(qs.events[last].Data) > 0 {
-		// Write over some of the previous event's data,
-		// to catch callers erroniously retaining it.
-		qs.events[last].Data[0] = 0
-	}
+	// NOTE: Removed data poisoning write that modified previous event's data.
+	// While intended to catch callers erroneously retaining data, it creates
+	// a potential race condition and can silently corrupt data in edge cases.
+	// The event zeroing on line 260 provides sufficient cleanup by releasing
+	// references to data without risking corruption.
 	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain.Load() {
 		qs.waitingForDrain.Store(false)
 		<-qs.signalc
@@ -472,6 +493,9 @@ func (c *Conn) quicRejectedEarlyData() {
 	})
 }
 
+// errQUICClosed is returned when a QUIC operation is attempted on a closed connection.
+var errQUICClosed = errors.New("tls: QUIC connection closed")
+
 // quicWaitForSignal notifies the QUICConn that handshake progress is blocked,
 // and waits for a signal that the handshake should proceed.
 //
@@ -482,14 +506,30 @@ func (c *Conn) quicWaitForSignal() error {
 	// to call ConnectionState before the handshake completes.
 	c.handshakeMutex.Unlock()
 	defer c.handshakeMutex.Lock()
+
+	// Check if channels are already closed before attempting to send.
+	// The closed flag is set atomically before channels are closed in closeChannels(),
+	// so this check prevents send-on-closed-channel panics in the common case.
+	if c.quic.closed.Load() {
+		return errQUICClosed
+	}
+
 	// Send on blockedc to notify the QUICConn that the handshake is blocked.
 	// Exported methods of QUICConn wait for the handshake to become blocked
 	// before returning to the user.
 	select {
 	case c.quic.blockedc <- struct{}{}:
+		// Successfully notified that we're blocked
 	case <-c.quic.cancelc:
-		return c.sendAlertLocked(alertCloseNotify)
+		return c.sendAlert(alertCloseNotify)
 	}
+
+	// Re-check closed state before second send to handle race where
+	// channels were closed between our sends.
+	if c.quic.closed.Load() {
+		return errQUICClosed
+	}
+
 	// The QUICConn reads from signalc to notify us that the handshake may
 	// be able to proceed. (The QUICConn reads, because we close signalc to
 	// indicate that the handshake has completed.)
@@ -498,7 +538,7 @@ func (c *Conn) quicWaitForSignal() error {
 		c.hand.Write(c.quic.readbuf)
 		c.quic.readbuf = nil
 	case <-c.quic.cancelc:
-		return c.sendAlertLocked(alertCloseNotify)
+		return c.sendAlert(alertCloseNotify)
 	}
 	return nil
 }

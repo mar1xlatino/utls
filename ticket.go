@@ -121,6 +121,13 @@ type SessionState struct {
 	useBy  uint64 // seconds since UNIX epoch
 	ageAdd uint32
 	ticket []byte
+
+	// [uTLS] maxEarlyDataSize is the max_early_data_size from the NewSessionTicket.
+	// Per RFC 8446 Section 4.6.1, this indicates the maximum amount of 0-RTT data
+	// the server will accept. For QUIC (RFC 9001), this must be 0xffffffff.
+	// For standard TLS, this is the byte limit for early data.
+	// Zero means early data is not supported for this session.
+	maxEarlyDataSize uint32
 }
 
 // Bytes encodes the session, including any private fields, so that it can be
@@ -188,6 +195,19 @@ func (s *SessionState) Bytes() ([]byte, error) {
 	if s.isClient {
 		if s.version >= VersionTLS13 {
 			addUint64(&b, s.useBy)
+			b.AddUint32(s.ageAdd)
+			// [uTLS] Serialize maxEarlyDataSize when EarlyData is enabled.
+			// This is critical for 0-RTT session resumption - without it,
+			// the client doesn't know how much early data the server accepts.
+			if s.EarlyData {
+				b.AddUint32(s.maxEarlyDataSize)
+			}
+		}
+	} else {
+		// Server-side TLS 1.3 session ticket: include ageAdd when EarlyData is enabled.
+		// This is required for RFC 8446 Section 4.2.10 ticket age validation during 0-RTT.
+		// Without ageAdd in the ticket, the server cannot verify the client's obfuscated_ticket_age.
+		if s.version >= VersionTLS13 && s.EarlyData {
 			b.AddUint32(s.ageAdd)
 		}
 	}
@@ -291,6 +311,13 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 		ss.alpnProtocol = string(alpn)
 	}
 	if isClient := typ == 2; !isClient {
+		// Server-side TLS 1.3 session ticket: read ageAdd when EarlyData is enabled.
+		// This is required for RFC 8446 Section 4.2.10 ticket age validation during 0-RTT.
+		if ss.version >= VersionTLS13 && ss.EarlyData {
+			if !s.ReadUint32(&ss.ageAdd) {
+				return nil, errors.New("tls: invalid session encoding: missing ageAdd for server-side 0-RTT")
+			}
+		}
 		if !s.Empty() {
 			return nil, errors.New("tls: invalid session encoding")
 		}
@@ -306,7 +333,17 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 		}
 		return ss, nil
 	}
-	if !s.ReadUint64(&ss.useBy) || !s.ReadUint32(&ss.ageAdd) || !s.Empty() {
+	if !s.ReadUint64(&ss.useBy) || !s.ReadUint32(&ss.ageAdd) {
+		return nil, errors.New("tls: invalid session encoding")
+	}
+	// [uTLS] Parse maxEarlyDataSize when EarlyData is enabled.
+	// This is critical for 0-RTT session resumption.
+	if ss.EarlyData {
+		if !s.ReadUint32(&ss.maxEarlyDataSize) {
+			return nil, errors.New("tls: invalid session encoding: missing maxEarlyDataSize for early data")
+		}
+	}
+	if !s.Empty() {
 		return nil, errors.New("tls: invalid session encoding")
 	}
 
@@ -343,7 +380,10 @@ func (c *Conn) sessionState() *SessionState {
 // EncryptTicket encrypts a ticket with the [Config]'s configured (or default)
 // session ticket keys. It can be used as a [Config.WrapSession] implementation.
 func (c *Config) EncryptTicket(cs ConnectionState, ss *SessionState) ([]byte, error) {
-	ticketKeys := c.ticketKeys(nil)
+	ticketKeys, err := c.ticketKeys(nil)
+	if err != nil {
+		return nil, err
+	}
 	stateBytes, err := ss.Bytes()
 	if err != nil {
 		return nil, err
@@ -391,7 +431,10 @@ func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, er
 // This indicates a cryptographically valid ticket with corrupt contents,
 // which may be a security concern.
 func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionState, error) {
-	ticketKeys := c.ticketKeys(nil)
+	ticketKeys, err := c.ticketKeys(nil)
+	if err != nil {
+		return nil, err
+	}
 	stateBytes := c.decryptTicket(identity, ticketKeys)
 	if stateBytes == nil {
 		// Decryption failed (MAC mismatch, ticket too short, etc.)

@@ -45,7 +45,9 @@ func testSessionState(version uint16, cipherSuite uint16) *SessionState {
 func TestTicketEncryptDecrypt(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	testCases := []struct {
 		name        string
@@ -106,7 +108,9 @@ func TestTicketKeyRotation(t *testing.T) {
 	config := &Config{}
 
 	// Create ticket with key1
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
 	encrypted, err := config.EncryptTicket(ConnectionState{}, ss)
@@ -115,7 +119,9 @@ func TestTicketKeyRotation(t *testing.T) {
 	}
 
 	// Rotate to key2, but keep key1 for decryption
-	config.SetSessionTicketKeys([][32]byte{key2, key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key2, key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	// Decrypt should still work with key1 in rotation
 	decrypted, err := config.DecryptTicket(encrypted, ConnectionState{})
@@ -142,7 +148,9 @@ func TestTicketKeyRotationRemoved(t *testing.T) {
 	config := &Config{}
 
 	// Create ticket with key1
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
 	encrypted, err := config.EncryptTicket(ConnectionState{}, ss)
@@ -151,7 +159,9 @@ func TestTicketKeyRotationRemoved(t *testing.T) {
 	}
 
 	// Replace with completely different key (key1 not in rotation)
-	config.SetSessionTicketKeys([][32]byte{key2})
+	if err := config.SetSessionTicketKeys([][32]byte{key2}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	// Decrypt should fail (return nil, nil per the API contract)
 	decrypted, err := config.DecryptTicket(encrypted, ConnectionState{})
@@ -167,7 +177,9 @@ func TestTicketKeyRotationRemoved(t *testing.T) {
 func TestTicketCorruptedMAC(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
@@ -196,7 +208,9 @@ func TestTicketCorruptedMAC(t *testing.T) {
 func TestTicketCorruptedIV(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
@@ -224,7 +238,9 @@ func TestTicketCorruptedIV(t *testing.T) {
 func TestTicketCorruptedCiphertext(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
@@ -253,7 +269,9 @@ func TestTicketCorruptedCiphertext(t *testing.T) {
 func TestTicketTooShort(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	testCases := []struct {
 		name   string
@@ -287,7 +305,9 @@ func TestTicketTooShort(t *testing.T) {
 func TestTicketMinimumValidLength(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	// Minimum length is IV (16) + MAC (32) = 48 bytes
 	// This would represent zero-length plaintext
@@ -605,7 +625,9 @@ func TestTicketMultipleKeys(t *testing.T) {
 	tickets := make([][]byte, len(keys))
 	for i := range keys {
 		// Set only this key as primary
-		config.SetSessionTicketKeys([][32]byte{keys[i]})
+		if err := config.SetSessionTicketKeys([][32]byte{keys[i]}); err != nil {
+			t.Fatalf("SetSessionTicketKeys failed: %v", err)
+		}
 		ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
 		var err error
@@ -616,7 +638,9 @@ func TestTicketMultipleKeys(t *testing.T) {
 	}
 
 	// Now set all keys in rotation
-	config.SetSessionTicketKeys(keys)
+	if err := config.SetSessionTicketKeys(keys); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	// All tickets should decrypt successfully
 	for i, ticket := range tickets {
@@ -637,7 +661,9 @@ func TestTicketNewKeyUsedForEncryption(t *testing.T) {
 	config := &Config{}
 
 	// Set key2 as primary, key1 as backup
-	config.SetSessionTicketKeys([][32]byte{key2, key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key2, key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 	encrypted, err := config.EncryptTicket(ConnectionState{}, ss)
@@ -646,7 +672,9 @@ func TestTicketNewKeyUsedForEncryption(t *testing.T) {
 	}
 
 	// Set only key2 (should work - ticket was encrypted with key2)
-	config.SetSessionTicketKeys([][32]byte{key2})
+	if err := config.SetSessionTicketKeys([][32]byte{key2}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 	decrypted, err := config.DecryptTicket(encrypted, ConnectionState{})
 	if err != nil {
 		t.Fatalf("DecryptTicket with key2 only failed: %v", err)
@@ -656,7 +684,9 @@ func TestTicketNewKeyUsedForEncryption(t *testing.T) {
 	}
 
 	// Set only key1 (should fail - ticket was encrypted with key2)
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 	decrypted, err = config.DecryptTicket(encrypted, ConnectionState{})
 	if err != nil {
 		t.Fatalf("DecryptTicket should not return error, got: %v", err)
@@ -670,10 +700,15 @@ func TestTicketNewKeyUsedForEncryption(t *testing.T) {
 func TestTicketDecryptionError(t *testing.T) {
 	key1 := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key1})
+	if err := config.SetSessionTicketKeys([][32]byte{key1}); err != nil {
+		t.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	// Get the ticket keys to use for encryption
-	ticketKeys := config.ticketKeys(nil)
+	ticketKeys, err := config.ticketKeys(nil)
+	if err != nil {
+		t.Fatalf("ticketKeys failed: %v", err)
+	}
 	if len(ticketKeys) == 0 {
 		t.Fatal("No ticket keys available")
 	}
@@ -930,6 +965,29 @@ func TestTicketEncryptionWithDisabledTickets(t *testing.T) {
 	}
 }
 
+// TestSetSessionTicketKeysEmptyError tests that SetSessionTicketKeys returns error for empty keys
+func TestSetSessionTicketKeysEmptyError(t *testing.T) {
+	config := &Config{}
+
+	// Empty keys should return an error
+	err := config.SetSessionTicketKeys([][32]byte{})
+	if err == nil {
+		t.Fatal("SetSessionTicketKeys should return error for empty keys")
+	}
+
+	// Verify the error message
+	expectedMsg := "tls: keys must have at least one key"
+	if err.Error() != expectedMsg {
+		t.Errorf("expected error message %q, got %q", expectedMsg, err.Error())
+	}
+
+	// nil slice should also return an error
+	err = config.SetSessionTicketKeys(nil)
+	if err == nil {
+		t.Fatal("SetSessionTicketKeys should return error for nil keys")
+	}
+}
+
 // TestSentinelErrors tests that sentinel errors are properly defined
 func TestSentinelErrors(t *testing.T) {
 	// Verify sentinel errors are non-nil and have expected messages
@@ -967,7 +1025,9 @@ func TestSentinelErrors(t *testing.T) {
 func BenchmarkTicketEncrypt(b *testing.B) {
 	key := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key})
+	if err := config.SetSessionTicketKeys([][32]byte{key}); err != nil {
+		b.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 
@@ -984,7 +1044,9 @@ func BenchmarkTicketEncrypt(b *testing.B) {
 func BenchmarkTicketDecrypt(b *testing.B) {
 	key := testTicketKey()
 	config := &Config{}
-	config.SetSessionTicketKeys([][32]byte{key})
+	if err := config.SetSessionTicketKeys([][32]byte{key}); err != nil {
+		b.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 	encrypted, err := config.EncryptTicket(ConnectionState{}, ss)
@@ -1009,7 +1071,9 @@ func BenchmarkTicketDecryptWithRotation(b *testing.B) {
 	}
 
 	config := &Config{}
-	config.SetSessionTicketKeys(keys)
+	if err := config.SetSessionTicketKeys(keys); err != nil {
+		b.Fatalf("SetSessionTicketKeys failed: %v", err)
+	}
 
 	ss := testSessionState(VersionTLS12, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
 	encrypted, err := config.EncryptTicket(ConnectionState{}, ss)

@@ -88,6 +88,10 @@ type Conn struct {
 	// closeNotifySent is true if the Conn attempted to send an
 	// alertCloseNotify record.
 	closeNotifySent bool
+	// closeNotifySeq is a sequence counter that increments whenever closeNotify
+	// state changes. Used to detect ABA race conditions when the lock is temporarily
+	// released during closeNotify jitter delays. Protected by out.Mutex.
+	closeNotifySeq uint64
 
 	// clientFinished and serverFinished contain the Finished message sent
 	// by the client or server in the most recent handshake. This is
@@ -250,7 +254,14 @@ func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncrypti
 	if err != nil {
 		return err
 	}
-	hc.cipher = suite.aead(key, iv)
+	aeadCipher, err := suite.aead(key, iv)
+	if err != nil {
+		// Zero key material before returning error.
+		zeroSlice(key)
+		zeroSlice(iv)
+		return fmt.Errorf("tls: failed to create AEAD cipher: %w", err)
+	}
+	hc.cipher = aeadCipher
 	// Zero the derived key and IV after AEAD construction.
 	// Note: AEAD implementations typically copy these internally.
 	zeroSlice(key)
@@ -264,6 +275,10 @@ func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncrypti
 // errSequenceOverflow is returned when TLS sequence number would wrap around.
 // This indicates the connection has processed 2^64 records and must be closed.
 var errSequenceOverflow = errors.New("tls: sequence number overflow")
+
+// errUnknownCipherType is returned when an unrecognized cipher type is encountered.
+// This typically indicates a programming error or corrupted state.
+var errUnknownCipherType = errors.New("tls: unknown cipher type")
 
 // incSeq increments the sequence number.
 // Returns an error if the sequence number would overflow.
@@ -284,24 +299,25 @@ func (hc *halfConn) incSeq() error {
 // explicitNonceLen returns the number of bytes of explicit nonce or IV included
 // in each record. Explicit nonces are present only in CBC modes after TLS 1.0
 // and in certain AEAD modes in TLS 1.2.
-func (hc *halfConn) explicitNonceLen() int {
+// Returns an error if an unknown cipher type is encountered.
+func (hc *halfConn) explicitNonceLen() (int, error) {
 	if hc.cipher == nil {
-		return 0
+		return 0, nil
 	}
 
 	switch c := hc.cipher.(type) {
 	case cipher.Stream:
-		return 0
+		return 0, nil
 	case aead:
-		return c.explicitNonceLen()
+		return c.explicitNonceLen(), nil
 	case cbcMode:
 		// TLS 1.1 introduced a per-record explicit IV to fix the BEAST attack.
 		if hc.version >= VersionTLS11 {
-			return c.BlockSize()
+			return c.BlockSize(), nil
 		}
-		return 0
+		return 0, nil
 	default:
-		panic("unknown cipher type")
+		return 0, errUnknownCipherType
 	}
 }
 
@@ -381,7 +397,10 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 	paddingGood := byte(255)
 	paddingLen := 0
 
-	explicitNonceLen := hc.explicitNonceLen()
+	explicitNonceLen, err := hc.explicitNonceLen()
+	if err != nil {
+		return nil, 0, alertInternalError
+	}
 
 	if hc.cipher != nil {
 		switch c := hc.cipher.(type) {
@@ -433,7 +452,7 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			// affect the subsequent write, modulo cache effects.
 			paddingLen, paddingGood = extractPadding(payload)
 		default:
-			panic("unknown cipher type")
+			return nil, 0, alertInternalError
 		}
 
 		if hc.version == VersionTLS13 {
@@ -516,7 +535,11 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader, paddingLen i
 	}
 
 	var explicitNonce []byte
-	if explicitNonceLen := hc.explicitNonceLen(); explicitNonceLen > 0 {
+	explicitNonceLen, err := hc.explicitNonceLen()
+	if err != nil {
+		return nil, err
+	}
+	if explicitNonceLen > 0 {
 		record, explicitNonce = sliceForAppend(record, explicitNonceLen)
 		if _, isCBC := hc.cipher.(cbcMode); !isCBC && explicitNonceLen < 16 {
 			// The AES-GCM construction in TLS has an explicit nonce so that the
@@ -596,7 +619,7 @@ func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader, paddingLen i
 		}
 		c.CryptBlocks(dst, dst)
 	default:
-		panic("unknown cipher type")
+		return nil, errUnknownCipherType
 	}
 
 	// Update length to include nonce, MAC and any block padding needed.
@@ -737,6 +760,15 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		return c.in.setErrorLocked(c.sendAlert(err.(alert)))
 	}
 	if len(data) > maxPlaintext {
+		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
+	}
+
+	// [uTLS] RFC 8449: Enforce advertised record size limit.
+	// Per RFC 8449 Section 4: "A TLS endpoint that receives a record larger
+	// than its advertised limit MUST generate a fatal 'record_overflow' alert."
+	// This check applies to the inner plaintext after decryption.
+	// In TLS 1.3, the advertised limit includes the content type byte.
+	if c.utls.advertisedRecordSizeLimit > 0 && len(data) > int(c.utls.advertisedRecordSizeLimit) {
 		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
 	}
 
@@ -885,7 +917,8 @@ func (c *Conn) sendAlertLocked(err alert) error {
 	}
 
 	switch err {
-	case alertNoRenegotiation, alertCloseNotify:
+	case alertNoRenegotiation, alertCloseNotify, alertUserCanceled:
+		// RFC 8446 Section 6.1: user_canceled "generally has AlertLevel=warning"
 		c.tmp[0] = alertLevelWarning
 	default:
 		c.tmp[0] = alertLevelError
@@ -941,7 +974,8 @@ const (
 //
 // [uTLS] This function also respects the negotiated record_size_limit (RFC 8449)
 // when the extension was negotiated. The limit applies to the inner plaintext.
-func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
+// Returns an error if an unknown cipher type is encountered.
+func (c *Conn) maxPayloadSizeForWrite(typ recordType) (int, error) {
 	// [uTLS] Determine the effective maximum plaintext based on record_size_limit.
 	// RFC 8449 Section 4: The limit is for the inner plaintext, which in TLS 1.3
 	// includes the content type byte. So for TLS 1.3, if limit is L, we can send
@@ -969,15 +1003,19 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 	}
 
 	if c.config.DynamicRecordSizingDisabled || typ != recordTypeApplicationData {
-		return effectiveMax
+		return effectiveMax, nil
 	}
 
 	if c.bytesSent.Load() >= recordSizeBoostThreshold {
-		return effectiveMax
+		return effectiveMax, nil
 	}
 
 	// Subtract TLS overheads to get the maximum payload size.
-	payloadBytes := tcpMSSEstimate - recordHeaderLen - c.out.explicitNonceLen()
+	explicitNonceLen, err := c.out.explicitNonceLen()
+	if err != nil {
+		return 0, err
+	}
+	payloadBytes := tcpMSSEstimate - recordHeaderLen - explicitNonceLen
 	if c.out.cipher != nil {
 		switch ciph := c.out.cipher.(type) {
 		case cipher.Stream:
@@ -993,7 +1031,7 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 			// payload size directly.
 			payloadBytes -= c.out.mac.Size()
 		default:
-			panic("unknown cipher type")
+			return 0, errUnknownCipherType
 		}
 	}
 	if c.vers == VersionTLS13 {
@@ -1004,14 +1042,14 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 	// Atomically increment and get the previous value (Add returns new value).
 	pkt := c.packetsSent.Add(1) - 1
 	if pkt > 1000 {
-		return effectiveMax // avoid overflow in multiply below
+		return effectiveMax, nil // avoid overflow in multiply below
 	}
 
 	n := payloadBytes * int(pkt+1)
 	if n > effectiveMax {
 		n = effectiveMax
 	}
-	return n
+	return n, nil
 }
 
 func (c *Conn) write(data []byte) (int, error) {
@@ -1075,7 +1113,11 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 	var n int
 	for len(data) > 0 {
 		m := len(data)
-		if maxPayload := c.maxPayloadSizeForWrite(typ); m > maxPayload {
+		maxPayload, err := c.maxPayloadSizeForWrite(typ)
+		if err != nil {
+			return n, err
+		}
+		if m > maxPayload {
 			m = maxPayload
 		}
 
@@ -1105,7 +1147,6 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 			paddingLen = c.config.RecordPadding.GeneratePadding()
 		}
 
-		var err error
 		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand(), paddingLen)
 		if err != nil {
 			return n, err
@@ -1246,6 +1287,11 @@ func (c *Conn) unmarshalHandshakeMessage(data []byte, transcript transcriptHash)
 	// case typeEncryptedExtensions:
 	// 	m = new(encryptedExtensionsMsg)
 	case typeEndOfEarlyData:
+		// RFC 9001 Section 8.3: The TLS EndOfEarlyData message is not used with QUIC.
+		// A server MUST treat receipt of this message as a connection error.
+		if c.quic != nil {
+			return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		}
 		m = new(endOfEarlyDataMsg)
 	case typeKeyUpdate:
 		m = new(keyUpdateMsg)
@@ -1583,6 +1629,7 @@ func (c *Conn) closeNotify() error {
 			// Check if we should skip close_notify entirely (mimics browser abrupt close)
 			if jitterCfg.ShouldSkip() {
 				c.closeNotifySent = true
+				c.closeNotifySeq++ // Increment sequence to signal state change
 				// No error - skipping is intentional behavior
 				c.closeNotifyErr = nil
 				return nil
@@ -1590,12 +1637,22 @@ func (c *Conn) closeNotify() error {
 
 			// Apply random delay before sending close_notify
 			if delay := jitterCfg.GetDelay(); delay > 0 {
+				// Capture sequence number before releasing lock to detect ABA race.
+				// If another goroutine modifies closeNotify state while we sleep,
+				// the sequence will change and we'll know state was modified.
+				seqBefore := c.closeNotifySeq
+
 				// Unlock while sleeping to avoid blocking other operations
 				c.out.Unlock()
 				time.Sleep(delay)
 				c.out.Lock()
-				// Re-check after sleeping in case another goroutine sent it
-				if c.closeNotifySent {
+
+				// Check sequence number to detect if state changed during sleep.
+				// This handles the ABA problem: even if closeNotifySent is still false,
+				// a sequence change indicates concurrent activity occurred.
+				if c.closeNotifySeq != seqBefore || c.closeNotifySent {
+					// State changed while we were sleeping; return current state.
+					// Another goroutine handled (or is handling) the close_notify.
 					return c.closeNotifyErr
 				}
 			}
@@ -1606,6 +1663,7 @@ func (c *Conn) closeNotify() error {
 		c.SetWriteDeadline(time.Now().Add(c.config.closeNotifyTimeout()))
 		c.closeNotifyErr = c.sendAlertLocked(alertCloseNotify)
 		c.closeNotifySent = true
+		c.closeNotifySeq++ // Increment sequence to signal state change
 		// Any subsequent writes will fail.
 		c.SetWriteDeadline(time.Now())
 	}
@@ -1737,8 +1795,10 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 			// Truncate the text of the alert to 0 characters.
 			c.handshakeErr = fmt.Errorf("%w%.0w", c.handshakeErr, AlertError(a))
 		}
-		close(c.quic.blockedc)
-		close(c.quic.signalc)
+		// Use thread-safe channel close to prevent "send on closed channel" panic.
+		// The closeChannels method uses sync.Once to ensure channels are closed
+		// exactly once, even if multiple goroutines attempt to close them.
+		c.quic.closeChannels()
 	}
 
 	return c.handshakeErr

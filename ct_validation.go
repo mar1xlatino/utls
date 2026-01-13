@@ -198,7 +198,8 @@ func (sct *SignedCertificateTimestamp) Verify(cert *x509.Certificate, issuerKeyH
 	}
 
 	// Verify the signature
-	return sct.verifySignature(hash, logKey)
+	// Note: Ed25519 requires the raw signedData, not the hash
+	return sct.verifySignature(hash, signedData, logKey)
 }
 
 // buildCertSignedData builds the signed data for an X.509 certificate entry
@@ -338,7 +339,8 @@ func (sct *SignedCertificateTimestamp) hashSignedData(data []byte) ([]byte, erro
 }
 
 // verifySignature verifies the SCT signature over the hashed data
-func (sct *SignedCertificateTimestamp) verifySignature(hash []byte, pubKey crypto.PublicKey) error {
+// signedData is the raw data before hashing (needed for Ed25519)
+func (sct *SignedCertificateTimestamp) verifySignature(hash, signedData []byte, pubKey crypto.PublicKey) error {
 	switch sct.Signature.Algorithm.Signature {
 	case 1: // RSA
 		rsaKey, ok := pubKey.(*rsa.PublicKey)
@@ -364,9 +366,8 @@ func (sct *SignedCertificateTimestamp) verifySignature(hash []byte, pubKey crypt
 		if !ok {
 			return errors.New("tls: SCT signature algorithm Ed25519 but key is not Ed25519")
 		}
-		// Ed25519 uses the raw message, not a hash
-		// This is a simplification - in practice, the signed data should be passed directly
-		if !ed25519.Verify(ed25519Key, hash, sct.Signature.Signature) {
+		// Ed25519 uses the raw message, not a hash (RFC 8032)
+		if !ed25519.Verify(ed25519Key, signedData, sct.Signature.Signature) {
 			return errors.New("tls: invalid Ed25519 signature in SCT")
 		}
 		return nil

@@ -108,6 +108,7 @@ const (
 // TLS extension numbers
 const (
 	extensionServerName              uint16 = 0
+	extensionMaxFragmentLength       uint16 = 1  // RFC 6066
 	extensionStatusRequest           uint16 = 5
 	extensionSupportedCurves         uint16 = 10 // supported_groups in TLS 1.3, see RFC 8446, Section 4.2.7
 	extensionSupportedPoints         uint16 = 11
@@ -116,6 +117,7 @@ const (
 	extensionStatusRequestV2         uint16 = 17
 	extensionSCT                     uint16 = 18
 	extensionExtendedMasterSecret    uint16 = 23
+	extensionCompressCertificate     uint16 = 27 // RFC 8879
 	extensionRecordSizeLimit         uint16 = 28 // RFC 8449
 	extensionDelegatedCredentials    uint16 = 34
 	extensionSessionTicket           uint16 = 35
@@ -153,14 +155,36 @@ const (
 	CurveP521      CurveID = 25
 	X25519         CurveID = 29
 	X25519MLKEM768 CurveID = 4588
+
+	// Post-quantum hybrid key exchange mechanisms (TLS 1.3 only)
+	// These combine classical ECDHE with post-quantum ML-KEM (Kyber) for hybrid security.
+	// See IANA TLS Supported Groups registry and draft-ietf-tls-ecdhe-mlkem.
+	SecP256r1MLKEM768  CurveID = 4587 // P-256 + ML-KEM-768 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+	SecP384r1MLKEM1024 CurveID = 4589 // P-384 + ML-KEM-1024 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
 )
 
+// isTLS13OnlyKeyExchange reports whether the curve/group is only supported in TLS 1.3.
+// All post-quantum hybrid key exchanges are TLS 1.3 only.
 func isTLS13OnlyKeyExchange(curve CurveID) bool {
-	return curve == X25519MLKEM768
+	return isPQKeyExchange(curve)
 }
 
+// isPQKeyExchange reports whether the curve/group is a post-quantum hybrid key exchange.
+// These mechanisms combine classical ECDHE with post-quantum algorithms (ML-KEM/Kyber)
+// for security against both classical and quantum adversaries.
+//
+// Supported PQ key exchanges:
+//   - X25519MLKEM768 (4588): X25519 + ML-KEM-768, IETF standard
+//   - X25519Kyber768Draft00 (0x6399): X25519 + Kyber768, legacy draft (Chrome 115-130)
+//   - SecP256r1MLKEM768 (4587): P-256 + ML-KEM-768, IETF standard (draft-ietf-tls-ecdhe-mlkem-03)
+//   - SecP384r1MLKEM1024 (4589): P-384 + ML-KEM-1024, IETF standard (draft-ietf-tls-ecdhe-mlkem-03)
 func isPQKeyExchange(curve CurveID) bool {
-	return curve == X25519MLKEM768
+	switch curve {
+	case X25519MLKEM768, X25519Kyber768Draft00, SecP256r1MLKEM768, SecP384r1MLKEM1024:
+		return true
+	default:
+		return false
+	}
 }
 
 // TLS 1.3 Key Share. See RFC 8446, Section 4.2.8.
@@ -727,6 +751,42 @@ type Config struct {
 	// [uTLS] This is a uTLS extension implementing RFC 9345.
 	AcceptDelegatedCredentials bool // [uTLS]
 
+	// ServerCertCompressionAlgorithms specifies which certificate compression
+	// algorithms (RFC 8879) the server supports. When a client advertises
+	// compress_certificate extension with one of these algorithms, the server
+	// will compress its certificate chain using the first mutually supported algorithm.
+	//
+	// Supported algorithms:
+	//   - CertCompressionZlib (1)   - zlib/DEFLATE compression
+	//   - CertCompressionBrotli (2) - Brotli compression (preferred, best ratio)
+	//   - CertCompressionZstd (3)   - Zstandard compression (fast)
+	//
+	// The order matters: the server will use the first algorithm from this list
+	// that the client also supports. For best compatibility, use:
+	//   []CertCompressionAlgo{CertCompressionBrotli, CertCompressionZlib, CertCompressionZstd}
+	//
+	// When nil or empty (default), the server does not compress certificates.
+	// [uTLS] This is a uTLS extension implementing RFC 8879.
+	ServerCertCompressionAlgorithms []CertCompressionAlgo // [uTLS]
+
+	// ServerMaxEarlyData specifies the maximum amount of 0-RTT (early data)
+	// the server will accept on non-QUIC connections. When non-zero, the server
+	// will advertise this value in session tickets and accept early data from
+	// clients using those tickets.
+	//
+	// For QUIC connections, this value is ignored and 0xffffffff is used per RFC 9001.
+	//
+	// When zero (default), 0-RTT is disabled for non-QUIC connections.
+	// Typical values: 16384 (16KB) is a safe default that covers most use cases.
+	//
+	// Security considerations:
+	//   - 0-RTT data is replayable by network attackers
+	//   - Only non-mutating, idempotent requests should be sent as 0-RTT
+	//   - Applications must implement replay protection for sensitive operations
+	//
+	// [uTLS] This is a uTLS extension for non-QUIC 0-RTT support.
+	ServerMaxEarlyData uint32 // [uTLS]
+
 	// OmitEmptyPsk determines whether utls will automatically conceal
 	// the psk extension when it is empty. When the psk extension is empty, the
 	// browser omits it from the client hello. Utls can mimic this behavior,
@@ -1200,6 +1260,13 @@ func (c *Config) Clone() *Config {
 		copy(autoSessionKeys, c.autoSessionTicketKeys)
 	}
 
+	// Deep copy ServerCertCompressionAlgorithms slice [uTLS]
+	var serverCertCompAlgos []CertCompressionAlgo
+	if c.ServerCertCompressionAlgorithms != nil {
+		serverCertCompAlgos = make([]CertCompressionAlgo, len(c.ServerCertCompressionAlgorithms))
+		copy(serverCertCompAlgos, c.ServerCertCompressionAlgorithms)
+	}
+
 	return &Config{
 		Rand:                                c.Rand,
 		Time:                                c.Time,
@@ -1248,8 +1315,10 @@ func (c *Config) Clone() *Config {
 		sessionTicketKeys:                   sessionKeys,
 		autoSessionTicketKeys:               autoSessionKeys,
 
-		PreferSkipResumptionOnNilExtension: c.PreferSkipResumptionOnNilExtension, // [UTLS]
-		PSKBinderConstantTime:              c.PSKBinderConstantTime,              // [uTLS]
+		PreferSkipResumptionOnNilExtension:  c.PreferSkipResumptionOnNilExtension,  // [UTLS]
+		PSKBinderConstantTime:               c.PSKBinderConstantTime,               // [uTLS]
+		ServerCertCompressionAlgorithms:     serverCertCompAlgos,                   // [uTLS]
+		ServerMaxEarlyData:                  c.ServerMaxEarlyData,                  // [uTLS]
 	}
 }
 
@@ -1259,12 +1328,13 @@ var deprecatedSessionTicketKey = []byte("DEPRECATED")
 
 // initLegacySessionTicketKeyRLocked ensures the legacy SessionTicketKey field is
 // randomized if empty, and that sessionTicketKeys is populated from it otherwise.
-func (c *Config) initLegacySessionTicketKeyRLocked() {
+// Returns an error if random number generation fails.
+func (c *Config) initLegacySessionTicketKeyRLocked() error {
 	// Don't write if SessionTicketKey is already defined as our deprecated string,
 	// or if it is defined by the user but sessionTicketKeys is already set.
 	if c.SessionTicketKey != [32]byte{} &&
 		(bytes.HasPrefix(c.SessionTicketKey[:], deprecatedSessionTicketKey) || len(c.sessionTicketKeys) > 0) {
-		return
+		return nil
 	}
 
 	// We need to write some data, so get an exclusive lock and re-check any conditions.
@@ -1274,7 +1344,7 @@ func (c *Config) initLegacySessionTicketKeyRLocked() {
 	defer c.mutex.Unlock()
 	if c.SessionTicketKey == [32]byte{} {
 		if _, err := io.ReadFull(c.rand(), c.SessionTicketKey[:]); err != nil {
-			panic(fmt.Sprintf("tls: unable to generate random session ticket key: %v", err))
+			return fmt.Errorf("tls: unable to generate random session ticket key: %w", err)
 		}
 		// Write the deprecated prefix at the beginning so we know we created
 		// it. This key with the DEPRECATED prefix isn't used as an actual
@@ -1285,6 +1355,7 @@ func (c *Config) initLegacySessionTicketKeyRLocked() {
 		c.sessionTicketKeys = []ticketKey{c.ticketKeyFromBytes(c.SessionTicketKey)}
 	}
 
+	return nil
 }
 
 // ticketKeys returns the ticketKeys for this connection.
@@ -1296,19 +1367,24 @@ func (c *Config) initLegacySessionTicketKeyRLocked() {
 // encrypting tickets (ie. the first ticketKey in c.sessionTicketKeys)
 // is not fresh, then a new session ticket key will be
 // created and prepended to c.sessionTicketKeys.
-func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
+// Returns an error if random number generation fails during key rotation.
+func (c *Config) ticketKeys(configForClient *Config) ([]ticketKey, error) {
 	// If the ConfigForClient callback returned a Config with explicitly set
 	// keys, use those, otherwise just use the original Config.
 	if configForClient != nil {
 		configForClient.mutex.RLock()
 		if configForClient.SessionTicketsDisabled {
-			return nil
+			configForClient.mutex.RUnlock()
+			return nil, nil
 		}
-		configForClient.initLegacySessionTicketKeyRLocked()
+		if err := configForClient.initLegacySessionTicketKeyRLocked(); err != nil {
+			configForClient.mutex.RUnlock()
+			return nil, err
+		}
 		if len(configForClient.sessionTicketKeys) != 0 {
 			ret := configForClient.sessionTicketKeys
 			configForClient.mutex.RUnlock()
-			return ret
+			return ret, nil
 		}
 		configForClient.mutex.RUnlock()
 	}
@@ -1316,15 +1392,17 @@ func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	if c.SessionTicketsDisabled {
-		return nil
+		return nil, nil
 	}
-	c.initLegacySessionTicketKeyRLocked()
+	if err := c.initLegacySessionTicketKeyRLocked(); err != nil {
+		return nil, err
+	}
 	if len(c.sessionTicketKeys) != 0 {
-		return c.sessionTicketKeys
+		return c.sessionTicketKeys, nil
 	}
 	// Fast path for the common case where the key is fresh enough.
 	if len(c.autoSessionTicketKeys) > 0 && c.time().Sub(c.autoSessionTicketKeys[0].created) < ticketKeyRotation {
-		return c.autoSessionTicketKeys
+		return c.autoSessionTicketKeys, nil
 	}
 
 	// autoSessionTicketKeys are managed by auto-rotation.
@@ -1336,7 +1414,7 @@ func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
 	if len(c.autoSessionTicketKeys) == 0 || c.time().Sub(c.autoSessionTicketKeys[0].created) >= ticketKeyRotation {
 		var newKey [32]byte
 		if _, err := io.ReadFull(c.rand(), newKey[:]); err != nil {
-			panic(fmt.Sprintf("unable to generate random session ticket key: %v", err))
+			return nil, fmt.Errorf("tls: unable to generate random session ticket key: %w", err)
 		}
 		valid := make([]ticketKey, 0, len(c.autoSessionTicketKeys)+1)
 		valid = append(valid, c.ticketKeyFromBytes(newKey))
@@ -1348,7 +1426,7 @@ func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
 		}
 		c.autoSessionTicketKeys = valid
 	}
-	return c.autoSessionTicketKeys
+	return c.autoSessionTicketKeys, nil
 }
 
 // SetSessionTicketKeys updates the session ticket keys for a server.
@@ -1356,7 +1434,7 @@ func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
 // The first key will be used when creating new tickets, while all keys can be
 // used for decrypting tickets. It is safe to call this function while the
 // server is running in order to rotate the session ticket keys. The function
-// will panic if keys is empty.
+// returns an error if keys is empty.
 //
 // Calling this function will turn off automatic session ticket key rotation.
 //
@@ -1364,9 +1442,9 @@ func (c *Config) ticketKeys(configForClient *Config) []ticketKey {
 // all have the same session ticket keys. If the session ticket keys leaks,
 // previously recorded and future TLS connections using those keys might be
 // compromised.
-func (c *Config) SetSessionTicketKeys(keys [][32]byte) {
+func (c *Config) SetSessionTicketKeys(keys [][32]byte) error {
 	if len(keys) == 0 {
-		panic("tls: keys must have at least one key")
+		return errors.New("tls: keys must have at least one key")
 	}
 
 	newKeys := make([]ticketKey, len(keys))
@@ -1377,6 +1455,7 @@ func (c *Config) SetSessionTicketKeys(keys [][32]byte) {
 	c.mutex.Lock()
 	c.sessionTicketKeys = newKeys
 	c.mutex.Unlock()
+	return nil
 }
 
 func (c *Config) rand() io.Reader {
@@ -1812,11 +1891,12 @@ func (c *Config) BuildNameToCertificate() {
 }
 
 const (
-	keyLogLabelTLS12           = "CLIENT_RANDOM"
-	keyLogLabelClientHandshake = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
-	keyLogLabelServerHandshake = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
-	keyLogLabelClientTraffic   = "CLIENT_TRAFFIC_SECRET_0"
-	keyLogLabelServerTraffic   = "SERVER_TRAFFIC_SECRET_0"
+	keyLogLabelTLS12              = "CLIENT_RANDOM"
+	keyLogLabelClientHandshake    = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelServerHandshake    = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+	keyLogLabelClientTraffic      = "CLIENT_TRAFFIC_SECRET_0"
+	keyLogLabelServerTraffic      = "SERVER_TRAFFIC_SECRET_0"
+	keyLogLabelClientEarlyTraffic = "CLIENT_EARLY_TRAFFIC_SECRET" // [uTLS] 0-RTT early data
 )
 
 func (c *Config) writeKeyLog(label string, clientRandom, secret []byte) error {
@@ -1934,10 +2014,16 @@ func (c *lruSessionCache) Put(sessionKey string, cs *ClientSessionState) {
 			delete(c.m, sessionKey)
 			return
 		} else {
-			entry := elem.Value.(*lruSessionCacheEntry)
-			entry.state = cs
-			c.q.MoveToFront(elem)
-			return
+			entry, ok := elem.Value.(*lruSessionCacheEntry)
+			if !ok {
+				// Corrupted cache entry type, remove and fall through to add new
+				c.q.Remove(elem)
+				delete(c.m, sessionKey)
+			} else {
+				entry.state = cs
+				c.q.MoveToFront(elem)
+				return
+			}
 		}
 	}
 
@@ -1954,7 +2040,14 @@ func (c *lruSessionCache) Put(sessionKey string, cs *ClientSessionState) {
 		c.m[sessionKey] = c.q.PushFront(entry)
 		return
 	}
-	entry := elem.Value.(*lruSessionCacheEntry)
+	entry, ok := elem.Value.(*lruSessionCacheEntry)
+	if !ok {
+		// Corrupted cache entry type, remove old and create new
+		c.q.Remove(elem)
+		newEntry := &lruSessionCacheEntry{sessionKey, cs}
+		c.m[sessionKey] = c.q.PushFront(newEntry)
+		return
+	}
 	delete(c.m, entry.sessionKey)
 	entry.sessionKey = sessionKey
 	entry.state = cs
@@ -1970,7 +2063,12 @@ func (c *lruSessionCache) Get(sessionKey string) (*ClientSessionState, bool) {
 
 	if elem, ok := c.m[sessionKey]; ok {
 		c.q.MoveToFront(elem)
-		return elem.Value.(*lruSessionCacheEntry).state, true
+		entry, ok := elem.Value.(*lruSessionCacheEntry)
+		if !ok {
+			// Corrupted cache entry type, return not found
+			return nil, false
+		}
+		return entry.state, true
 	}
 	return nil, false
 }

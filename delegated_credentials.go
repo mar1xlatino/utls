@@ -5,6 +5,7 @@
 package tls
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -26,9 +27,18 @@ var delegationUsageOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 44363, 44}
 // RFC 9345 Section 4.1 specifies 7 days maximum.
 const dcMaxTTLSeconds = 7 * 24 * 60 * 60
 
-// dcServerContext is the context string used in DC signature for server credentials.
-// Per RFC 9345 Section 4.1, this is 0x04 || 0x01 || DC credential.
-var dcServerContext = []byte{0x04, 0x01}
+// dcSignaturePrefix is the 64-byte prefix of 0x20 (space) used in DC signature computation.
+// Per RFC 9345 Section 4.1.1, the signature is computed over this prefix followed by
+// the context string, a null byte, the certificate, credential, and algorithm.
+var dcSignaturePrefix = bytes.Repeat([]byte{0x20}, 64)
+
+// dcServerContextString is the context string for server delegated credentials.
+// Per RFC 9345 Section 4.1.1: "TLS, server delegated credentials" (33 bytes).
+var dcServerContextString = []byte("TLS, server delegated credentials")
+
+// dcClientContextString is the context string for client delegated credentials.
+// Per RFC 9345 Section 4.1.1: "TLS, client delegated credentials" (33 bytes).
+var dcClientContextString = []byte("TLS, client delegated credentials")
 
 // DelegatedCredential represents a delegated credential per RFC 9345.
 // A delegated credential allows a TLS server to use a short-lived key pair
@@ -166,31 +176,63 @@ func (dc *DelegatedCredential) credentialBytes() []byte {
 }
 
 // Verify verifies the DC signature against the parent certificate.
-// Per RFC 9345 Section 4.1, the signed message is:
-//
-//	DelegationCertificate || DelegationContext || Credential
-//
-// where:
-//   - DelegationCertificate is the DER-encoded end-entity certificate
-//   - DelegationContext is 0x04 || 0x01 for server credentials
-//   - Credential is the DC credential (without signature)
+// Per RFC 9345 Section 4.1.1, the signed message is computed over:
+//  1. 64 bytes of 0x20 (space character)
+//  2. Context string "TLS, server delegated credentials" (33 bytes)
+//  3. Single 0x00 byte separator
+//  4. DER-encoded X.509 end-entity certificate
+//  5. DelegatedCredential.cred (valid_time + expected_cert_verify_algorithm + SPKI)
+//  6. DelegatedCredential.algorithm (2 bytes)
 func (dc *DelegatedCredential) Verify(cert *x509.Certificate) error {
-	// Check that the certificate has the DelegationUsage extension
-	if !hasDelegationUsage(cert) {
-		return errors.New("tls: certificate does not have DelegationUsage extension")
+	return dc.verify(cert, false)
+}
+
+// VerifyClient verifies the DC signature for client-side delegated credentials.
+// Uses the client context string per RFC 9345 Section 4.1.1.
+func (dc *DelegatedCredential) VerifyClient(cert *x509.Certificate) error {
+	return dc.verify(cert, true)
+}
+
+// verify is the internal verification function that handles both server and client DCs.
+func (dc *DelegatedCredential) verify(cert *x509.Certificate, isClient bool) error {
+	// RFC 9345 Section 4.2: rsaEncryption OID certificates cannot sign DCs.
+	// The rsa_pss_rsae_* algorithms use rsaEncryption OID and are prohibited.
+	switch dc.Algorithm {
+	case PSSWithSHA256, PSSWithSHA384, PSSWithSHA512: // 0x0804, 0x0805, 0x0806 - rsa_pss_rsae_*
+		return errors.New("tls: rsa_pss_rsae_* algorithms not allowed for delegated credentials per RFC 9345")
 	}
 
-	// Build the signed message per RFC 9345 Section 4.1
-	// SignedData = DER(certificate) || context || credential
+	// Check that the certificate has the DelegationUsage extension and digitalSignature KeyUsage
+	if !hasDelegationUsage(cert) {
+		return errors.New("tls: certificate does not have DelegationUsage extension or digitalSignature KeyUsage")
+	}
+
+	// Build the signed message per RFC 9345 Section 4.1.1:
+	// 64 bytes of 0x20 || context string || 0x00 || certificate || credential || algorithm
 	credential := dc.credentialBytes()
-	signedLen := len(cert.Raw) + len(dcServerContext) + len(credential)
-	signed := make([]byte, signedLen)
-	offset := 0
-	copy(signed[offset:], cert.Raw)
-	offset += len(cert.Raw)
-	copy(signed[offset:], dcServerContext)
-	offset += len(dcServerContext)
-	copy(signed[offset:], credential)
+
+	// Select context string based on whether this is a client or server DC
+	contextString := dcServerContextString
+	if isClient {
+		contextString = dcClientContextString
+	}
+
+	// Total length: 64 (prefix) + 33 (context) + 1 (null) + cert + credential + 2 (algorithm)
+	signedLen := 64 + len(contextString) + 1 + len(cert.Raw) + len(credential) + 2
+	signed := make([]byte, 0, signedLen)
+
+	// 1. 64 bytes of 0x20
+	signed = append(signed, dcSignaturePrefix...)
+	// 2. Context string
+	signed = append(signed, contextString...)
+	// 3. 0x00 separator
+	signed = append(signed, 0x00)
+	// 4. DER-encoded certificate
+	signed = append(signed, cert.Raw...)
+	// 5. Credential (valid_time + expected_cert_verify_algorithm + SPKI with length prefix)
+	signed = append(signed, credential...)
+	// 6. Algorithm (2 bytes big-endian)
+	signed = append(signed, byte(dc.Algorithm>>8), byte(dc.Algorithm))
 
 	// Verify signature using certificate's public key
 	sigType, sigHash, err := typeAndHashFromSignatureScheme(dc.Algorithm)
@@ -231,13 +273,9 @@ func (dc *DelegatedCredential) Verify(cert *x509.Certificate) error {
 		}
 
 	case signaturePKCS1v15:
-		pubKey, ok := cert.PublicKey.(*rsa.PublicKey)
-		if !ok {
-			return errors.New("tls: DC signature requires RSA key but certificate has different key type")
-		}
-		if err := rsa.VerifyPKCS1v15(pubKey, sigHash, digest, dc.Signature); err != nil {
-			return fmt.Errorf("tls: invalid delegated credential PKCS1v15 signature: %w", err)
-		}
+		// RFC 8446 Section 4.2.3: PKCS#1 v1.5 signatures MUST NOT be used with TLS 1.3.
+		// Delegated Credentials are TLS 1.3 only per RFC 9345.
+		return errors.New("tls: PKCS#1 v1.5 signatures not allowed for delegated credentials in TLS 1.3")
 
 	case signatureEd25519:
 		pubKey, ok := cert.PublicKey.(ed25519.PublicKey)
@@ -276,10 +314,17 @@ func (dc *DelegatedCredential) PublicKey() crypto.PublicKey {
 	return dc.publicKey
 }
 
-// hasDelegationUsage checks if the certificate has the DelegationUsage extension.
-// Per RFC 9345 Section 4.2, this extension must be present for a certificate
-// to issue delegated credentials.
+// hasDelegationUsage checks if the certificate has the DelegationUsage extension
+// and the required digitalSignature KeyUsage bit set.
+// Per RFC 9345 Section 4.2:
+// - The certificate MUST have the digitalSignature KeyUsage set
+// - The DelegationUsage extension MUST be present
 func hasDelegationUsage(cert *x509.Certificate) bool {
+	// RFC 9345 Section 4.2: Certificate MUST have digitalSignature KeyUsage
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return false
+	}
+	// Check for DelegationUsage extension
 	for _, ext := range cert.Extensions {
 		if ext.Id.Equal(delegationUsageOID) {
 			return true

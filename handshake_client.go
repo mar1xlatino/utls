@@ -149,7 +149,7 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 	}
 
 	var keyShareKeys *keySharePrivateKeys
-	if hello.supportedVersions[0] == VersionTLS13 {
+	if len(hello.supportedVersions) > 0 && hello.supportedVersions[0] == VersionTLS13 {
 		// Reset the list of ciphers when the client only supports TLS 1.3.
 		if len(hello.supportedVersions) == 1 {
 			hello.cipherSuites = nil
@@ -193,6 +193,56 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 			if slices.Contains(hello.supportedCurves, X25519) {
 				hello.keyShares = append(hello.keyShares, keyShare{group: X25519, data: x25519EphemeralKey})
 			}
+		} else if curveID == SecP256r1MLKEM768 {
+			// SecP256r1MLKEM768: P-256 + ML-KEM-768 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+			// Client key share format: P-256 public key (65 bytes) || ML-KEM-768 encapsulation key (1184 bytes)
+			keyShareKeys.ecdhe, err = generateECDHEKey(config.rand(), CurveP256)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			seed := make([]byte, mlkem.SeedSize)
+			if _, err := io.ReadFull(config.rand(), seed); err != nil {
+				return nil, nil, nil, err
+			}
+			keyShareKeys.mlkem, err = mlkem.NewDecapsulationKey768(seed)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			p256PublicKey := keyShareKeys.ecdhe.PublicKey().Bytes()
+			mlkemEncapsulationKey := keyShareKeys.mlkem.EncapsulationKey().Bytes()
+			// Format: ECDH public key first, then ML-KEM encapsulation key (per draft-ietf-tls-ecdhe-mlkem-03)
+			hello.keyShares = []keyShare{
+				{group: SecP256r1MLKEM768, data: append(p256PublicKey, mlkemEncapsulationKey...)},
+			}
+			// If P-256 is also in supported curves, add it as a fallback
+			if slices.Contains(hello.supportedCurves, CurveP256) {
+				hello.keyShares = append(hello.keyShares, keyShare{group: CurveP256, data: p256PublicKey})
+			}
+		} else if curveID == SecP384r1MLKEM1024 {
+			// SecP384r1MLKEM1024: P-384 + ML-KEM-1024 hybrid (draft-ietf-tls-ecdhe-mlkem-03)
+			// Client key share format: P-384 public key (97 bytes) || ML-KEM-1024 encapsulation key (1568 bytes)
+			keyShareKeys.ecdhe, err = generateECDHEKey(config.rand(), CurveP384)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			seed := make([]byte, mlkem.SeedSize)
+			if _, err := io.ReadFull(config.rand(), seed); err != nil {
+				return nil, nil, nil, err
+			}
+			keyShareKeys.mlkem1024, err = mlkem.NewDecapsulationKey1024(seed)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			p384PublicKey := keyShareKeys.ecdhe.PublicKey().Bytes()
+			mlkemEncapsulationKey := keyShareKeys.mlkem1024.EncapsulationKey().Bytes()
+			// Format: ECDH public key first, then ML-KEM encapsulation key
+			hello.keyShares = []keyShare{
+				{group: SecP384r1MLKEM1024, data: append(p384PublicKey, mlkemEncapsulationKey...)},
+			}
+			// If P-384 is also in supported curves, add it as a fallback
+			if slices.Contains(hello.supportedCurves, CurveP384) {
+				hello.keyShares = append(hello.keyShares, keyShare{group: CurveP384, data: p384PublicKey})
+			}
 		} else {
 			if _, ok := curveForCurveID(curveID); !ok {
 				return nil, nil, nil, errors.New("tls: CurvePreferences includes unsupported curve")
@@ -234,6 +284,10 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 		}
 		ech = &echClientContext{config: echConfig}
 		hello.encryptedClientHello = []byte{1} // indicate inner hello
+
+		// ECH spec Section 5.1: Inner ClientHello "MUST NOT offer to negotiate
+		// TLS 1.2 or below". We must strip all TLS 1.2-specific elements.
+
 		// We need to explicitly set these 1.2 fields to nil, as we do not
 		// marshal them when encoding the inner hello, otherwise transcripts
 		// will later mismatch.
@@ -241,6 +295,37 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 		hello.ticketSupported = false
 		hello.secureRenegotiationSupported = false
 		hello.extendedMasterSecret = false
+
+		// ECH spec Section 5.1: Filter supportedVersions to only include TLS 1.3+.
+		// The inner ClientHello must not offer to negotiate TLS 1.2 or below.
+		var tls13Versions []uint16
+		for _, v := range hello.supportedVersions {
+			if v >= VersionTLS13 {
+				tls13Versions = append(tls13Versions, v)
+			}
+		}
+		if len(tls13Versions) == 0 {
+			return nil, nil, nil, errors.New("tls: ECH requires TLS 1.3, but no TLS 1.3+ versions configured")
+		}
+		hello.supportedVersions = tls13Versions
+
+		// ECH spec Section 5.1: Filter cipher suites to only include TLS 1.3 suites.
+		// TLS 1.2 cipher suites must not be offered in the inner ClientHello.
+		var tls13Suites []uint16
+		for _, suite := range hello.cipherSuites {
+			if cipherSuiteTLS13ByID(suite) != nil {
+				tls13Suites = append(tls13Suites, suite)
+			}
+		}
+		if len(tls13Suites) == 0 {
+			return nil, nil, nil, errors.New("tls: ECH requires TLS 1.3 cipher suites, but none configured")
+		}
+		hello.cipherSuites = tls13Suites
+
+		// ECH spec Section 5.1: Clear TLS 1.2 session ticket.
+		// Session resumption via session tickets is a TLS 1.2 mechanism.
+		// TLS 1.3 uses PSK identities instead.
+		hello.sessionTicket = nil
 
 		echPK, err := hpke.ParseHPKEPublicKey(ech.config.KemID, ech.config.PublicKey)
 		if err != nil {
@@ -1013,8 +1098,15 @@ func (hs *clientHandshakeState) establishKeys() error {
 		}
 		serverHash = hs.suite.mac(serverMAC)
 	} else {
-		clientCipher = hs.suite.aead(clientKey, clientIV)
-		serverCipher = hs.suite.aead(serverKey, serverIV)
+		var err error
+		clientCipher, err = hs.suite.aead(clientKey, clientIV)
+		if err != nil {
+			return fmt.Errorf("tls: failed to create client AEAD cipher: %w", err)
+		}
+		serverCipher, err = hs.suite.aead(serverKey, serverIV)
+		if err != nil {
+			return fmt.Errorf("tls: failed to create server AEAD cipher: %w", err)
+		}
 	}
 
 	c.in.prepareCipherSpec(c.vers, serverCipher, serverHash)
@@ -1039,6 +1131,14 @@ func (hs *clientHandshakeState) processServerHello() (bool, error) {
 	if hs.serverHello.compressionMethod != compressionNone {
 		c.sendAlert(alertUnexpectedMessage)
 		return false, errors.New("tls: server selected unsupported compression format")
+	}
+
+	// RFC 8449 Section 5: max_fragment_length and record_size_limit are mutually exclusive.
+	// A client MUST treat receipt of both extensions as a fatal error and generate
+	// an "illegal_parameter" alert.
+	if hs.serverHello.hasMaxFragmentLength && hs.serverHello.recordSizeLimit > 0 {
+		c.sendAlert(alertIllegalParameter)
+		return false, errors.New("tls: server sent both max_fragment_length and record_size_limit extensions")
 	}
 
 	if c.handshakes == 0 && hs.serverHello.secureRenegotiationSupported {
