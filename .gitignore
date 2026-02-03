@@ -1,0 +1,33 @@
+# Go test binaries
+*.test
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go coverage
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fuzz corpus (optional - remove if you want to track corpus)
+testdata/fuzz/
+
+# Compiled example binaries
+tls-resumption
+
+# Build directories
+bin/
+dist/

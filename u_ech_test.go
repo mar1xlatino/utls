@@ -24,7 +24,7 @@ func TestGREASEECHWrite(t *testing.T) {
 			t.Fatalf("Failed to write all GREASE ECH extension bytes: %d != %d", n, len(testsuite.raw[4:]))
 		}
 
-		var gechBytes []byte = make([]byte, 1024)
+		gechBytes := make([]byte, 1024)
 		n, err = gech.Read(gechBytes)
 		if err != nil && !errors.Is(err, io.EOF) {
 			t.Fatalf("Failed to read GREASE ECH extension: %s", err)

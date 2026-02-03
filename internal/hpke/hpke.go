@@ -12,13 +12,14 @@ import (
 	"crypto/rand"
 	_ "crypto/sha256" // Register SHA-256 hash for HKDF
 	_ "crypto/sha512" // Register SHA-384 and SHA-512 hashes for HKDF
-	"errors"
 	"math/bits"
 	"sync"
 
 	"github.com/refraction-networking/utls/internal/byteorder"
 	"github.com/refraction-networking/utls/internal/hkdf"
 	"golang.org/x/crypto/chacha20poly1305"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ErrMessageLimitReached is returned when the HPKE message limit has been reached.
@@ -26,13 +27,13 @@ import (
 // For 12-byte nonces (AES-GCM, ChaCha20-Poly1305), this is 2^96 - 1 messages.
 // This error indicates a catastrophic failure - reaching this limit means
 // continuing would result in nonce reuse and complete security compromise.
-var ErrMessageLimitReached = errors.New("hpke: message limit reached")
+var ErrMessageLimitReached = utlserrors.New("hpke: message limit reached").AtError()
 
 // ErrExportOnlyMode is returned when Seal or Open is called on a context
 // configured with Export-only AEAD (0xFFFF). Per RFC 9180 Section 7.3,
 // Export-only mode does not provide encryption/decryption capabilities
 // and MUST NOT be used with Seal or Open.
-var ErrExportOnlyMode = errors.New("hpke: seal/open not available in export-only mode")
+var ErrExportOnlyMode = utlserrors.New("hpke: seal/open not available in export-only mode").AtError()
 
 // testingOnlyGenerateKey is only used during testing, to provide
 // a fixed test key to use when checking the RFC 9180 vectors.
@@ -100,7 +101,7 @@ var SupportedKEMs = map[uint16]struct {
 func newDHKem(kemID uint16) (*dhKEM, error) {
 	suite, ok := SupportedKEMs[kemID]
 	if !ok {
-		return nil, errors.New("unsupported suite ID")
+		return nil, utlserrors.New("hpke: unsupported suite ID").AtError()
 	}
 	return &dhKEM{
 		dh:      suite.curve,
@@ -277,13 +278,13 @@ func newContext(sharedSecret []byte, kemID, kdfID, aeadID uint16, info []byte) (
 
 	kdfInit, ok := SupportedKDFs[kdfID]
 	if !ok {
-		return nil, errors.New("unsupported KDF id")
+		return nil, utlserrors.New("hpke: unsupported KDF id").AtError()
 	}
 	kdf := kdfInit()
 
 	aeadInfo, ok := SupportedAEADs[aeadID]
 	if !ok {
-		return nil, errors.New("unsupported AEAD id")
+		return nil, utlserrors.New("hpke: unsupported AEAD id").AtError()
 	}
 
 	// Check if this is export-only mode
@@ -388,7 +389,14 @@ func SetupRecipient(kemID, kdfID, aeadID uint16, priv *ecdh.PrivateKey, info, en
 	return &Recipient{context}, nil
 }
 
+// nextNonce computes the nonce for the current sequence number by XORing
+// the base nonce with the sequence number. This function MUST NOT be called
+// in export-only mode (when ctx.aead is nil) as there is no AEAD to derive
+// nonce size from. Callers (Seal/Open) must check exportOnly before calling.
 func (ctx *context) nextNonce() []byte {
+	if ctx.aead == nil {
+		panic("hpke: nextNonce called in export-only mode - this is a bug in the HPKE implementation")
+	}
 	nonce := ctx.seqNum.bytes()[16-ctx.aead.NonceSize():]
 	for i := range ctx.baseNonce {
 		nonce[i] ^= ctx.baseNonce[i]
@@ -397,7 +405,9 @@ func (ctx *context) nextNonce() []byte {
 }
 
 // incrementNonce increments the sequence number and returns an error if the
-// message limit has been reached.
+// message limit has been reached. This function MUST NOT be called in
+// export-only mode (when ctx.aead is nil). Callers (Seal/Open) must check
+// exportOnly before calling.
 //
 // Message limit is, according to RFC 9180, 2^(8*Nn - 1) where Nn is the
 // nonce size. For 12-byte nonces, this is 2^95 messages - an astronomically
@@ -411,6 +421,9 @@ func (ctx *context) nextNonce() []byte {
 // We allow sequence numbers from 0 to 2^(8*Nn-1) - 1, meaning 2^(8*Nn-1) messages total.
 // The error triggers when seqNum >= 2^(8*Nn-1), i.e., when bitLen >= 8*Nn.
 func (ctx *context) incrementNonce() error {
+	if ctx.aead == nil {
+		panic("hpke: incrementNonce called in export-only mode - this is a bug in the HPKE implementation")
+	}
 	// Message limit: 2^(8*Nn - 1) messages allowed.
 	// After sending the last valid message (seqNum = 2^(8*Nn-1) - 1, which has bitLen = 8*Nn-1),
 	// incrementing would make seqNum = 2^(8*Nn-1), which has bitLen = 8*Nn.
@@ -516,7 +529,7 @@ func suiteID(kemID, kdfID, aeadID uint16) []byte {
 func ParseHPKEPublicKey(kemID uint16, bytes []byte) (*ecdh.PublicKey, error) {
 	kemInfo, ok := SupportedKEMs[kemID]
 	if !ok {
-		return nil, errors.New("unsupported KEM id")
+		return nil, utlserrors.New("hpke: unsupported KEM id").AtError()
 	}
 	return kemInfo.curve.NewPublicKey(bytes)
 }
@@ -524,7 +537,7 @@ func ParseHPKEPublicKey(kemID uint16, bytes []byte) (*ecdh.PublicKey, error) {
 func ParseHPKEPrivateKey(kemID uint16, bytes []byte) (*ecdh.PrivateKey, error) {
 	kemInfo, ok := SupportedKEMs[kemID]
 	if !ok {
-		return nil, errors.New("unsupported KEM id")
+		return nil, utlserrors.New("hpke: unsupported KEM id").AtError()
 	}
 	return kemInfo.curve.NewPrivateKey(bytes)
 }

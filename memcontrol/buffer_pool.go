@@ -34,18 +34,19 @@
 package memcontrol
 
 import (
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // Buffer pool errors for defensive programming
 // DOS-017 FIX: Return errors instead of panics to prevent server crashes
 var (
-	ErrBufferNegativeSize  = errors.New("tls: invalid buffer size")
-	ErrBufferTooLarge      = errors.New("tls: buffer size exceeds maximum")
-	ErrBufferPoolExhausted = errors.New("tls: memory limit exceeded")
+	ErrBufferNegativeSize  = utlserrors.New("tls: invalid buffer size").AtError()
+	ErrBufferTooLarge      = utlserrors.New("tls: buffer size exceeds maximum").AtError()
+	ErrBufferPoolExhausted = utlserrors.New("tls: memory limit exceeded").AtError()
 )
 
 // Pool size tiers based on REALITY TLS allocation profile analysis

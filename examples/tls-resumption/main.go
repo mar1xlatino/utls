@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
 
 type ClientSessionCache struct {
+	mu            sync.Mutex
 	sessionKeyMap map[string]*tls.ClientSessionState
 }
 
@@ -20,6 +22,8 @@ func NewClientSessionCache() tls.ClientSessionCache {
 }
 
 func (csc *ClientSessionCache) Get(sessionKey string) (session *tls.ClientSessionState, ok bool) {
+	csc.mu.Lock()
+	defer csc.mu.Unlock()
 	if session, ok = csc.sessionKeyMap[sessionKey]; ok {
 		fmt.Printf("Getting session for %s\n", sessionKey)
 		return session, true
@@ -29,6 +33,8 @@ func (csc *ClientSessionCache) Get(sessionKey string) (session *tls.ClientSessio
 }
 
 func (csc *ClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
+	csc.mu.Lock()
+	defer csc.mu.Unlock()
 	if cs == nil {
 		fmt.Printf("Deleting session for %s\n", sessionKey)
 		delete(csc.sessionKeyMap, sessionKey)

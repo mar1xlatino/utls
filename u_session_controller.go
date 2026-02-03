@@ -1,10 +1,10 @@
 package tls
 
 import (
-	"errors"
-	"fmt"
+	"context"
 	"sync"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/tls13"
 )
 
@@ -117,8 +117,9 @@ func (s *sessionController) utlsAboutToLoadSession() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !(s.state == NoSession && !s.locked) {
-		return errors.New("tls: aboutToLoadSession failed: must only load session when the session of the client hello is not locked and when there's currently no session")
+		return utlserrors.New("tls: aboutToLoadSession failed: must only load session when the session of the client hello is not locked and when there's currently no session").AtError()
 	}
+	utlserrors.LogDebug(context.Background(), "session controller: about to load session")
 	s.loadSessionTracker = UtlsAboutToCall
 	return nil
 }
@@ -127,7 +128,7 @@ func (s *sessionController) utlsAboutToLoadSession() error {
 // Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertHelloNotBuilt(caller string) error {
 	if s.uconnRef.clientHelloBuildStatus != NotBuilt {
-		return fmt.Errorf("tls: %s failed: we can't modify the session after the clientHello is built", caller)
+		return utlserrors.New("tls: ", caller, " failed: we can't modify the session after the clientHello is built").AtError()
 	}
 	return nil
 }
@@ -138,7 +139,7 @@ func (s *sessionController) assertControllerState(caller string, desired session
 	if s.state != desired && !anyTrue(moreDesiredStates, func(_ int, state *sessionControllerState) bool {
 		return s.state == *state
 	}) {
-		return fmt.Errorf("tls: %s failed: undesired controller state %d", caller, s.state)
+		return utlserrors.New("tls: ", caller, " failed: undesired controller state ", s.state).AtError()
 	}
 	return nil
 }
@@ -147,7 +148,7 @@ func (s *sessionController) assertControllerState(caller string, desired session
 // Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertNotLocked(caller string) error {
 	if s.locked {
-		return fmt.Errorf("tls: %s failed: you must not modify the session after it's locked", caller)
+		return utlserrors.New("tls: ", caller, " failed: you must not modify the session after it's locked").AtError()
 	}
 	return nil
 }
@@ -156,7 +157,7 @@ func (s *sessionController) assertNotLocked(caller string) error {
 // Internal helper - caller must hold s.mu lock.
 func (s *sessionController) assertCanSkip(caller, extensionName string) error {
 	if !s.uconnRef.skipResumptionOnNilExtension {
-		return fmt.Errorf("tls: %s failed: session resumption is enabled, but there is no %s in the ClientHelloSpec; Please consider provide one in the ClientHelloSpec; If this is intentional, you may consider disable resumption by setting Config.SessionTicketsDisabled to true, or set Config.PreferSkipResumptionOnNilExtension to true to suppress this exception", caller, extensionName)
+		return utlserrors.New("tls: ", caller, " failed: session resumption is enabled, but there is no ", extensionName, " in the ClientHelloSpec; Please consider provide one in the ClientHelloSpec; If this is intentional, you may consider disable resumption by setting Config.SessionTicketsDisabled to true, or set Config.PreferSkipResumptionOnNilExtension to true to suppress this exception").AtError()
 	}
 	return nil
 }
@@ -174,6 +175,7 @@ func (s *sessionController) finalCheck() error {
 		return err
 	}
 	s.locked = true
+	utlserrors.LogDebug(context.Background(), "session controller: final check passed, state locked, finalState=", s.state)
 	return nil
 }
 
@@ -181,7 +183,7 @@ func (s *sessionController) finalCheck() error {
 func errOnNil(caller string, params ...any) error {
 	for i, p := range params {
 		if p == nil {
-			return fmt.Errorf("tls: %s failed: the [%d] parameter is nil", caller, i)
+			return utlserrors.New("tls: ", caller, " failed: the [", i, "] parameter is nil").AtError()
 		}
 	}
 	return nil
@@ -190,17 +192,17 @@ func errOnNil(caller string, params ...any) error {
 // initializationGuardWithErr is an error-returning version of initializationGuard.
 func initializationGuardWithErr[E Initializable, I func(E)](extension E, initializer I) error {
 	if extension.IsInitialized() {
-		return errors.New("tls: initialization failed: the extension is already initialized")
+		return utlserrors.New("tls: initialization failed: the extension is already initialized").AtError()
 	}
 	initializer(extension)
 	if !extension.IsInitialized() {
 		// Check if the extension provides a specific error reason
 		if errProvider, ok := any(extension).(InitErrorProvider); ok {
 			if initErr := errProvider.GetInitError(); initErr != nil {
-				return fmt.Errorf("tls: initialization failed: %w", initErr)
+				return utlserrors.New("tls: initialization failed").Base(initErr).AtError()
 			}
 		}
-		return errors.New("tls: initialization failed: the extension is not initialized after initialization")
+		return utlserrors.New("tls: initialization failed: the extension is not initialized after initialization").AtError()
 	}
 	return nil
 }
@@ -235,6 +237,7 @@ func (s *sessionController) initSessionTicketExt(session *SessionState, ticket [
 		return err
 	}
 	s.state = SessionTicketExtInitialized
+	utlserrors.LogDebug(context.Background(), "session controller: session ticket extension initialized, ticketSize=", len(ticket))
 	return nil
 }
 
@@ -275,6 +278,7 @@ func (s *sessionController) initPskExt(session *SessionState, earlySecret *tls13
 		return err
 	}
 	s.state = PskExtInitialized
+	utlserrors.LogDebug(context.Background(), "session controller: PSK extension initialized, identities=", len(pskIdentities))
 	return nil
 }
 
@@ -285,11 +289,12 @@ func (s *sessionController) setSessionTicketToUConn() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !(s.sessionTicketExt != nil && s.state == SessionTicketExtInitialized) {
-		return errors.New("tls: setSessionTicketExt failed: invalid state")
+		return utlserrors.New("tls: setSessionTicketExt failed: invalid state").AtError()
 	}
 	s.uconnRef.HandshakeState.Session = s.sessionTicketExt.GetSession()
 	s.uconnRef.HandshakeState.Hello.SessionTicket = s.sessionTicketExt.GetTicket()
 	s.state = SessionTicketExtAllSet
+	utlserrors.LogDebug(context.Background(), "session controller: session ticket set to UConn")
 	return nil
 }
 
@@ -300,7 +305,7 @@ func (s *sessionController) setPskToUConn() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !(s.pskExtension != nil && (s.state == PskExtInitialized || s.state == PskExtAllSet)) {
-		return errors.New("tls: setPskToUConn failed: invalid state")
+		return utlserrors.New("tls: setPskToUConn failed: invalid state").AtError()
 	}
 	pskCommon := s.pskExtension.GetPreSharedKeyCommon()
 	if s.state == PskExtInitialized {
@@ -308,6 +313,7 @@ func (s *sessionController) setPskToUConn() error {
 		s.uconnRef.HandshakeState.Session = pskCommon.Session
 		s.uconnRef.HandshakeState.Hello.PskIdentities = pskCommon.Identities
 		s.uconnRef.HandshakeState.Hello.PskBinders = pskCommon.Binders
+		utlserrors.LogDebug(context.Background(), "session controller: PSK initialized, identities=", len(pskCommon.Identities))
 	} else if s.state == PskExtAllSet {
 		bindersMatch := s.uconnRef.HandshakeState.Session == pskCommon.Session &&
 			sliceEq(s.uconnRef.HandshakeState.State13.EarlySecret, pskCommon.EarlySecret) &&
@@ -315,8 +321,9 @@ func (s *sessionController) setPskToUConn() error {
 				return pskCommon.Identities[i].ObfuscatedTicketAge == psk.ObfuscatedTicketAge && sliceEq(pskCommon.Identities[i].Label, psk.Label)
 			})
 		if !bindersMatch {
-			return errors.New("tls: setPskToUConn failed: only binders are allowed to change on state `PskAllSet`")
+			return utlserrors.New("tls: setPskToUConn failed: only binders are allowed to change on state PskAllSet").AtError()
 		}
+		utlserrors.LogDebug(context.Background(), "session controller: PSK binders updated")
 	}
 	s.uconnRef.HandshakeState.State13.BinderKey = pskCommon.BinderKey
 	s.state = PskExtAllSet
@@ -351,8 +358,9 @@ func (s *sessionController) updateBinders() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.shouldUpdateBindersLocked() {
-		return errors.New("tls: updateBinders failed: shouldn't update binders")
+		return utlserrors.New("tls: updateBinders failed: shouldn't update binders").AtError()
 	}
+	utlserrors.LogDebug(context.Background(), "session controller: updating PSK binders")
 	return s.pskExtension.PatchBuiltHello(s.uconnRef.HandshakeState.Hello)
 }
 
@@ -411,8 +419,9 @@ func (s *sessionController) overrideSessionTicketExt(sessionTicketExt ISessionTi
 func (s *sessionController) syncSessionExts() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	utlserrors.LogDebug(context.Background(), "session controller: syncing session extensions")
 	if s.uconnRef.clientHelloBuildStatus != NotBuilt {
-		return errors.New("tls: checkSessionExts failed: we can't modify the session after the clientHello is built")
+		return utlserrors.New("tls: checkSessionExts failed: we can't modify the session after the clientHello is built").AtError()
 	}
 	if err := s.assertNotLocked("checkSessionExts"); err != nil {
 		return err
@@ -429,7 +438,7 @@ func (s *sessionController) syncSessionExts() error {
 		switch ext := e.(type) {
 		case ISessionTicketExtension:
 			if numSessionExt != 0 {
-				return errors.New("tls: checkSessionExts failed: multiple ISessionTicketExtensions in the extension list")
+				return utlserrors.New("tls: checkSessionExts failed: multiple ISessionTicketExtensions in the extension list").AtError()
 			}
 			if s.sessionTicketExt == nil {
 				// If there isn't a user-provided session ticket extension, use the one from the spec
@@ -441,7 +450,7 @@ func (s *sessionController) syncSessionExts() error {
 			numSessionExt += 1
 		case PreSharedKeyExtension:
 			if i != len(s.uconnRef.Extensions)-1 {
-				return errors.New("tls: checkSessionExts failed: PreSharedKeyExtension must be the last extension")
+				return utlserrors.New("tls: checkSessionExts failed: PreSharedKeyExtension must be the last extension").AtError()
 			}
 			if s.pskExtension == nil {
 				// If there isn't a user-provided psk extension, use the one from the spec
@@ -456,21 +465,23 @@ func (s *sessionController) syncSessionExts() error {
 	}
 	if numSessionExt == 0 {
 		if s.state == SessionTicketExtInitialized {
-			return errors.New("tls: checkSessionExts failed: the user provided a session ticket, but the specification doesn't contain one")
+			return utlserrors.New("tls: checkSessionExts failed: the user provided a session ticket, but the specification doesn't contain one").AtError()
 		}
 		s.sessionTicketExt = nil
 		s.uconnRef.HandshakeState.Session = nil
 		s.uconnRef.HandshakeState.Hello.SessionTicket = nil
+		utlserrors.LogDebug(context.Background(), "session controller: no session ticket extension in spec")
 	}
 	if !hasPskExt {
 		if s.state == PskExtInitialized {
-			return errors.New("tls: checkSessionExts failed: the user provided a psk, but the specification doesn't contain one")
+			return utlserrors.New("tls: checkSessionExts failed: the user provided a psk, but the specification doesn't contain one").AtError()
 		}
 		s.pskExtension = nil
 		s.uconnRef.HandshakeState.State13.BinderKey = nil
 		s.uconnRef.HandshakeState.State13.EarlySecret = nil
 		s.uconnRef.HandshakeState.Session = nil
 		s.uconnRef.HandshakeState.Hello.PskIdentities = nil
+		utlserrors.LogDebug(context.Background(), "session controller: no PSK extension in spec")
 	}
 	return nil
 }
@@ -483,16 +494,17 @@ func (s *sessionController) onEnterLoadSessionCheck() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
-		return errors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: session is set and locked, no call to loadSession is allowed")
+		return utlserrors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: session is set and locked, no call to loadSession is allowed").AtError()
 	}
 	switch s.loadSessionTracker {
 	case UtlsAboutToCall, NeverCalled:
 		s.callingLoadSession = true
+		utlserrors.LogDebug(context.Background(), "session controller: entering loadSession, tracker=", s.loadSessionTracker)
 		return nil
 	case CalledByULoadSession, CalledByGoTLS:
-		return errors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: you must not call loadSession() twice")
+		return utlserrors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: you must not call loadSession() twice").AtError()
 	default:
-		return errors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: unimplemented state")
+		return utlserrors.New("tls: LoadSessionCoordinator.onEnterLoadSessionCheck failed: unimplemented state").AtError()
 	}
 }
 
@@ -504,15 +516,17 @@ func (s *sessionController) onLoadSessionReturn() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.callingLoadSession {
-		return errors.New("tls: LoadSessionCoordinator.onLoadSessionReturn failed: it's not loading sessions, perhaps this function is not being called by loadSession")
+		return utlserrors.New("tls: LoadSessionCoordinator.onLoadSessionReturn failed: it's not loading sessions, perhaps this function is not being called by loadSession").AtError()
 	}
 	switch s.loadSessionTracker {
 	case NeverCalled:
 		s.loadSessionTracker = CalledByGoTLS
+		utlserrors.LogDebug(context.Background(), "session controller: loadSession returned, calledBy=GoTLS")
 	case UtlsAboutToCall:
 		s.loadSessionTracker = CalledByULoadSession
+		utlserrors.LogDebug(context.Background(), "session controller: loadSession returned, calledBy=ULoadSession")
 	default:
-		return errors.New("tls: LoadSessionCoordinator.onLoadSessionReturn failed: unimplemented state")
+		return utlserrors.New("tls: LoadSessionCoordinator.onLoadSessionReturn failed: unimplemented state").AtError()
 	}
 	s.callingLoadSession = false
 	return nil
@@ -525,15 +539,17 @@ func (s *sessionController) shouldLoadSessionWriteBinders() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.callingLoadSession {
-		return false, errors.New("tls: shouldWriteBinders failed: LoadSessionCoordinator isn't loading sessions, perhaps this function is not being called by loadSession")
+		return false, utlserrors.New("tls: shouldWriteBinders failed: LoadSessionCoordinator isn't loading sessions, perhaps this function is not being called by loadSession").AtError()
 	}
 
 	switch s.loadSessionTracker {
 	case NeverCalled:
+		utlserrors.LogDebug(context.Background(), "session controller: should write binders (NeverCalled)")
 		return true, nil
 	case UtlsAboutToCall:
+		utlserrors.LogDebug(context.Background(), "session controller: should not write binders (UtlsAboutToCall)")
 		return false, nil
 	default:
-		return false, errors.New("tls: shouldWriteBinders failed: unimplemented state")
+		return false, utlserrors.New("tls: shouldWriteBinders failed: unimplemented state").AtError()
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/memcontrol"
 )
 
@@ -39,7 +40,7 @@ const (
 // ErrExtensionsLocked is returned when attempting to modify Extensions after
 // BuildHandshakeState() has been called. This prevents race conditions between
 // user code modifying Extensions and the handshake goroutine iterating over it.
-var ErrExtensionsLocked = errors.New("tls: cannot modify extensions after BuildHandshakeState() has been called")
+var ErrExtensionsLocked = utlserrors.New("tls: cannot modify extensions after BuildHandshakeState() has been called").AtError()
 
 // UConn is the main uTLS connection type, embedding the standard crypto/tls Conn
 // with additional fingerprinting capabilities. It allows mimicking the TLS fingerprint
@@ -152,7 +153,7 @@ type UConn struct {
 //   - config has empty ServerName and InsecureSkipVerify is false
 func UClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) (*UConn, error) {
 	if conn == nil {
-		return nil, errors.New("tls: UClient requires non-nil connection for non-QUIC usage; for QUIC, use UQUICClient instead")
+		return nil, utlserrors.New("tls: UClient requires non-nil connection for non-QUIC usage; for QUIC, use UQUICClient instead").AtError()
 	}
 	// Validate config requirements early to provide clear error messages.
 	// Either ServerName must be set for hostname verification, or InsecureSkipVerify
@@ -161,7 +162,7 @@ func UClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) (*UConn
 	// Note: nil config is allowed and will be initialized later, with validation
 	// occurring during handshake when ServerName could be set via SetSNI().
 	if config != nil && len(config.ServerName) == 0 && !config.InsecureSkipVerify && len(config.InsecureServerNameToVerify) == 0 {
-		return nil, errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
+		return nil, utlserrors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true").AtError()
 	}
 	return uClient(conn, config, clientHelloID), nil
 }
@@ -200,6 +201,15 @@ func uClient(conn net.Conn, config *Config, clientHelloID ClientHelloID) *UConn 
 	// Users can disable with: uconn.SetHandshakeTimingConfig(nil)
 	if uconn.handshakeTimingConfig == nil {
 		uconn.handshakeTimingConfig = TimingConfigForClientHelloID(clientHelloID)
+	}
+
+	// [uTLS] Notify observability hook of connection start.
+	// Only call if conn is non-nil (QUIC connections have nil conn) and RemoteAddr is non-nil.
+	// Some mock connections in tests may have nil RemoteAddr.
+	if conn != nil {
+		if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+			callOnConnectionStart(remoteAddr.String())
+		}
 	}
 
 	return &uconn
@@ -264,7 +274,7 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 			return nil
 		}
 		if uconn.clientHelloBuildStatus != NotBuilt {
-			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built previously")
+			return utlserrors.New("BuildHandshakeState failed: invalid call, client hello has already been built previously").AtError()
 		}
 
 		// use default Golang ClientHello.
@@ -280,7 +290,11 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		uconn.clientHelloBuildStatus = BuildByGoTLS
 	} else {
 		if !(uconn.clientHelloBuildStatus == BuildByUtls || uconn.clientHelloBuildStatus == NotBuilt) {
-			return errors.New("BuildHandshakeState failed: invalid call, client hello has already been built by go-tls")
+			return utlserrors.New("BuildHandshakeState failed: invalid call, client hello has already been built by go-tls").AtError()
+		}
+		// Return early if already built to prevent double-marshal that breaks REALITY AEAD
+		if uconn.clientHelloBuildStatus == BuildByUtls {
+			return nil
 		}
 		if uconn.clientHelloBuildStatus == NotBuilt {
 			err := uconn.applyPresetByID(uconn.ClientHelloID)
@@ -340,7 +354,7 @@ func (uconn *UConn) uLoadSession() error {
 	case shouldLoad:
 		hello := uconn.HandshakeState.Hello.getPrivatePtr()
 		if hello == nil {
-			return errors.New("tls: cannot load session - ClientHello is nil")
+			return utlserrors.New("tls: cannot load session - ClientHello is nil").AtError()
 		}
 		if err := uconn.sessionController.utlsAboutToLoadSession(); err != nil {
 			return err
@@ -378,7 +392,7 @@ func (uconn *UConn) uApplyPatch() error {
 		}
 	}
 	if helloLen != len(uconn.HandshakeState.Hello.Raw) {
-		return errors.New("tls: uApplyPatch Failed: the patch should never change the length of the marshaled clientHello")
+		return utlserrors.New("tls: uApplyPatch Failed: the patch should never change the length of the marshaled clientHello").AtError()
 	}
 	return nil
 }
@@ -445,7 +459,7 @@ func (uconn *UConn) SetSessionCache(cache ClientSessionCache) {
 // r must to be 32 bytes long.
 func (uconn *UConn) SetClientRandom(r []byte) error {
 	if len(r) != 32 {
-		return errors.New("tls: invalid client random length")
+		return utlserrors.New("tls: invalid client random length").AtError()
 	} else {
 		uconn.HandshakeState.Hello.Random = make([]byte, 32)
 		copy(uconn.HandshakeState.Hello.Random, r)
@@ -680,6 +694,7 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	if c.isHandshakeComplete.Load() {
 		return nil
 	}
+	utlserrors.LogDebug(ctx, "uconn: handshakeContext starting, clientHelloID=", c.ClientHelloID.Client)
 
 	// [uTLS section begins]
 	// Apply overall handshake timeout if configured
@@ -763,6 +778,7 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 	c.handshakeErr = c.handshakeFn(handshakeCtx)
 	if c.handshakeErr == nil {
 		c.handshakes++
+		utlserrors.LogDebug(ctx, "uconn: handshake complete, cipher=", c.cipherSuite, " vers=", c.vers)
 
 		// [uTLS section begins]
 		// Send any buffered early data after successful handshake.
@@ -776,13 +792,14 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 		}
 		// [uTLS section ends]
 	} else {
+		utlserrors.LogDebug(ctx, "uconn: handshake failed: ", c.handshakeErr)
 		// If an error occurred during the hadshake try to flush the
 		// alert that might be left in the buffer.
 		c.flush()
 	}
 
 	if c.handshakeErr == nil && !c.isHandshakeComplete.Load() {
-		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")
+		c.handshakeErr = utlserrors.New("tls: internal error: handshake should have had a result").AtError()
 	}
 	if c.handshakeErr != nil && c.isHandshakeComplete.Load() {
 		// Internal inconsistency - reset completion flag and preserve the error
@@ -809,8 +826,7 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 			// Truncate the text of the alert to 0 characters.
 			c.handshakeErr = fmt.Errorf("%w%.0w", c.handshakeErr, AlertError(a))
 		}
-		close(c.quic.blockedc)
-		close(c.quic.signalc)
+		c.quic.closeChannels()
 	}
 
 	return c.handshakeErr
@@ -819,6 +835,9 @@ func (c *UConn) handshakeContext(ctx context.Context) (ret error) {
 // Copy-pasted from tls.Conn in its entirety. But c.Handshake() is now utls' one, not tls.
 // Write writes data to the connection.
 func (c *UConn) Write(b []byte) (int, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "uconn: Write len=", len(b))
+	}
 	// interlock with Close below
 	for {
 		x := c.activeCall.Load()
@@ -890,6 +909,9 @@ func (uconn *UConn) ApplyConfig() error {
 	uconn.extensionsMu.RLock()
 	defer uconn.extensionsMu.RUnlock()
 	for _, ext := range uconn.Extensions {
+		if ext == nil {
+			continue // skip nil extensions
+		}
 		err := ext.writeToUConn(uconn)
 		if err != nil {
 			return err
@@ -1312,7 +1334,7 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 	// This function is mostly copied from
 	// https://github.com/refraction-networking/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
 	if ech == nil {
-		return errors.New("tls: ech context is nil in computeAndUpdateOuterECHExtension")
+		return utlserrors.New("tls: ech context is nil in computeAndUpdateOuterECHExtension").AtError()
 	}
 	var encapKey []byte
 	if useKey {
@@ -1465,7 +1487,7 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 			if paddingExt == nil {
 				paddingExt = pe
 			} else {
-				return errors.New("multiple padding extensions")
+				return utlserrors.New("multiple padding extensions").AtError()
 			}
 		}
 	}
@@ -1513,7 +1535,7 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 			}
 		}
 		if pskIndex != -1 && pskIndex != len(uconn.Extensions)-1 {
-			return errors.New("tls: pre_shared_key extension must be last")
+			return utlserrors.New("tls: pre_shared_key extension must be last").AtError()
 		}
 
 		binary.Write(bufferedWriter, binary.BigEndian, uint16(extensionsLen))
@@ -1530,7 +1552,7 @@ func (uconn *UConn) MarshalClientHelloNoECH() error {
 	}
 
 	if helloBuffer.Len() != 4+helloLen {
-		return errors.New("tls: invalid ClientHello length")
+		return utlserrors.New("tls: invalid ClientHello length").AtError()
 	}
 
 	hello.Raw = helloBuffer.Bytes()
@@ -1545,7 +1567,7 @@ func (uconn *UConn) GetOutKeystream(length int) ([]byte, error) {
 		// AEAD.Seal() does not mutate internal state, other ciphers might
 		return outCipher.Seal(nil, uconn.out.seq[:], zeros, nil), nil
 	}
-	return nil, errors.New("could not convert OutCipher to cipher.AEAD")
+	return nil, utlserrors.New("could not convert OutCipher to cipher.AEAD").AtError()
 }
 
 // SetTLSVers sets min and max TLS version in all appropriate places.
@@ -1644,6 +1666,27 @@ func (uconn *UConn) isClosed() bool {
 	return uconn.Conn.activeCall.Load()&1 != 0
 }
 
+// Close closes the TLS connection and notifies the observability hook.
+// This method overrides the embedded Conn.Close() to add lifecycle tracking.
+func (uconn *UConn) Close() error {
+	// Capture remote address before closing - it may become unavailable after close.
+	// Handle nil cases gracefully for QUIC connections or partially initialized state.
+	var remoteAddr string
+	if uconn != nil && uconn.Conn != nil && uconn.Conn.conn != nil {
+		if addr := uconn.Conn.conn.RemoteAddr(); addr != nil {
+			remoteAddr = addr.String()
+		}
+	}
+
+	// Delegate to the embedded Conn's Close method.
+	err := uconn.Conn.Close()
+
+	// Notify observability hook of connection end.
+	callOnConnectionEnd(remoteAddr, err)
+
+	return err
+}
+
 // IsHealthy returns true if the connection appears usable for TLS operations.
 // A connection is considered healthy if:
 //   - The UConn and underlying Conn are not nil
@@ -1671,77 +1714,77 @@ func (uconn *UConn) IsHealthy() bool {
 
 // MakeConnWithCompleteHandshake allows to forge both server and client side TLS connections.
 // Major Hack Alert.
-func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite uint16, masterSecret []byte, clientRandom []byte, serverRandom []byte, isClient bool) *Conn {
+//
+// Returns an error if:
+//   - The cipher suite is not recognized (e.g., TLS 1.3 suites are not yet supported)
+//   - Cipher or AEAD creation fails (e.g., invalid key length)
+//   - Sequence number increment fails (should not happen in practice)
+func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite uint16, masterSecret []byte, clientRandom []byte, serverRandom []byte, isClient bool) (*Conn, error) {
 	tlsConn := &Conn{conn: tcpConn, config: &Config{}, isClient: isClient}
 	cs := cipherSuiteByID(cipherSuite)
-	if cs != nil {
-		// This is mostly borrowed from establishKeys()
-		clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV :=
-			keysFromMasterSecret(version, cs, masterSecret, clientRandom, serverRandom,
-				cs.macLen, cs.keyLen, cs.ivLen)
-
-		var clientCipher, serverCipher interface{}
-		var clientHash, serverHash hash.Hash
-		if cs.cipher != nil {
-			clientCipher = cs.cipher(clientKey, clientIV, true /* for reading */)
-			if clientCipher == nil {
-				// Cipher creation failed (invalid key length)
-				return nil
-			}
-			clientHash = cs.mac(clientMAC)
-			serverCipher = cs.cipher(serverKey, serverIV, false /* not for reading */)
-			if serverCipher == nil {
-				// Cipher creation failed (invalid key length)
-				return nil
-			}
-			serverHash = cs.mac(serverMAC)
-		} else {
-			var err error
-			clientCipher, err = cs.aead(clientKey, clientIV)
-			if err != nil {
-				// AEAD creation failed (invalid key length)
-				return nil
-			}
-			serverCipher, err = cs.aead(serverKey, serverIV)
-			if err != nil {
-				// AEAD creation failed (invalid key length)
-				return nil
-			}
-		}
-
-		if isClient {
-			tlsConn.in.prepareCipherSpec(version, serverCipher, serverHash)
-			tlsConn.out.prepareCipherSpec(version, clientCipher, clientHash)
-		} else {
-			tlsConn.in.prepareCipherSpec(version, clientCipher, clientHash)
-			tlsConn.out.prepareCipherSpec(version, serverCipher, serverHash)
-		}
-
-		// skip the handshake states
-		tlsConn.isHandshakeComplete.Store(true)
-		tlsConn.cipherSuite = cipherSuite
-		tlsConn.haveVers = true
-		tlsConn.vers = version
-
-		// Update to the new cipher specs
-		// and consume the finished messages
-		tlsConn.in.changeCipherSpec()
-		tlsConn.out.changeCipherSpec()
-
-		// Increment sequence numbers - errors are effectively impossible here
-		// since we just initialized (seq starts at 0), but handle gracefully.
-		if err := tlsConn.in.incSeq(); err != nil {
-			return nil
-		}
-		if err := tlsConn.out.incSeq(); err != nil {
-			return nil
-		}
-
-		return tlsConn
-	} else {
-		// TODO: Support TLS 1.3 Cipher Suites
-		return nil
+	if cs == nil {
+		return nil, fmt.Errorf("tls: unsupported or unrecognized cipher suite 0x%04X (TLS 1.3 suites not yet supported)", cipherSuite)
 	}
+
+	// This is mostly borrowed from establishKeys()
+	clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV :=
+		keysFromMasterSecret(version, cs, masterSecret, clientRandom, serverRandom,
+			cs.macLen, cs.keyLen, cs.ivLen)
+
+	var clientCipher, serverCipher interface{}
+	var clientHash, serverHash hash.Hash
+	if cs.cipher != nil {
+		clientCipher = cs.cipher(clientKey, clientIV, true /* for reading */)
+		if clientCipher == nil {
+			return nil, fmt.Errorf("tls: failed to create client cipher for suite 0x%04X (invalid key length)", cipherSuite)
+		}
+		clientHash = cs.mac(clientMAC)
+		serverCipher = cs.cipher(serverKey, serverIV, false /* not for reading */)
+		if serverCipher == nil {
+			return nil, fmt.Errorf("tls: failed to create server cipher for suite 0x%04X (invalid key length)", cipherSuite)
+		}
+		serverHash = cs.mac(serverMAC)
+	} else {
+		var err error
+		clientCipher, err = cs.aead(clientKey, clientIV)
+		if err != nil {
+			return nil, fmt.Errorf("tls: failed to create client AEAD for suite 0x%04X: %w", cipherSuite, err)
+		}
+		serverCipher, err = cs.aead(serverKey, serverIV)
+		if err != nil {
+			return nil, fmt.Errorf("tls: failed to create server AEAD for suite 0x%04X: %w", cipherSuite, err)
+		}
+	}
+
+	if isClient {
+		tlsConn.in.prepareCipherSpec(version, serverCipher, serverHash)
+		tlsConn.out.prepareCipherSpec(version, clientCipher, clientHash)
+	} else {
+		tlsConn.in.prepareCipherSpec(version, clientCipher, clientHash)
+		tlsConn.out.prepareCipherSpec(version, serverCipher, serverHash)
+	}
+
+	// skip the handshake states
+	tlsConn.isHandshakeComplete.Store(true)
+	tlsConn.cipherSuite = cipherSuite
+	tlsConn.haveVers = true
+	tlsConn.vers = version
+
+	// Update to the new cipher specs
+	// and consume the finished messages
+	tlsConn.in.changeCipherSpec()
+	tlsConn.out.changeCipherSpec()
+
+	// Increment sequence numbers - errors are effectively impossible here
+	// since we just initialized (seq starts at 0), but handle gracefully.
+	if err := tlsConn.in.incSeq(); err != nil {
+		return nil, fmt.Errorf("tls: failed to increment input sequence number: %w", err)
+	}
+	if err := tlsConn.out.incSeq(); err != nil {
+		return nil, fmt.Errorf("tls: failed to increment output sequence number: %w", err)
+	}
+
+	return tlsConn, nil
 }
 
 func makeSupportedVersions(minVers, maxVers uint16) []uint16 {
@@ -1802,6 +1845,9 @@ type utlsConnExtraFields struct {
 // has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and
 // [Conn.SetWriteDeadline].
 func (c *UConn) Read(b []byte) (int, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "uconn: Read bufLen=", len(b))
+	}
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
@@ -1816,6 +1862,9 @@ func (c *UConn) Read(b []byte) (int, error) {
 
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
+			if utlserrors.DebugLoggingEnabled {
+				utlserrors.LogDebug(context.Background(), "uconn: Read readRecord error: ", err)
+			}
 			return 0, err
 		}
 		for c.hand.Len() > 0 {
@@ -1826,6 +1875,9 @@ func (c *UConn) Read(b []byte) (int, error) {
 	}
 
 	n, _ := c.input.Read(b)
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "uconn: Read returned n=", n)
+	}
 
 	// If a close-notify alert is waiting, read it so that we can return (n,
 	// EOF) instead of (n, nil), to signal to the HTTP response reading
@@ -1847,7 +1899,7 @@ func (c *UConn) Read(b []byte) (int, error) {
 // handleRenegotiation processes a HelloRequest handshake message.
 func (c *UConn) handleRenegotiation() error {
 	if c.vers == VersionTLS13 {
-		return errors.New("tls: internal error: unexpected renegotiation")
+		return utlserrors.New("tls: internal error: unexpected renegotiation").AtError()
 	}
 
 	msg, err := c.readHandshake(nil)
@@ -1876,7 +1928,7 @@ func (c *UConn) handleRenegotiation() error {
 		// Ok.
 	default:
 		c.sendAlert(alertInternalError)
-		return errors.New("tls: unknown Renegotiation value")
+		return utlserrors.New("tls: unknown Renegotiation value").AtError()
 	}
 
 	c.handshakeMutex.Lock()
@@ -1909,7 +1961,7 @@ func (c *UConn) handlePostHandshakeMessage() error {
 	c.retryCount++
 	if c.retryCount > maxUselessRecords {
 		c.sendAlert(alertUnexpectedMessage)
-		return c.in.setErrorLocked(errors.New("tls: too many non-advancing records"))
+		return c.in.setErrorLocked(utlserrors.New("tls: too many non-advancing records").AtError())
 	}
 
 	switch msg := msg.(type) {

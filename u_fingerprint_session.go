@@ -8,10 +8,11 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // SessionFingerprintState holds all values that must remain consistent across
@@ -846,4 +847,4 @@ func (c *SessionStateCache) Cleanup() int {
 var DefaultSessionCache = NewSessionStateCache(10000, 24*time.Hour)
 
 // ErrSessionFrozen is returned when attempting to modify a frozen session.
-var ErrSessionFrozen = errors.New("tls: session state is frozen")
+var ErrSessionFrozen = utlserrors.New("tls: session state is frozen").AtError()

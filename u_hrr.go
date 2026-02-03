@@ -6,12 +6,14 @@ package tls
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // maxHRRCookieSize is the maximum allowed size for HRR cookies.
@@ -99,8 +101,15 @@ func IsHelloRetryRequest(raw []byte) bool {
 
 // ParseHRR parses a HelloRetryRequest message.
 func ParseHRR(raw []byte) (*HRRInfo, error) {
+	return ParseHRRWithContext(context.Background(), raw)
+}
+
+// ParseHRRWithContext parses a HelloRetryRequest message with context for logging.
+func ParseHRRWithContext(ctx context.Context, raw []byte) (*HRRInfo, error) {
+	utlserrors.LogDebug(ctx, "HRR: parsing HelloRetryRequest, length=", len(raw))
+
 	if len(raw) < 38 {
-		return nil, errors.New("tls: HRR too short")
+		return nil, utlserrors.New("tls: HRR too short").AtError()
 	}
 
 	info := &HRRInfo{
@@ -119,27 +128,29 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 
 	// Verify this is HRR by checking random
 	if offset+32 > len(raw) {
-		return nil, errors.New("tls: HRR too short for random")
+		return nil, utlserrors.New("tls: HRR too short for random").AtError()
 	}
 	if !bytes.Equal(raw[offset:offset+32], helloRetryRequestRandom) {
-		return nil, errors.New("tls: not a HelloRetryRequest (random mismatch)")
+		utlserrors.LogDebug(ctx, "HRR: random mismatch - not a HelloRetryRequest")
+		return nil, utlserrors.New("tls: not a HelloRetryRequest (random mismatch)").AtError()
 	}
+	utlserrors.LogDebug(ctx, "HRR: detected HelloRetryRequest (magic random matched)")
 	offset += 32
 
 	// Session ID length
 	if offset >= len(raw) {
-		return nil, errors.New("tls: HRR truncated at session ID length")
+		return nil, utlserrors.New("tls: HRR truncated at session ID length").AtError()
 	}
 	sessionIDLen := int(raw[offset])
 	offset++
 
 	// RFC 8446: legacy_session_id must be 0-32 bytes
 	if sessionIDLen > 32 {
-		return nil, errors.New("tls: invalid session ID length")
+		return nil, utlserrors.New("tls: invalid session ID length").AtError()
 	}
 
 	if offset+sessionIDLen > len(raw) {
-		return nil, errors.New("tls: HRR truncated at session ID")
+		return nil, utlserrors.New("tls: HRR truncated at session ID").AtError()
 	}
 	if sessionIDLen > 0 {
 		info.SessionID = make([]byte, sessionIDLen)
@@ -149,14 +160,15 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 
 	// Cipher suite
 	if offset+2 > len(raw) {
-		return nil, errors.New("tls: HRR truncated at cipher suite")
+		return nil, utlserrors.New("tls: HRR truncated at cipher suite").AtError()
 	}
 	info.CipherSuite = binary.BigEndian.Uint16(raw[offset:])
+	utlserrors.LogDebug(ctx, "HRR: cipher suite=", fmt.Sprintf("0x%04x", info.CipherSuite))
 	offset += 2
 
 	// Compression method
 	if offset >= len(raw) {
-		return nil, errors.New("tls: HRR truncated at compression")
+		return nil, utlserrors.New("tls: HRR truncated at compression").AtError()
 	}
 	offset++ // Skip compression method (always 0)
 
@@ -171,8 +183,10 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 
 	// Security: Check for overflow and bounds
 	if extLen > len(raw)-offset {
-		return nil, errors.New("tls: HRR extensions truncated")
+		return nil, utlserrors.New("tls: HRR extensions truncated").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "HRR: parsing extensions, length=", extLen)
 
 	// Parse extensions
 	extEnd := offset + extLen
@@ -182,33 +196,36 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 		offset += 4
 
 		if offset+extDataLen > extEnd {
-			return nil, errors.New("tls: HRR extension data truncated")
+			return nil, utlserrors.New("tls: HRR extension data truncated").AtError()
 		}
 
 		switch extType {
 		case extensionSupportedVersions:
 			// RFC 8446: In HRR, supported_versions MUST be exactly 2 bytes
 			if extDataLen != 2 {
-				return nil, fmt.Errorf("tls: HRR supported_versions must be 2 bytes, got %d", extDataLen)
+				return nil, utlserrors.New("tls: HRR supported_versions must be 2 bytes, got ", extDataLen).AtError()
 			}
 			info.SupportedVersion = binary.BigEndian.Uint16(raw[offset:])
+			utlserrors.LogDebug(ctx, "HRR: supported version=", fmt.Sprintf("0x%04x", info.SupportedVersion))
 		case extensionKeyShare:
 			// RFC 8446: In HRR, key_share MUST be exactly 2 bytes (selected group only)
 			if extDataLen != 2 {
-				return nil, fmt.Errorf("tls: HRR key_share must be 2 bytes, got %d", extDataLen)
+				return nil, utlserrors.New("tls: HRR key_share must be 2 bytes, got ", extDataLen).AtError()
 			}
 			info.SelectedGroup = CurveID(binary.BigEndian.Uint16(raw[offset:]))
+			utlserrors.LogDebug(ctx, "HRR: server requested curve=", info.SelectedGroup)
 		case extensionCookie:
 			if extDataLen >= 2 {
 				cookieLen := int(binary.BigEndian.Uint16(raw[offset:]))
 				// Security: Enforce maximum cookie size to prevent DoS attacks
 				if cookieLen > maxHRRCookieSize {
-					return nil, fmt.Errorf("tls: HRR cookie exceeds maximum size (%d > %d)", cookieLen, maxHRRCookieSize)
+					return nil, utlserrors.New("tls: HRR cookie exceeds maximum size (", cookieLen, " > ", maxHRRCookieSize, ")").AtError()
 				}
 				// Security: Validate bounds before copying
 				if 2+cookieLen <= extDataLen && offset+2+cookieLen <= len(raw) {
 					info.Cookie = make([]byte, cookieLen)
 					copy(info.Cookie, raw[offset+2:offset+2+cookieLen])
+					utlserrors.LogDebug(ctx, "HRR: cookie received, length=", cookieLen)
 				}
 			}
 		}
@@ -216,6 +233,7 @@ func ParseHRR(raw []byte) (*HRRInfo, error) {
 		offset += extDataLen
 	}
 
+	utlserrors.LogDebug(ctx, "HRR: parsing complete, selectedGroup=", info.SelectedGroup)
 	return info, nil
 }
 
@@ -262,15 +280,15 @@ func (b *HRRBuilder) WithCookie(cookie []byte) *HRRBuilder {
 // Build creates the HRR message bytes.
 func (b *HRRBuilder) Build() ([]byte, error) {
 	if b.cipherSuite == 0 {
-		return nil, errors.New("tls: HRR requires cipher suite")
+		return nil, utlserrors.New("tls: HRR requires cipher suite").AtError()
 	}
 	if b.selectedGroup == 0 {
-		return nil, errors.New("tls: HRR requires selected group")
+		return nil, utlserrors.New("tls: HRR requires selected group").AtError()
 	}
 
 	// RFC 8446: legacy_session_id must be 0-32 bytes
 	if len(b.sessionID) > 32 {
-		return nil, errors.New("tls: invalid session ID length")
+		return nil, utlserrors.New("tls: invalid session ID length").AtError()
 	}
 
 	// Calculate extensions length
@@ -283,12 +301,12 @@ func (b *HRRBuilder) Build() ([]byte, error) {
 	if len(b.cookie) > 0 {
 		// Security: Enforce maximum cookie size to prevent DoS attacks
 		if len(b.cookie) > maxHRRCookieSize {
-			return nil, fmt.Errorf("tls: HRR cookie exceeds maximum size (%d > %d)", len(b.cookie), maxHRRCookieSize)
+			return nil, utlserrors.New("tls: HRR cookie exceeds maximum size (", len(b.cookie), " > ", maxHRRCookieSize, ")").AtError()
 		}
 		// Security: Prevent integer overflow
 		cookieExtLen := 6 + len(b.cookie)
 		if cookieExtLen > 65535 || extLen+cookieExtLen > 65535 {
-			return nil, errors.New("tls: HRR cookie extension too large")
+			return nil, utlserrors.New("tls: HRR cookie extension too large").AtError()
 		}
 		extLen += cookieExtLen
 	}
@@ -391,63 +409,81 @@ func HRRTranscriptHash(hashFunc func() hash.Hash, clientHello1 []byte) []byte {
 // ValidateClientHello2 validates the second ClientHello after HRR.
 // Per RFC 8446 Section 4.1.2, certain fields must remain unchanged.
 func ValidateClientHello2(ch1, ch2 *clientHelloMsg, selectedGroup CurveID) error {
+	return ValidateClientHello2WithContext(context.Background(), ch1, ch2, selectedGroup)
+}
+
+// ValidateClientHello2WithContext validates the second ClientHello after HRR with context for logging.
+func ValidateClientHello2WithContext(ctx context.Context, ch1, ch2 *clientHelloMsg, selectedGroup CurveID) error {
+	utlserrors.LogDebug(ctx, "HRR: validating second ClientHello")
+
 	// Security: Nil check to prevent panic
 	if ch1 == nil || ch2 == nil {
-		return errors.New("tls: cannot validate nil ClientHello messages")
+		return utlserrors.New("tls: cannot validate nil ClientHello messages").AtError()
 	}
 
 	// Version must match
 	if ch1.vers != ch2.vers {
-		return errors.New("tls: client changed version after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed version after HRR")
+		return utlserrors.New("tls: client changed version after HRR").AtError()
 	}
 
 	// Session ID must match
 	if !bytes.Equal(ch1.sessionId, ch2.sessionId) {
-		return errors.New("tls: client changed session ID after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed session ID after HRR")
+		return utlserrors.New("tls: client changed session ID after HRR").AtError()
 	}
 
 	// Cipher suites must be identical
 	if len(ch1.cipherSuites) != len(ch2.cipherSuites) {
-		return errors.New("tls: client changed cipher suites after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed cipher suites after HRR (count mismatch)")
+		return utlserrors.New("tls: client changed cipher suites after HRR").AtError()
 	}
 	for i := range ch1.cipherSuites {
 		if ch1.cipherSuites[i] != ch2.cipherSuites[i] {
-			return errors.New("tls: client changed cipher suites after HRR")
+			utlserrors.LogDebug(ctx, "HRR: client changed cipher suites after HRR")
+			return utlserrors.New("tls: client changed cipher suites after HRR").AtError()
 		}
 	}
 
 	// Compression methods must be identical
 	if !bytes.Equal(ch1.compressionMethods, ch2.compressionMethods) {
-		return errors.New("tls: client changed compression methods after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed compression methods after HRR")
+		return utlserrors.New("tls: client changed compression methods after HRR").AtError()
 	}
 
 	// RFC 8446 Section 4.1.2: supported_versions must remain unchanged
 	if len(ch1.supportedVersions) != len(ch2.supportedVersions) {
-		return errors.New("tls: client changed supported_versions after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed supported_versions after HRR")
+		return utlserrors.New("tls: client changed supported_versions after HRR").AtError()
 	}
 	for i := range ch1.supportedVersions {
 		if ch1.supportedVersions[i] != ch2.supportedVersions[i] {
-			return errors.New("tls: client changed supported_versions after HRR")
+			utlserrors.LogDebug(ctx, "HRR: client changed supported_versions after HRR")
+			return utlserrors.New("tls: client changed supported_versions after HRR").AtError()
 		}
 	}
 
 	// RFC 8446 Section 4.1.2: supported_groups must remain unchanged
 	if len(ch1.supportedCurves) != len(ch2.supportedCurves) {
-		return errors.New("tls: client changed supported_groups after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed supported_groups after HRR")
+		return utlserrors.New("tls: client changed supported_groups after HRR").AtError()
 	}
 	for i := range ch1.supportedCurves {
 		if ch1.supportedCurves[i] != ch2.supportedCurves[i] {
-			return errors.New("tls: client changed supported_groups after HRR")
+			utlserrors.LogDebug(ctx, "HRR: client changed supported_groups after HRR")
+			return utlserrors.New("tls: client changed supported_groups after HRR").AtError()
 		}
 	}
 
 	// RFC 8446 Section 4.1.2: signature_algorithms must remain unchanged
 	if len(ch1.supportedSignatureAlgorithms) != len(ch2.supportedSignatureAlgorithms) {
-		return errors.New("tls: client changed signature_algorithms after HRR")
+		utlserrors.LogDebug(ctx, "HRR: client changed signature_algorithms after HRR")
+		return utlserrors.New("tls: client changed signature_algorithms after HRR").AtError()
 	}
 	for i := range ch1.supportedSignatureAlgorithms {
 		if ch1.supportedSignatureAlgorithms[i] != ch2.supportedSignatureAlgorithms[i] {
-			return errors.New("tls: client changed signature_algorithms after HRR")
+			utlserrors.LogDebug(ctx, "HRR: client changed signature_algorithms after HRR")
+			return utlserrors.New("tls: client changed signature_algorithms after HRR").AtError()
 		}
 	}
 
@@ -460,12 +496,15 @@ func ValidateClientHello2(ch1, ch2 *clientHelloMsg, selectedGroup CurveID) error
 		}
 	}
 	if keyShareCount == 0 {
-		return fmt.Errorf("tls: client did not provide key share for requested group %d", selectedGroup)
+		utlserrors.LogDebug(ctx, "HRR: client did not provide key share for requested group ", selectedGroup)
+		return utlserrors.New("tls: client did not provide key share for requested group ", selectedGroup).AtError()
 	}
 	if keyShareCount > 1 {
-		return fmt.Errorf("tls: client provided multiple key shares for selected group %d", selectedGroup)
+		utlserrors.LogDebug(ctx, "HRR: client provided multiple key shares for selected group ", selectedGroup)
+		return utlserrors.New("tls: client provided multiple key shares for selected group ", selectedGroup).AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "HRR: second ClientHello validation passed, key share found for group ", selectedGroup)
 	return nil
 }
 
@@ -524,22 +563,30 @@ func DecodeCookie(cookie, key []byte) (*HRRCookieData, error) {
 
 // DecodeCookieWithMaxAge decodes cookie with custom max age.
 func DecodeCookieWithMaxAge(cookie, key []byte, maxAgeSeconds int64) (*HRRCookieData, error) {
+	return DecodeCookieWithMaxAgeAndContext(context.Background(), cookie, key, maxAgeSeconds)
+}
+
+// DecodeCookieWithMaxAgeAndContext decodes cookie with custom max age and context for logging.
+func DecodeCookieWithMaxAgeAndContext(ctx context.Context, cookie, key []byte, maxAgeSeconds int64) (*HRRCookieData, error) {
+	utlserrors.LogDebug(ctx, "HRR: decoding cookie, length=", len(cookie))
+
 	if len(cookie) != 76 {
-		return nil, fmt.Errorf("tls: invalid cookie length: %d", len(cookie))
+		return nil, utlserrors.New("tls: invalid cookie length: ", len(cookie)).AtError()
 	}
 
 	// Security: Validate key length
 	if len(key) < 32 {
-		return nil, errors.New("tls: cookie key must be at least 32 bytes")
+		return nil, utlserrors.New("tls: cookie key must be at least 32 bytes").AtError()
 	}
 
 	// Verify HMAC
 	expectedMAC := ComputeAuthHMACSimple(key, cookie[:44])
 	if expectedMAC == nil {
-		return nil, errors.New("tls: failed to compute expected MAC")
+		return nil, utlserrors.New("tls: failed to compute expected MAC").AtError()
 	}
 	if !VerifyAuthHMAC(cookie[44:], expectedMAC[:32]) {
-		return nil, errors.New("tls: cookie authentication failed")
+		utlserrors.LogDebug(ctx, "HRR: cookie authentication failed")
+		return nil, utlserrors.New("tls: cookie authentication failed").AtError()
 	}
 
 	data := &HRRCookieData{
@@ -551,7 +598,7 @@ func DecodeCookieWithMaxAge(cookie, key []byte, maxAgeSeconds int64) (*HRRCookie
 
 	// Security: Reject negative timestamps (malformed or attack)
 	if data.Timestamp < 0 {
-		return nil, errors.New("tls: invalid cookie timestamp")
+		return nil, utlserrors.New("tls: invalid cookie timestamp").AtError()
 	}
 
 	// Security: Validate timestamp to prevent replay attacks
@@ -561,15 +608,18 @@ func DecodeCookieWithMaxAge(cookie, key []byte, maxAgeSeconds int64) (*HRRCookie
 
 		// Check for expired cookie
 		if age > maxAgeSeconds {
-			return nil, fmt.Errorf("tls: cookie expired (age: %d seconds)", age)
+			utlserrors.LogDebug(ctx, "HRR: cookie expired, age=", age, " seconds")
+			return nil, utlserrors.New("tls: cookie expired (age: ", age, " seconds)").AtError()
 		}
 
 		// Check for future timestamp (clock skew tolerance: 60 seconds)
 		if data.Timestamp > now+60 {
-			return nil, errors.New("tls: cookie timestamp in future")
+			utlserrors.LogDebug(ctx, "HRR: cookie timestamp in future")
+			return nil, utlserrors.New("tls: cookie timestamp in future").AtError()
 		}
 	}
 
+	utlserrors.LogDebug(ctx, "HRR: cookie decoded successfully, group=", data.SelectedGroup)
 	return data, nil
 }
 

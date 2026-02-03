@@ -5,10 +5,10 @@
 package tls
 
 import (
+	"context"
 	"crypto/mlkem"
 	crand "crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -17,9 +17,10 @@ import (
 	"sort"
 
 	"github.com/refraction-networking/utls/dicttls"
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
-var ErrUnknownClientHelloID = errors.New("tls: unknown ClientHelloID")
+var ErrUnknownClientHelloID = utlserrors.New("tls: unknown ClientHelloID").AtError()
 
 // Shared cipher suite lists to reduce code duplication across browser profiles.
 // Chrome/Edge cipher suites (16 ciphers with GREASE)
@@ -329,6 +330,9 @@ func ApplyCipherSuiteOrder(ciphers []uint16, hint CipherSuiteOrderHint) []uint16
 
 // UTLSIdToSpec converts a ClientHelloID to a corresponding ClientHelloSpec.
 func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "parrot: resolving profile ID:", id.Str())
+
 	switch id {
 	case HelloChrome_106_Shuffle:
 		return ClientHelloSpec{
@@ -589,6 +593,16 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&UtlsGREASEExtension{},
 			}),
 		}, nil
+	case HelloChrome_143:
+		// Chrome 143 (December 2025) - Same TLS fingerprint as Chrome 142
+		// No cipher suite or extension changes were made in this version.
+		// X25519MLKEM768 (0x11EC), extension shuffling, new ALPS codepoint (17613)
+		return UTLSIdToSpec(HelloChrome_142)
+	case HelloChrome_144:
+		// Chrome 144 (January 2026) - Same TLS fingerprint as Chrome 142
+		// No cipher suite or extension changes were made in this version.
+		// X25519MLKEM768 (0x11EC), extension shuffling, new ALPS codepoint (17613)
+		return UTLSIdToSpec(HelloChrome_142)
 	case HelloFirefox_120:
 		// Firefox 120 with FFDHE groups matching real Firefox.
 		// FFDHE key exchange is fully implemented - HelloRetryRequest works correctly.
@@ -993,11 +1007,13 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 		}, nil
 	default:
 		if id.Client == helloRandomized || id.Client == helloRandomizedALPN || id.Client == helloRandomizedNoALPN {
+			utlserrors.LogDebug(ctx, "parrot: generating randomized spec for profile:", id.Str())
 			// Use empty values as they can be filled later by UConn.ApplyPreset or manually.
 			return generateRandomizedSpec(&id, "", nil)
 		}
 
-		return ClientHelloSpec{}, fmt.Errorf("%w: %s", ErrUnknownClientHelloID, id.Str())
+		utlserrors.LogDebug(ctx, "parrot: unknown profile ID:", id.Str())
+		return ClientHelloSpec{}, utlserrors.New("tls: unknown ClientHelloID:", id.Str()).Base(ErrUnknownClientHelloID).AtError()
 	}
 }
 
@@ -1006,6 +1022,9 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 // Returns an error if cryptographic random number generation fails - this is a security
 // requirement to prevent predictable extension ordering.
 func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) ([]TLSExtension, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "parrot: shuffling extensions, count:", len(exts), "skipGREASE:", skipGREASE)
+
 	skipShuf := func(idx int) bool {
 		switch exts[idx].(type) {
 		case *UtlsPaddingExtension, PreSharedKeyExtension:
@@ -1020,7 +1039,8 @@ func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) ([]TLSExtension,
 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
 	if err != nil {
 		// SECURITY: Never fall back to weak randomness - return error instead
-		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+		utlserrors.LogWarning(ctx, "parrot: crypto/rand failed for extension shuffle:", err)
+		return nil, utlserrors.New("crypto/rand failed for extension shuffle").Base(err).AtError()
 	}
 	rng := rand.New(rand.NewSource(randInt64.Int64()))
 
@@ -1031,6 +1051,7 @@ func shuffleTLSExtensions(exts []TLSExtension, skipGREASE bool) ([]TLSExtension,
 		exts[i], exts[j] = exts[j], exts[i]
 	})
 
+	utlserrors.LogDebug(ctx, "parrot: extension shuffle complete")
 	return exts, nil
 }
 
@@ -1163,6 +1184,10 @@ func AggressiveShuffleConfig() ShuffleConfig {
 // constrained ranges (start and end of the extension list) based on probability,
 // mimicking real Chrome behavior where GREASE usually stays fixed but occasionally varies.
 func shuffleTLSExtensionsWithConfig(exts []TLSExtension, cfg ShuffleConfig) ([]TLSExtension, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "parrot: shuffling extensions with config, count:", len(exts),
+		"shuffleGREASE:", cfg.ShuffleGREASE, "shufflePadding:", cfg.ShufflePadding)
+
 	if len(exts) < 2 {
 		return exts, nil
 	}
@@ -1170,7 +1195,8 @@ func shuffleTLSExtensionsWithConfig(exts []TLSExtension, cfg ShuffleConfig) ([]T
 	// Generate cryptographically secure random seed
 	randInt64, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
 	if err != nil {
-		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+		utlserrors.LogWarning(ctx, "parrot: crypto/rand failed for extension shuffle with config:", err)
+		return nil, utlserrors.New("crypto/rand failed for extension shuffle").Base(err).AtError()
 	}
 	rng := rand.New(rand.NewSource(randInt64.Int64()))
 
@@ -1430,6 +1456,9 @@ func RandomizeChromeGREASEPositions(exts []TLSExtension) ([]TLSExtension, error)
 //	if err != nil { return err }
 //	exts = ShuffleChromeTLSExtensions(exts)
 func RandomizeGREASEPositions(exts []TLSExtension) ([]TLSExtension, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "parrot: randomizing GREASE positions, extensions count:", len(exts))
+
 	if len(exts) < 2 {
 		return exts, nil
 	}
@@ -1443,8 +1472,11 @@ func RandomizeGREASEPositions(exts []TLSExtension) ([]TLSExtension, error) {
 	}
 
 	if len(greaseIndices) == 0 {
+		utlserrors.LogDebug(ctx, "parrot: no GREASE extensions found to randomize")
 		return exts, nil
 	}
+
+	utlserrors.LogDebug(ctx, "parrot: found GREASE extensions at positions:", greaseIndices)
 
 	// Determine valid range (exclude PSK if it's last)
 	maxIdx := len(exts)
@@ -1761,10 +1793,14 @@ func cloneExtension(ext TLSExtension) TLSExtension {
 // Extensions are deep-cloned to prevent race conditions when multiple connections share
 // the same ClientHelloSpec.
 func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "parrot: applying preset, extensions count:", len(p.Extensions))
+
 	var err error
 
 	err = uconn.SetTLSVers(p.TLSVersMin, p.TLSVersMax, p.Extensions)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "parrot: SetTLSVers failed:", err)
 		return err
 	}
 
@@ -1786,12 +1822,12 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 		hello.Random = make([]byte, 32)
 		_, err := io.ReadFull(uconn.config.rand(), hello.Random)
 		if err != nil {
-			return errors.New("tls: short read from Rand: " + err.Error())
+			return utlserrors.New("tls: short read from Rand").Base(err).AtError()
 		}
 	case 32:
 	// carry on
 	default:
-		return errors.New("tls: invalid client random length")
+		return utlserrors.New("tls: invalid client random length").AtError()
 	}
 
 	if len(hello.CompressionMethods) == 0 {
@@ -1801,38 +1837,48 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	// Currently, GREASE is assumed to come from BoringSSL
 	grease_bytes := make([]byte, 2*ssl_grease_last_index)
 	grease_extensions_seen := 0
+	// Track first GREASE extension value to detect collisions.
+	// RFC 8446 Section 4.2 prohibits duplicate extension types.
+	var firstGreaseExtValue uint16
 	_, err = io.ReadFull(uconn.config.rand(), grease_bytes)
 	if err != nil {
-		return errors.New("tls: short read from Rand: " + err.Error())
+		return utlserrors.New("tls: short read from Rand").Base(err).AtError()
 	}
 	// Defensive check: ensure grease_bytes has sufficient length for greaseSeed.
 	// Each greaseSeed element requires 2 bytes. This validates the allocation
 	// matches the array size to prevent index out of bounds if constants change.
 	requiredBytes := 2 * len(uconn.greaseSeed)
 	if len(grease_bytes) < requiredBytes {
-		return errors.New("tls: insufficient random bytes for GREASE seed initialization")
+		return utlserrors.New("tls: insufficient random bytes for GREASE seed initialization").AtError()
 	}
 	for i := range uconn.greaseSeed {
 		uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
 	}
-	// GREASE collision handling: Real Chrome/BoringSSL generates extension1 and extension2
-	// GREASE values independently. With 16 possible GREASE values (0x0A0A through 0xFAFA),
-	// there's a natural 1/16 = 6.25% collision rate. This is CORRECT Chrome behavior.
-	// DO NOT deduplicate - deduplication creates a detectable fingerprint (0% collision
-	// rate vs Chrome's natural 6.25% rate).
+	// GREASE collision handling: Chrome/BoringSSL generates extension1 and extension2
+	// GREASE values from different seed indices. With 16 possible GREASE values
+	// (0x0A0A through 0xFAFA), there's a 1/16 = 6.25% collision probability.
+	// RFC 8446 Section 4.2 prohibits duplicate extension types, so real Chrome
+	// must avoid collisions. We rotate to the next GREASE value on collision,
+	// which stays within valid GREASE space and is undetectable.
 
 	// Apply cipher suite ordering based on hardware capabilities.
 	// Real browsers (Chrome, Edge) reorder cipher suites based on AES-NI availability:
 	//   - With AES hardware: AES-GCM suites first (faster with hardware acceleration)
 	//   - Without AES hardware: ChaCha20 suites first (faster in software)
 	// This is controlled by the CipherSuiteOrder field in ClientHelloSpec.
+	utlserrors.LogDebug(ctx, "parrot: applying cipher suite order:", string(p.CipherSuiteOrder), "count:", len(p.CipherSuites))
 	orderedCiphers := ApplyCipherSuiteOrder(p.CipherSuites, p.CipherSuiteOrder)
 	hello.CipherSuites = make([]uint16, len(orderedCiphers))
 	copy(hello.CipherSuites, orderedCiphers)
+	greaseCount := 0
 	for i := range hello.CipherSuites {
 		if isGREASEUint16(hello.CipherSuites[i]) { // just in case the user set a GREASE value instead of unGREASEd
 			hello.CipherSuites[i] = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_cipher)
+			greaseCount++
 		}
+	}
+	if utlserrors.DebugLoggingEnabled && greaseCount > 0 {
+		utlserrors.LogDebug(ctx, "parrot: inserted GREASE cipher suites:", greaseCount)
 	}
 
 	// Session ID handling with configurable length per browser profile.
@@ -1869,10 +1915,15 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	}
 
 	// Deep clone extensions to prevent race conditions and shared state
-	// between connections using the same ClientHelloSpec
-	uconn.Extensions = make([]TLSExtension, len(p.Extensions))
-	for i, ext := range p.Extensions {
-		uconn.Extensions[i] = cloneExtension(ext)
+	// between connections using the same ClientHelloSpec.
+	// Filter out nil extensions to prevent nil pointer dereferences downstream.
+	utlserrors.LogDebug(ctx, "parrot: cloning extensions, count:", len(p.Extensions))
+	uconn.Extensions = make([]TLSExtension, 0, len(p.Extensions))
+	for _, ext := range p.Extensions {
+		cloned := cloneExtension(ext)
+		if cloned != nil {
+			uconn.Extensions = append(uconn.Extensions, cloned)
+		}
 	}
 
 	// For QUIC connections, automatically add QUICTransportParametersExtension
@@ -1965,12 +2016,19 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 			case 0:
 				// [uTLS] Chrome correlation: First GREASE extension uses same value as supported_versions
 				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_version)
+				firstGreaseExtValue = ext.Value
 			case 1:
 				// [uTLS] Chrome correlation: Second GREASE extension uses same value as supported_groups/key_share
 				ext.Value = GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group)
+				// RFC 8446 Section 4.2: "A client MUST NOT offer more than one extension of the same type"
+				// GREASE values have 16 possible values, so there's a 6.25% collision probability.
+				// If collision detected, rotate to the next GREASE value to ensure uniqueness.
+				if ext.Value == firstGreaseExtValue {
+					ext.Value = NextGREASEValue(ext.Value)
+				}
 				ext.Body = []byte{0}
 			default:
-				return errors.New("tls: too many reserved extensions")
+				return utlserrors.New("tls: too many reserved extensions").AtError()
 			}
 			grease_extensions_seen += 1
 		case *SupportedCurvesExtension:
@@ -1994,14 +2052,14 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 						var lenByte [1]byte
 						_, err = io.ReadFull(uconn.config.rand(), lenByte[:])
 						if err != nil {
-							return errors.New("tls: short read from Rand: " + err.Error())
+							return utlserrors.New("tls: short read from Rand").Base(err).AtError()
 						}
 						// Map 0-255 to 1-32: (lenByte % 32) + 1
 						greaseDataLen := int(lenByte[0]%32) + 1
 						greaseData := make([]byte, greaseDataLen)
 						_, err = io.ReadFull(uconn.config.rand(), greaseData)
 						if err != nil {
-							return errors.New("tls: short read from Rand: " + err.Error())
+							return utlserrors.New("tls: short read from Rand").Base(err).AtError()
 						}
 						ext.KeyShares[i].Data = greaseData
 					}
@@ -2121,9 +2179,11 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 
 	err = uconn.sessionController.syncSessionExts()
 	if err != nil {
+		utlserrors.LogDebug(ctx, "parrot: syncSessionExts failed:", err)
 		return err
 	}
 
+	utlserrors.LogDebug(ctx, "parrot: preset applied successfully, extensions:", len(uconn.Extensions), "cipher suites:", len(hello.CipherSuites))
 	return nil
 }
 

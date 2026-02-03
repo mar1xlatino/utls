@@ -492,10 +492,9 @@ func TestConnCloseIdempotent(t *testing.T) {
 		// Only first close should potentially return an error
 		// Subsequent closes should be no-ops (return nil due to sync.Once)
 		if i > 0 && err != nil {
-			// sync.Once means the underlying Close() is only called once
-			// so we shouldn't get errors on subsequent calls
-			// Note: the implementation stores err from first call, so
-			// subsequent calls return nil (not stored error)
+			// sync.Once means the underlying Close() is only called once,
+			// so subsequent calls should return nil (not the stored error)
+			t.Errorf("Close() on call %d returned unexpected error: %v", i, err)
 		}
 	}
 
@@ -828,9 +827,9 @@ func TestConnZeroRead(t *testing.T) {
 		// Expected - read is blocking
 	}
 
-	// BytesRead should not have increased from zero reads
+	// BytesRead should not have increased from zero-byte reads
 	if mc.BytesRead() != initialBytes {
-		// This is actually expected behavior - if n=0, no update happens
+		t.Errorf("BytesRead changed unexpectedly after zero-byte read: got %d, want %d", mc.BytesRead(), initialBytes)
 	}
 
 	_ = initialActivity // Activity tracking is implementation detail

@@ -8,8 +8,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ServerHelloBuilder constructs ServerHello messages with controlled JA4S fingerprint.
@@ -137,7 +138,7 @@ func (b *ServerHelloBuilder) Build() (*serverHelloMsg, error) {
 	hello.random = make([]byte, 32)
 	if b.random != nil {
 		if len(b.random) != 32 {
-			return nil, errors.New("server random must be 32 bytes")
+			return nil, utlserrors.New("server random must be 32 bytes").AtError()
 		}
 		copy(hello.random, b.random)
 	} else {
@@ -184,7 +185,7 @@ func (b *ServerHelloBuilder) Build() (*serverHelloMsg, error) {
 		hello.cipherSuite = SelectCipher(b.profile, b.clientHello.cipherSuites)
 	}
 	if hello.cipherSuite == 0 {
-		return nil, errors.New("no cipher suite selected")
+		return nil, utlserrors.New("no cipher suite selected").AtError()
 	}
 
 	// Set compression (always null for TLS 1.3)
@@ -198,7 +199,7 @@ func (b *ServerHelloBuilder) Build() (*serverHelloMsg, error) {
 		if b.keyShareGroup != 0 {
 			// Explicit key share provided via WithKeyShare()
 			if len(b.keyShareData) == 0 {
-				return nil, errors.New("tls: TLS 1.3 requires key share data - use WithKeyShare(group, data)")
+				return nil, utlserrors.New("tls: TLS 1.3 requires key share data - use WithKeyShare(group, data)").AtError()
 			}
 			hello.serverShare = keyShare{
 				group: b.keyShareGroup,
@@ -458,7 +459,7 @@ func formatHexByte(b byte) string {
 func ServerHelloBuilderFromProfile(profileID string) (*ServerHelloBuilder, error) {
 	profile, ok := DefaultServerProfileRegistry.Get(profileID)
 	if !ok {
-		return nil, errors.New("unknown server profile: " + profileID)
+		return nil, utlserrors.New("unknown server profile: " + profileID).AtError()
 	}
 	return NewServerHelloBuilder(profile), nil
 }

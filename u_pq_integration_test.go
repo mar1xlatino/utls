@@ -209,7 +209,10 @@ func TestPQKeyShareSize(t *testing.T) {
 			}
 
 			// Build a connection to generate actual key shares
-			conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, tc.clientHelloID)
+			conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, tc.clientHelloID)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			if err := conn.BuildHandshakeState(); err != nil {
 				t.Fatalf("BuildHandshakeState failed: %v", err)
 			}
@@ -355,7 +358,10 @@ func TestPQWithECH(t *testing.T) {
 		}
 		defer rawConn.Close()
 
-		conn := UClient(rawConn, config, HelloChrome_142)
+		conn, err := UClient(rawConn, config, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("UClient failed: %v", err)
+		}
 		conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 		err = conn.Handshake()
@@ -532,10 +538,13 @@ func TestPQKeyShareValidation(t *testing.T) {
 				},
 			}
 
-			conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
+			conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 
 			// ApplyPreset configures the spec
-			err := conn.ApplyPreset(spec)
+			err = conn.ApplyPreset(spec)
 			if err != nil {
 				if tc.expectError {
 					if tc.errorSubstr == "" || strings.Contains(err.Error(), tc.errorSubstr) {
@@ -600,13 +609,16 @@ func TestPQKeyShareValidationDirect(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ext := &KeyShareExtension{KeyShares: tc.keyShares}
-			conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
+			conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 
 			// Initialize the handshake state
 			conn.HandshakeState.Hello = &PubClientHelloMsg{}
 
 			// Test direct validation through writeToUConn
-			err := ext.writeToUConn(conn)
+			err = ext.writeToUConn(conn)
 
 			if tc.expectError && err == nil {
 				t.Error("Expected error but got none")
@@ -624,7 +636,10 @@ func TestPQKeyGeneration(t *testing.T) {
 	const iterations = 100
 
 	for i := 0; i < iterations; i++ {
-		conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("Iteration %d: UClient failed: %v", i, err)
+		}
 		if err := conn.BuildHandshakeState(); err != nil {
 			t.Fatalf("Iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -668,7 +683,10 @@ func TestPQClientHelloSerialization(t *testing.T) {
 
 	for _, profile := range profiles {
 		t.Run(profile.Str(), func(t *testing.T) {
-			conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, profile)
+			conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, profile)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			if err := conn.BuildHandshakeState(); err != nil {
 				t.Fatalf("BuildHandshakeState failed: %v", err)
 			}
@@ -829,7 +847,10 @@ func TestPQMemoryLeak(t *testing.T) {
 	runtime.ReadMemStats(&before)
 
 	for i := 0; i < iterations; i++ {
-		conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("Iteration %d: UClient failed: %v", i, err)
+		}
 		if err := conn.BuildHandshakeState(); err != nil {
 			t.Fatalf("Iteration %d: BuildHandshakeState failed: %v", i, err)
 		}
@@ -875,7 +896,11 @@ func dialPQServer(t *testing.T, domain string, clientHelloID ClientHelloID) (*UC
 		return nil, ConnectionState{}, fmt.Errorf("dial failed: %w", err)
 	}
 
-	conn := UClient(rawConn, config, clientHelloID)
+	conn, err := UClient(rawConn, config, clientHelloID)
+	if err != nil {
+		rawConn.Close()
+		return nil, ConnectionState{}, fmt.Errorf("UClient failed: %w", err)
+	}
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	err = conn.Handshake()
@@ -949,7 +974,9 @@ func TestPQEdgeCases(t *testing.T) {
 	t.Run("MaxSizeKeyShare", func(t *testing.T) {
 		// Test with maximum reasonable key share size
 		largeData := make([]byte, pqHybridKeyShareSize)
-		rand.Read(largeData)
+		if _, err := rand.Read(largeData); err != nil {
+			t.Fatalf("rand.Read failed: %v", err)
+		}
 
 		spec := &ClientHelloSpec{
 			CipherSuites:       []uint16{TLS_AES_128_GCM_SHA256},
@@ -967,8 +994,11 @@ func TestPQEdgeCases(t *testing.T) {
 			},
 		}
 
-		conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
-		err := conn.ApplyPreset(spec)
+		conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloCustom)
+		if err != nil {
+			t.Fatalf("UClient failed: %v", err)
+		}
+		err = conn.ApplyPreset(spec)
 		if err != nil {
 			t.Errorf("Failed to apply preset with max size key share: %v", err)
 		}
@@ -976,7 +1006,10 @@ func TestPQEdgeCases(t *testing.T) {
 
 	t.Run("MultipleKeySharesOrder", func(t *testing.T) {
 		// Test that key shares maintain their order
-		conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("UClient failed: %v", err)
+		}
 		if err := conn.BuildHandshakeState(); err != nil {
 			t.Fatalf("BuildHandshakeState failed: %v", err)
 		}
@@ -1015,7 +1048,10 @@ func TestPQEdgeCases(t *testing.T) {
 	})
 
 	t.Run("GREASEInKeyShares", func(t *testing.T) {
-		conn := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		conn, err := UClient(&net.TCPConn{}, &Config{ServerName: "test.example.com"}, HelloChrome_142)
+		if err != nil {
+			t.Fatalf("UClient failed: %v", err)
+		}
 		if err := conn.BuildHandshakeState(); err != nil {
 			t.Fatalf("BuildHandshakeState failed: %v", err)
 		}
@@ -1053,7 +1089,11 @@ func TestPQTransportLayerIntegration(t *testing.T) {
 				ServerName: host,
 			}
 
-			conn := UClient(rawConn, config, HelloChrome_142)
+			conn, err := UClient(rawConn, config, HelloChrome_142)
+			if err != nil {
+				rawConn.Close()
+				return nil, err
+			}
 			if err := conn.Handshake(); err != nil {
 				rawConn.Close()
 				return nil, err

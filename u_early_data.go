@@ -54,31 +54,39 @@
 package tls
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"math"
 	"sync"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // Early data (0-RTT) error types.
 var (
 	// ErrEarlyDataNotSupported is returned when attempting to write early data
 	// but the session doesn't support 0-RTT.
-	ErrEarlyDataNotSupported = errors.New("tls: server does not support 0-RTT early data")
+	ErrEarlyDataNotSupported = utlserrors.New("tls: server does not support 0-RTT early data").AtError()
 
 	// ErrEarlyDataRejected is returned when the server rejects 0-RTT data.
 	// The application must resend the data via normal Write() after handshake.
-	ErrEarlyDataRejected = errors.New("tls: server rejected 0-RTT early data")
+	ErrEarlyDataRejected = utlserrors.New("tls: server rejected 0-RTT early data").AtError()
 
 	// ErrEarlyDataTooLarge is returned when early data exceeds max_early_data_size.
-	ErrEarlyDataTooLarge = errors.New("tls: early data exceeds maximum size")
+	ErrEarlyDataTooLarge = utlserrors.New("tls: early data exceeds maximum size").AtError()
 
 	// ErrEarlyDataAfterHandshake is returned when WriteEarlyData is called
 	// after handshake has completed.
-	ErrEarlyDataAfterHandshake = errors.New("tls: handshake already complete, use Write()")
+	ErrEarlyDataAfterHandshake = utlserrors.New("tls: handshake already complete, use Write()").AtError()
 
 	// ErrEarlyDataNoSecret is returned when early traffic secret hasn't been derived.
-	ErrEarlyDataNoSecret = errors.New("tls: early traffic secret not derived")
+	ErrEarlyDataNoSecret = utlserrors.New("tls: early traffic secret not derived").AtError()
+
+	// ErrCipherSuiteMismatch is returned when the cipher suite passed to transmitEarlyData
+	// does not match the cipher suite stored in EarlyDataState. This indicates a bug in
+	// the caller - the cipher suite must match what was negotiated during session resumption.
+	// Using the wrong cipher suite would encrypt data with incorrect keys.
+	ErrCipherSuiteMismatch = utlserrors.New("tls: cipher suite mismatch for early data encryption").AtError()
 )
 
 // EarlyDataState tracks the state of 0-RTT early data.
@@ -129,6 +137,8 @@ func (e *EarlyDataState) Enable(maxSize uint32, trafficSecret []byte) {
 	e.maxSize = maxSize
 	e.trafficSecret = make([]byte, len(trafficSecret))
 	copy(e.trafficSecret, trafficSecret)
+
+	utlserrors.LogDebug(context.Background(), "0-RTT: enabled early data, max_size:", maxSize)
 }
 
 // EnableWithCipherSuite enables early data with the cipher suite for TLS 1.3 encryption.
@@ -143,6 +153,8 @@ func (e *EarlyDataState) EnableWithCipherSuite(maxSize uint32, trafficSecret []b
 	e.cipherSuiteID = cipherSuiteID
 	e.trafficSecret = make([]byte, len(trafficSecret))
 	copy(e.trafficSecret, trafficSecret)
+
+	utlserrors.LogDebug(context.Background(), "0-RTT: enabled early data with cipher suite:", cipherSuiteID, "max_size:", maxSize)
 }
 
 // CipherSuiteID returns the cipher suite ID for early data encryption.
@@ -211,6 +223,8 @@ func (e *EarlyDataState) SetAccepted() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.accepted = true
+
+	utlserrors.LogDebug(context.Background(), "0-RTT: server accepted early data")
 }
 
 // SetRejected marks early data as rejected by server.
@@ -218,6 +232,8 @@ func (e *EarlyDataState) SetRejected() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.rejected = true
+
+	utlserrors.LogDebug(context.Background(), "0-RTT: server rejected early data, data must be resent")
 }
 
 // IsAccepted returns true if server accepted early data.
@@ -270,6 +286,57 @@ func (e *EarlyDataState) RecordWrite(data []byte) error {
 	return nil
 }
 
+// TryRecordWrite atomically checks if the data fits within max_early_data_size
+// and records the write if it does. This prevents TOCTOU race conditions where
+// concurrent calls to WriteEarlyData() could exceed max_early_data_size.
+//
+// This method acquires the lock once and performs both the size check and the
+// write operation atomically, eliminating the race window that exists when
+// calling MaxSize(), BytesWritten(), and RecordWrite() separately.
+//
+// Returns:
+//   - currentWritten: bytes written before this call (for logging)
+//   - nil error on success
+//   - ErrEarlyDataTooLarge if the write would exceed limits
+func (e *EarlyDataState) TryRecordWrite(data []byte) (currentWritten uint32, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Capture current state for return value (useful for logging)
+	currentWritten = e.written
+
+	// Security: Validate len(data) fits in uint32 before cast to prevent silent truncation
+	if len(data) > math.MaxUint32 {
+		return currentWritten, fmt.Errorf("%w: data length %d exceeds uint32 max",
+			ErrEarlyDataTooLarge, len(data))
+	}
+	dataLen := uint32(len(data))
+
+	// Security: Check for integer overflow before addition
+	if dataLen > 0xFFFFFFFF-e.written {
+		return currentWritten, fmt.Errorf("%w: would overflow uint32", ErrEarlyDataTooLarge)
+	}
+
+	newTotal := e.written + dataLen
+
+	// Atomic check: verify write fits within configured max size
+	if e.maxSize > 0 && newTotal > e.maxSize {
+		return currentWritten, fmt.Errorf("%w: %d + %d exceeds max %d",
+			ErrEarlyDataTooLarge, e.written, dataLen, e.maxSize)
+	}
+
+	// Security: Enforce absolute max to prevent memory exhaustion
+	if newTotal > maxEarlyDataBufferSize {
+		return currentWritten, fmt.Errorf("%w: %d bytes exceeds absolute max %d",
+			ErrEarlyDataTooLarge, newTotal, maxEarlyDataBufferSize)
+	}
+
+	// Atomic write: update state within the same lock acquisition
+	e.written = newTotal
+	e.buffer = append(e.buffer, data...)
+	return currentWritten, nil
+}
+
 // BytesWritten returns total bytes written as early data.
 func (e *EarlyDataState) BytesWritten() uint32 {
 	e.mu.RLock()
@@ -292,15 +359,23 @@ func (e *EarlyDataState) BufferedData() []byte {
 
 // ClearBuffer clears the early data buffer (after acceptance or resend).
 // Also resets the written counter for consistency.
+// The buffer is zeroed before release to prevent sensitive early data from
+// lingering in memory.
 func (e *EarlyDataState) ClearBuffer() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.buffer = nil
+	// Zero early data buffer before releasing to prevent sensitive application
+	// data from lingering in memory. zeroSlice includes runtime.KeepAlive
+	// to prevent compiler optimization.
+	if e.buffer != nil {
+		zeroSlice(e.buffer)
+		e.buffer = nil
+	}
 	e.written = 0 // Reset counter to match cleared buffer
 }
 
 // Reset resets all early data state.
-// Securely zeros the traffic secret before releasing it.
+// Securely zeros sensitive data (buffer and traffic secret) before releasing.
 func (e *EarlyDataState) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -310,7 +385,12 @@ func (e *EarlyDataState) Reset() {
 	e.rejected = false
 	e.maxSize = 0
 	e.written = 0
-	e.buffer = nil
+	// Zero early data buffer before releasing to prevent sensitive application
+	// data from lingering in memory.
+	if e.buffer != nil {
+		zeroSlice(e.buffer)
+		e.buffer = nil
+	}
 	e.cipherSuiteID = 0
 	e.transmitted = false
 	// Zero traffic secret before releasing to prevent key material from lingering in memory.
@@ -410,41 +490,35 @@ func DefaultEarlyDataConfig() *EarlyDataConfig {
 // Returns ErrEarlyDataNotSupported if early data is not enabled for this connection.
 // Must be called after setting up session resumption but before Handshake().
 func (uconn *UConn) WriteEarlyData(data []byte) (int, error) {
+	ctx := context.Background()
+
 	// Check handshake state
 	if uconn.ConnectionState().HandshakeComplete {
+		utlserrors.LogDebug(ctx, "0-RTT: write rejected - handshake already complete")
 		return 0, ErrEarlyDataAfterHandshake
 	}
 
 	// Check early data state
 	if uconn.earlyData == nil {
+		utlserrors.LogDebug(ctx, "0-RTT: write rejected - early data not initialized")
 		return 0, ErrEarlyDataNotSupported
 	}
 
 	if !uconn.earlyData.IsEnabled() {
+		utlserrors.LogDebug(ctx, "0-RTT: write rejected - early data not enabled")
 		return 0, ErrEarlyDataNotSupported
 	}
 
-	// Check max size with integer overflow protection
-	maxSize := uconn.earlyData.MaxSize()
-	if maxSize > 0 {
-		// Protect against integer truncation: len(data) could exceed uint32 max
-		if len(data) > math.MaxUint32 {
-			return 0, fmt.Errorf("%w: data length %d exceeds uint32 max",
-				ErrEarlyDataTooLarge, len(data))
-		}
-		currentWritten := uconn.earlyData.BytesWritten()
-		// Safe overflow check: instead of (a + b > max) which can overflow,
-		// use (b > max - a) which is safe when max >= a (always true here)
-		if uint32(len(data)) > maxSize-currentWritten {
-			return 0, fmt.Errorf("%w: %d + %d exceeds max %d",
-				ErrEarlyDataTooLarge, currentWritten, len(data), maxSize)
-		}
-	}
-
-	// Record write for potential resend
-	if err := uconn.earlyData.RecordWrite(data); err != nil {
+	// Atomically check size limits and record write to prevent TOCTOU race condition.
+	// TryRecordWrite performs the size check and buffer write under a single lock,
+	// ensuring concurrent calls cannot exceed max_early_data_size (RFC 8446 compliance).
+	currentWritten, err := uconn.earlyData.TryRecordWrite(data)
+	if err != nil {
+		utlserrors.LogDebug(ctx, "0-RTT: write rejected -", err)
 		return 0, err
 	}
+
+	utlserrors.LogDebug(ctx, "0-RTT: buffered early data, size:", len(data), "total written:", currentWritten+uint32(len(data)))
 
 	// Write early data record
 	// Note: Actual encryption requires cipher setup from early traffic secret
@@ -454,7 +528,7 @@ func (uconn *UConn) WriteEarlyData(data []byte) (int, error) {
 // ErrEarlyDataNotImplemented is kept for backwards compatibility.
 // Note: True 0-RTT early data transmission IS now implemented for standard TLS (non-QUIC).
 // This error may still be returned in edge cases where transmission fails.
-var ErrEarlyDataNotImplemented = errors.New("tls: early data transmission failed")
+var ErrEarlyDataNotImplemented = utlserrors.New("tls: early data transmission failed").AtError()
 
 // writeEarlyDataInternal buffers early data for transmission.
 //
@@ -555,6 +629,8 @@ func (uconn *UConn) ClearEarlyDataBuffer() {
 //   - Early data was already accepted by server (transmitted as 0-RTT)
 //   - Early data was already transmitted but awaiting acceptance
 func (uconn *UConn) sendBufferedEarlyData() error {
+	ctx := context.Background()
+
 	if uconn.earlyData == nil {
 		return nil
 	}
@@ -562,28 +638,48 @@ func (uconn *UConn) sendBufferedEarlyData() error {
 	// If server accepted early data, it was already delivered via 0-RTT.
 	// Buffer should already be cleared by readServerParameters(), but check anyway.
 	if uconn.earlyData.IsAccepted() {
+		utlserrors.LogDebug(ctx, "0-RTT: early data already accepted, no fallback needed")
 		return nil
 	}
 
-	// If early data was transmitted as 0-RTT but server rejected it,
-	// the buffered data needs to be resent via regular application data.
-	// If early data was NOT transmitted (e.g., no session available),
-	// but data was buffered via WriteEarlyData(), also send it now.
+	// CRITICAL FIX: If early data was already transmitted as 0-RTT records,
+	// do NOT resend automatically - even if the server rejected it.
+	// Automatic resend would cause double transmission of data that was already
+	// sent over the wire, potentially executing non-idempotent operations twice
+	// (e.g., financial transactions, state changes).
+	//
+	// Per RFC 8446, when server rejects 0-RTT, the application is responsible for
+	// deciding whether to resend. Use EarlyDataRejected() to detect rejection and
+	// EarlyDataBufferedData() to retrieve the buffered data for manual resend.
+	if uconn.earlyData.WasTransmitted() {
+		utlserrors.LogDebug(ctx, "0-RTT: early data was already transmitted as 0-RTT, skipping automatic resend")
+		return nil
+	}
 
+	// If early data was NOT transmitted (e.g., no session available, cipher setup
+	// failed, or transmission error), but data was buffered via WriteEarlyData(),
+	// send it now as regular application data. This implements "silent fallback"
+	// for cases where true 0-RTT transmission did not occur.
 	buffered := uconn.earlyData.BufferedData()
 	if len(buffered) == 0 {
 		return nil
 	}
 
+	utlserrors.LogDebug(ctx, "0-RTT: sending buffered early data as fallback, size:", len(buffered))
+
 	// Write the buffered data using normal Write() now that handshake is complete
 	n, err := uconn.Write(buffered)
 	if err != nil {
-		return fmt.Errorf("tls: failed to send buffered early data: %w", err)
+		utlserrors.LogDebug(ctx, "0-RTT: fallback write failed:", err)
+		return utlserrors.New("tls: failed to send buffered early data").Base(err).AtError()
 	}
 
 	if n != len(buffered) {
-		return fmt.Errorf("tls: incomplete write of buffered early data: wrote %d of %d bytes", n, len(buffered))
+		utlserrors.LogDebug(ctx, "0-RTT: fallback write incomplete:", n, "of", len(buffered), "bytes")
+		return utlserrors.New("tls: incomplete write of buffered early data: wrote", n, "of", len(buffered), "bytes").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "0-RTT: fallback write complete, sent", n, "bytes")
 
 	// Clear the buffer after successful send
 	uconn.earlyData.ClearBuffer()
@@ -626,7 +722,22 @@ func (uconn *UConn) HasBufferedEarlyData() bool {
 //   - earlyTrafficSecret: The client_early_traffic_secret for encryption
 //
 // Returns error if transmission fails. Returns nil if no data to transmit.
-func (uconn *UConn) transmitEarlyData(suite *cipherSuiteTLS13, earlyTrafficSecret []byte) error {
+//
+// Error Handling and State Restoration:
+//
+// This function uses a defer to restore cipher state on ANY error after state is
+// saved. This ensures consistent state restoration regardless of which operation
+// fails (setTrafficSecret, writeRecordLocked, or flush).
+//
+// IMPORTANT: If writeRecordLocked() partially succeeds (writes some data before
+// failing), data has already been sent over the wire with the new cipher state.
+// In this case, state restoration maintains internal consistency but the connection
+// should be considered compromised and not reused. The sequence number restoration
+// could theoretically cause record replay issues if the connection were reused,
+// but since TLS connections are typically abandoned on error, this is acceptable.
+func (uconn *UConn) transmitEarlyData(suite *cipherSuiteTLS13, earlyTrafficSecret []byte) (transmitErr error) {
+	ctx := context.Background()
+
 	if uconn.earlyData == nil {
 		return nil
 	}
@@ -634,16 +745,34 @@ func (uconn *UConn) transmitEarlyData(suite *cipherSuiteTLS13, earlyTrafficSecre
 	// Get buffered data to transmit
 	buffered := uconn.earlyData.BufferedData()
 	if len(buffered) == 0 {
+		utlserrors.LogDebug(ctx, "0-RTT: no buffered data to transmit")
 		return nil
 	}
 
-	// Validate parameters
+	// Validate parameters - these early returns are safe because cipher state
+	// has not been modified yet.
 	if suite == nil {
-		return errors.New("tls: early data transmission requires cipher suite")
+		utlserrors.LogDebug(ctx, "0-RTT: transmission failed - no cipher suite")
+		return utlserrors.New("tls: early data transmission requires cipher suite").AtError()
 	}
+
+	// Validate cipher suite matches what was negotiated for early data.
+	// This is a critical security check - using the wrong cipher suite would
+	// encrypt data with incorrect keys, potentially causing decryption failure
+	// or security issues. A mismatch indicates a bug in the caller.
+	expectedSuiteID := uconn.earlyData.CipherSuiteID()
+	if expectedSuiteID != 0 && suite.id != expectedSuiteID {
+		utlserrors.LogDebug(ctx, "0-RTT: transmission failed - cipher suite mismatch: expected",
+			fmt.Sprintf("0x%04x", expectedSuiteID), "got", fmt.Sprintf("0x%04x", suite.id))
+		return fmt.Errorf("%w: expected 0x%04x, got 0x%04x", ErrCipherSuiteMismatch, expectedSuiteID, suite.id)
+	}
+
 	if len(earlyTrafficSecret) == 0 {
+		utlserrors.LogDebug(ctx, "0-RTT: transmission failed - no early traffic secret")
 		return ErrEarlyDataNoSecret
 	}
+
+	utlserrors.LogDebug(ctx, "0-RTT: attempting early data transmission, size:", len(buffered), "cipher suite:", fmt.Sprintf("0x%04x", suite.id))
 
 	// Enforce max_early_data_size limit from session ticket.
 	// Per RFC 8446 Section 4.2.10, the client MUST NOT send more than
@@ -653,67 +782,89 @@ func (uconn *UConn) transmitEarlyData(suite *cipherSuiteTLS13, earlyTrafficSecre
 		// Truncate to max size - the remaining data will be sent via fallback
 		// after handshake completes (if server accepts early data, this truncation
 		// means we send less; if server rejects, all buffered data is resent).
+		utlserrors.LogDebug(ctx, "0-RTT: truncating early data from", len(buffered), "to max_early_data_size:", maxSize)
 		buffered = buffered[:maxSize]
 	}
 
 	c := uconn.Conn
 
-	// Save current output cipher state to restore after early data transmission.
-	// After early data, the handshake will set up handshake keys, which will
-	// overwrite the early data cipher. This save/restore is for safety in case
-	// of errors during transmission.
+	// Save current output cipher state BEFORE any modifications.
+	// This state will be restored on ANY error via defer.
 	savedCipher := c.out.cipher
 	savedTrafficSecret := c.out.trafficSecret
 	savedSeq := c.out.seq
 	savedLevel := c.out.level
 
-	// Set up the output cipher with early traffic secret
-	// This uses the same mechanism as handshake/application traffic keys
+	// Defer state restoration on ANY error after this point.
+	// This ensures consistent behavior regardless of which operation fails:
+	// - setTrafficSecret failure: restores state (cipher may be partially set)
+	// - writeRecordLocked failure: restores state (but wire may have partial data)
+	// - flush failure: restores state (previously missing, causing BUG)
+	//
+	// Note on partial writes: If writeRecordLocked() writes some data before failing,
+	// that data is already on the wire and cannot be recalled. Restoring state
+	// maintains internal consistency but the connection is effectively broken.
+	defer func() {
+		if transmitErr != nil {
+			c.out.cipher = savedCipher
+			c.out.trafficSecret = savedTrafficSecret
+			c.out.seq = savedSeq
+			c.out.level = savedLevel
+			utlserrors.LogDebug(ctx, "0-RTT: restored cipher state after error")
+		}
+	}()
+
+	// Set up the output cipher with early traffic secret.
+	// This uses the same mechanism as handshake/application traffic keys.
+	// If this fails, the defer will restore the original cipher state.
 	if err := c.out.setTrafficSecret(suite, QUICEncryptionLevelEarly, earlyTrafficSecret); err != nil {
-		return fmt.Errorf("tls: failed to set early data cipher: %w", err)
+		utlserrors.LogDebug(ctx, "0-RTT: failed to set early data cipher:", err)
+		transmitErr = utlserrors.New("tls: failed to set early data cipher").Base(err).AtError()
+		return transmitErr
 	}
 
-	// Write early data as application_data records (content type 0x17)
-	// The data will be encrypted with the early traffic keys
+	// Write early data as application_data records (content type 0x17).
+	// The data will be encrypted with the early traffic keys.
 	c.out.Lock()
 	n, err := c.writeRecordLocked(recordTypeApplicationData, buffered)
 	c.out.Unlock()
 
 	if err != nil {
-		// Restore cipher state on error
-		c.out.cipher = savedCipher
-		c.out.trafficSecret = savedTrafficSecret
-		c.out.seq = savedSeq
-		c.out.level = savedLevel
-		return fmt.Errorf("tls: failed to write early data records: %w", err)
+		utlserrors.LogDebug(ctx, "0-RTT: failed to write early data records:", err)
+		transmitErr = utlserrors.New("tls: failed to write early data records").Base(err).AtError()
+		return transmitErr
 	}
 
 	if n != len(buffered) {
-		// Restore cipher state on partial write
-		c.out.cipher = savedCipher
-		c.out.trafficSecret = savedTrafficSecret
-		c.out.seq = savedSeq
-		c.out.level = savedLevel
-		return fmt.Errorf("tls: incomplete early data transmission: wrote %d of %d bytes", n, len(buffered))
+		utlserrors.LogDebug(ctx, "0-RTT: incomplete transmission:", n, "of", len(buffered), "bytes")
+		transmitErr = utlserrors.New("tls: incomplete early data transmission: wrote", n, "of", len(buffered), "bytes").AtError()
+		return transmitErr
 	}
 
-	// Flush to ensure data is sent over the wire before reading ServerHello
+	// Flush to ensure data is sent over the wire before reading ServerHello.
+	// FIXED: Previously, flush errors did not trigger state restoration.
+	// Now the defer handles this automatically.
 	if _, err := c.flush(); err != nil {
-		return fmt.Errorf("tls: failed to flush early data: %w", err)
+		utlserrors.LogDebug(ctx, "0-RTT: failed to flush early data:", err)
+		transmitErr = utlserrors.New("tls: failed to flush early data").Base(err).AtError()
+		return transmitErr
 	}
+
+	utlserrors.LogDebug(ctx, "0-RTT: early data transmitted successfully, size:", n)
 
 	// Mark early data as transmitted
 	uconn.earlyData.SetTransmitted()
 
-	// Write to key log for debugging with tools like Wireshark
+	// Write to key log for debugging with tools like Wireshark.
+	// This is non-fatal - early data has been transmitted successfully.
 	if err := c.config.writeKeyLog(keyLogLabelClientEarlyTraffic, uconn.HandshakeState.Hello.Random, earlyTrafficSecret); err != nil {
-		// Log error but don't fail - key logging is optional
-		// The early data has been transmitted successfully at this point
+		utlserrors.LogDebug(ctx, "0-RTT: key log write failed (non-fatal):", err)
 	}
 
-	// Note: We do NOT restore the cipher state here because the handshake will
-	// immediately set up handshake keys after receiving ServerHello.
+	// Note: On success, we do NOT restore the cipher state because the handshake
+	// will immediately set up handshake keys after receiving ServerHello.
 	// The early data cipher is only used for these initial records.
+	// transmitErr remains nil, so defer does not restore state.
 
 	return nil
 }

@@ -5,11 +5,11 @@
 package tls
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"strings"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/net/idna"
 )
 
@@ -161,7 +161,7 @@ func ValidateSNIStrict(hostname string) error {
 // validateSNILabel validates a single label of a hostname.
 func validateSNILabel(label string) error {
 	if len(label) == 0 {
-		return errors.New("empty label (consecutive dots)")
+		return utlserrors.New("empty label (consecutive dots)").AtError()
 	}
 
 	if len(label) > MaxSNILabelLength {
@@ -170,10 +170,10 @@ func validateSNILabel(label string) error {
 
 	// Check for hyphen at start or end
 	if label[0] == '-' {
-		return errors.New("label cannot start with hyphen")
+		return utlserrors.New("label cannot start with hyphen").AtError()
 	}
 	if label[len(label)-1] == '-' {
-		return errors.New("label cannot end with hyphen")
+		return utlserrors.New("label cannot end with hyphen").AtError()
 	}
 
 	// Validate each character
@@ -237,7 +237,7 @@ func isAllNumeric(s string) bool {
 func validatePunycodeLabel(label string) error {
 	// Punycode labels must be at least 4 characters (xn--)
 	if len(label) < 4 {
-		return errors.New("invalid Punycode prefix")
+		return utlserrors.New("invalid Punycode prefix").AtError()
 	}
 
 	// Syntactic validation already done by validateSNILabel:

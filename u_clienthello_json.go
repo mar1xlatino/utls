@@ -2,14 +2,14 @@ package tls
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 
 	"github.com/refraction-networking/utls/dicttls"
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
-var ErrUnknownExtension = errors.New("extension name is unknown to the dictionary")
+var ErrUnknownExtension = utlserrors.New("tls: extension name is unknown to the dictionary").AtError()
 
 type ClientHelloSpecJSONUnmarshaler struct {
 	CipherSuites       *CipherSuitesJSONUnmarshaler       `json:"cipher_suites"`
@@ -94,6 +94,12 @@ func (e *TLSExtensionsJSONUnmarshaler) UnmarshalJSON(jsonStr []byte) error {
 	var accepters []tlsExtensionJSONAccepter
 	if err := json.Unmarshal(jsonStr, &accepters); err != nil {
 		return err
+	}
+
+	// Handle JSON null or empty array case - accepters may be nil after unmarshal
+	if accepters == nil {
+		e.extensions = nil
+		return nil
 	}
 
 	var exts []TLSExtensionJSON = make([]TLSExtensionJSON, 0, len(accepters))

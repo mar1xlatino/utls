@@ -6,56 +6,67 @@ package tls
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
-	"errors"
 	"fmt"
 	"hash"
 	"io"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // verifyHandshakeSignature verifies a signature against pre-hashed
 // (if required) handshake contents.
 func verifyHandshakeSignature(sigType uint8, pubkey crypto.PublicKey, hashFunc crypto.Hash, signed, sig []byte) error {
+	// Debug log signature type being verified (no key material)
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: verifying signature type:", sigType)
+	}
+
 	switch sigType {
 	case signatureECDSA:
 		pubKey, ok := pubkey.(*ecdsa.PublicKey)
 		if !ok {
-			return fmt.Errorf("expected an ECDSA public key, got %T", pubkey)
+			return utlserrors.New("tls: expected an ECDSA public key, got ", fmt.Sprintf("%T", pubkey)).AtError()
 		}
 		if !ecdsa.VerifyASN1(pubKey, signed, sig) {
-			return errors.New("ECDSA verification failure")
+			return utlserrors.New("tls: ECDSA verification failure").AtError()
 		}
 	case signatureEd25519:
 		pubKey, ok := pubkey.(ed25519.PublicKey)
 		if !ok {
-			return fmt.Errorf("expected an Ed25519 public key, got %T", pubkey)
+			return utlserrors.New("tls: expected an Ed25519 public key, got ", fmt.Sprintf("%T", pubkey)).AtError()
 		}
 		if !ed25519.Verify(pubKey, signed, sig) {
-			return errors.New("Ed25519 verification failure")
+			return utlserrors.New("tls: Ed25519 verification failure").AtError()
 		}
 	case signaturePKCS1v15:
 		pubKey, ok := pubkey.(*rsa.PublicKey)
 		if !ok {
-			return fmt.Errorf("expected an RSA public key, got %T", pubkey)
+			return utlserrors.New("tls: expected an RSA public key, got ", fmt.Sprintf("%T", pubkey)).AtError()
 		}
 		if err := rsa.VerifyPKCS1v15(pubKey, hashFunc, signed, sig); err != nil {
-			return err
+			return utlserrors.New("tls: RSA PKCS1v15 verification failure").Base(err).AtError()
 		}
 	case signatureRSAPSS:
 		pubKey, ok := pubkey.(*rsa.PublicKey)
 		if !ok {
-			return fmt.Errorf("expected an RSA public key, got %T", pubkey)
+			return utlserrors.New("tls: expected an RSA public key, got ", fmt.Sprintf("%T", pubkey)).AtError()
 		}
 		signOpts := &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}
 		if err := rsa.VerifyPSS(pubKey, hashFunc, signed, sig, signOpts); err != nil {
-			return err
+			return utlserrors.New("tls: RSA-PSS verification failure").Base(err).AtError()
 		}
 	default:
-		return errors.New("internal error: unknown signature type")
+		return utlserrors.New("tls: internal error: unknown signature type ", sigType).AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: signature verified successfully")
 	}
 	return nil
 }
@@ -106,7 +117,7 @@ func typeAndHashFromSignatureScheme(signatureAlgorithm SignatureScheme) (sigType
 	case Ed25519:
 		sigType = signatureEd25519
 	default:
-		return 0, 0, fmt.Errorf("unsupported signature algorithm: %v", signatureAlgorithm)
+		return 0, 0, utlserrors.New("tls: unsupported signature algorithm: ", signatureAlgorithm).AtError()
 	}
 	switch signatureAlgorithm {
 	case PKCS1WithSHA1, ECDSAWithSHA1:
@@ -120,7 +131,7 @@ func typeAndHashFromSignatureScheme(signatureAlgorithm SignatureScheme) (sigType
 	case Ed25519:
 		hash = directSigning
 	default:
-		return 0, 0, fmt.Errorf("unsupported signature algorithm: %v", signatureAlgorithm)
+		return 0, 0, utlserrors.New("tls: unsupported signature algorithm: ", signatureAlgorithm).AtError()
 	}
 	return sigType, hash, nil
 }
@@ -139,9 +150,9 @@ func legacyTypeAndHashFromPublicKey(pub crypto.PublicKey) (sigType uint8, hash c
 		// but it requires holding on to a handshake transcript to do a
 		// full signature, and not even OpenSSL bothers with the
 		// complexity, so we can't even test it properly.
-		return 0, 0, fmt.Errorf("tls: Ed25519 public keys are not supported before TLS 1.2")
+		return 0, 0, utlserrors.New("tls: Ed25519 public keys are not supported before TLS 1.2").AtError()
 	default:
-		return 0, 0, fmt.Errorf("tls: unsupported public key: %T", pub)
+		return 0, 0, utlserrors.New("tls: unsupported public key: ", fmt.Sprintf("%T", pub)).AtError()
 	}
 }
 
@@ -248,10 +259,13 @@ func selectSignatureScheme(vers uint16, c *Certificate, peerAlgs []SignatureSche
 		// }
 		// [uTLS] SECTION END
 		if isSupportedSignatureAlgorithm(preferredAlg, supportedAlgs) {
+			if utlserrors.DebugLoggingEnabled {
+				utlserrors.LogDebug(context.Background(), "tls: selected signature scheme:", preferredAlg)
+			}
 			return preferredAlg, nil
 		}
 	}
-	return 0, errors.New("tls: peer doesn't support any of the certificate's signature algorithms")
+	return 0, utlserrors.New("tls: peer doesn't support any of the certificate's signature algorithms").AtError()
 }
 
 // unsupportedCertificateError returns a helpful error for certificates with
@@ -259,16 +273,16 @@ func selectSignatureScheme(vers uint16, c *Certificate, peerAlgs []SignatureSche
 func unsupportedCertificateError(cert *Certificate) error {
 	switch cert.PrivateKey.(type) {
 	case rsa.PrivateKey, ecdsa.PrivateKey:
-		return fmt.Errorf("tls: unsupported certificate: private key is %T, expected *%T",
-			cert.PrivateKey, cert.PrivateKey)
+		return utlserrors.New("tls: unsupported certificate: private key is ", fmt.Sprintf("%T", cert.PrivateKey),
+			", expected *", fmt.Sprintf("%T", cert.PrivateKey)).AtError()
 	case *ed25519.PrivateKey:
-		return fmt.Errorf("tls: unsupported certificate: private key is *ed25519.PrivateKey, expected ed25519.PrivateKey")
+		return utlserrors.New("tls: unsupported certificate: private key is *ed25519.PrivateKey, expected ed25519.PrivateKey").AtError()
 	}
 
 	signer, ok := cert.PrivateKey.(crypto.Signer)
 	if !ok {
-		return fmt.Errorf("tls: certificate private key (%T) does not implement crypto.Signer",
-			cert.PrivateKey)
+		return utlserrors.New("tls: certificate private key (", fmt.Sprintf("%T", cert.PrivateKey),
+			") does not implement crypto.Signer").AtError()
 	}
 
 	switch pub := signer.Public().(type) {
@@ -278,18 +292,18 @@ func unsupportedCertificateError(cert *Certificate) error {
 		case elliptic.P384():
 		case elliptic.P521():
 		default:
-			return fmt.Errorf("tls: unsupported certificate curve (%s)", pub.Curve.Params().Name)
+			return utlserrors.New("tls: unsupported certificate curve (", pub.Curve.Params().Name, ")").AtError()
 		}
 	case *rsa.PublicKey:
-		return fmt.Errorf("tls: certificate RSA key size too small for supported signature algorithms")
+		return utlserrors.New("tls: certificate RSA key size too small for supported signature algorithms").AtError()
 	case ed25519.PublicKey:
 	default:
-		return fmt.Errorf("tls: unsupported certificate key (%T)", pub)
+		return utlserrors.New("tls: unsupported certificate key (", fmt.Sprintf("%T", pub), ")").AtError()
 	}
 
 	if cert.SupportedSignatureAlgorithms != nil {
-		return fmt.Errorf("tls: peer doesn't support the certificate custom signature algorithms")
+		return utlserrors.New("tls: peer doesn't support the certificate custom signature algorithms").AtError()
 	}
 
-	return fmt.Errorf("tls: internal error: unsupported key (%T)", cert.PrivateKey)
+	return utlserrors.New("tls: internal error: unsupported key (", fmt.Sprintf("%T", cert.PrivateKey), ")").AtError()
 }

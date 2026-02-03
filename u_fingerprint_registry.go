@@ -5,13 +5,14 @@
 package tls
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"sort"
 	"sync"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ProfileRegistry manages all available fingerprint profiles.
@@ -29,12 +30,17 @@ func NewProfileRegistry() *ProfileRegistry {
 
 // Get retrieves a profile by ID.
 func (r *ProfileRegistry) Get(id string) (*FingerprintProfile, error) {
+	ctx := context.Background()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "registry lookup: profileID=", id)
+	}
+
 	profile, ok := r.profiles[id]
 	if !ok {
-		return nil, fmt.Errorf("tls: profile %q not found", id)
+		return nil, utlserrors.New("tls: profile \"", id, "\" not found").AtError()
 	}
 
 	return profile.Clone(), nil
@@ -42,50 +48,64 @@ func (r *ProfileRegistry) Get(id string) (*FingerprintProfile, error) {
 
 // Register adds a new profile to the registry.
 func (r *ProfileRegistry) Register(profile *FingerprintProfile) error {
+	ctx := context.Background()
+
 	if profile == nil {
-		return errors.New("tls: cannot register nil profile")
+		return utlserrors.New("tls: cannot register nil profile").AtError()
 	}
 
 	if profile.ID == "" {
-		return errors.New("tls: profile ID must not be empty")
+		return utlserrors.New("tls: profile ID must not be empty").AtError()
 	}
 
 	// Validate the profile
 	if errs := profile.Validate(); len(errs) > 0 {
-		return fmt.Errorf("tls: profile validation failed: %w", errs[0])
+		return utlserrors.New("tls: profile validation failed").Base(errs[0]).AtError()
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.profiles[profile.ID]; exists {
-		return fmt.Errorf("tls: profile %q already registered", profile.ID)
+		return utlserrors.New("tls: profile \"", profile.ID, "\" already registered").AtError()
 	}
 
 	r.profiles[profile.ID] = profile.Clone()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "registered profile: id=", profile.ID, ", browser=", profile.Browser, ", version=", profile.Version)
+	}
+
 	return nil
 }
 
 // RegisterOrUpdate adds or updates a profile in the registry.
 // Unlike Register, this allows overwriting existing profiles.
 func (r *ProfileRegistry) RegisterOrUpdate(profile *FingerprintProfile) error {
+	ctx := context.Background()
+
 	if profile == nil {
-		return errors.New("tls: cannot register nil profile")
+		return utlserrors.New("tls: cannot register nil profile").AtError()
 	}
 
 	if profile.ID == "" {
-		return errors.New("tls: profile ID must not be empty")
+		return utlserrors.New("tls: profile ID must not be empty").AtError()
 	}
 
 	// Validate the profile (same as Register)
 	if errs := profile.Validate(); len(errs) > 0 {
-		return fmt.Errorf("tls: profile validation failed: %w", errs[0])
+		return utlserrors.New("tls: profile validation failed").Base(errs[0]).AtError()
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.profiles[profile.ID] = profile.Clone()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "registered/updated profile: id=", profile.ID)
+	}
+
 	return nil
 }
 
@@ -95,7 +115,7 @@ func (r *ProfileRegistry) Unregister(id string) error {
 	defer r.mu.Unlock()
 
 	if _, exists := r.profiles[id]; !exists {
-		return fmt.Errorf("tls: profile %q not found", id)
+		return utlserrors.New("tls: profile \"", id, "\" not found").AtError()
 	}
 
 	delete(r.profiles, id)
@@ -180,8 +200,14 @@ type ProfileCriteria struct {
 
 // Match finds a profile matching criteria.
 func (r *ProfileRegistry) Match(criteria ProfileCriteria) (*FingerprintProfile, error) {
+	ctx := context.Background()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "matching profile: browser=", criteria.Browser,
+			", platform=", criteria.Platform, ", minVersion=", criteria.MinVersion)
+	}
 
 	for _, profile := range r.profiles {
 		if criteria.Browser != "" && profile.Browser != criteria.Browser {
@@ -203,13 +229,18 @@ func (r *ProfileRegistry) Match(criteria ProfileCriteria) (*FingerprintProfile, 
 		return profile.Clone(), nil
 	}
 
-	return nil, errors.New("tls: no profile matches criteria")
+	return nil, utlserrors.New("tls: no profile matches criteria").AtError()
 }
 
 // Latest returns the latest version of a browser/platform combination.
 func (r *ProfileRegistry) Latest(browser, platform string) (*FingerprintProfile, error) {
+	ctx := context.Background()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "finding latest profile: browser=", browser, ", platform=", platform)
+	}
 
 	var latest *FingerprintProfile
 	for _, profile := range r.profiles {
@@ -225,7 +256,7 @@ func (r *ProfileRegistry) Latest(browser, platform string) (*FingerprintProfile,
 	}
 
 	if latest == nil {
-		return nil, fmt.Errorf("tls: no profile found for browser %q platform %q", browser, platform)
+		return nil, utlserrors.New("tls: no profile found for browser \"", browser, "\" platform \"", platform, "\"").AtError()
 	}
 
 	return latest.Clone(), nil
@@ -257,7 +288,7 @@ func (r *ProfileRegistry) Random(filter *ProfileFilter) (*FingerprintProfile, er
 	}
 
 	if len(candidates) == 0 {
-		return nil, errors.New("tls: no profiles match filter")
+		return nil, utlserrors.New("tls: no profiles match filter").AtError()
 	}
 
 	// Select random profile using rejection sampling to avoid modulo bias
@@ -306,7 +337,7 @@ func (r *ProfileRegistry) Export(id string) ([]byte, error) {
 
 	profile, ok := r.profiles[id]
 	if !ok {
-		return nil, fmt.Errorf("tls: profile %q not found", id)
+		return nil, utlserrors.New("tls: profile \"", id, "\" not found").AtError()
 	}
 
 	return json.MarshalIndent(profile, "", "  ")
@@ -324,7 +355,7 @@ func (r *ProfileRegistry) ExportAll() ([]byte, error) {
 func (r *ProfileRegistry) Import(data []byte) error {
 	var profile FingerprintProfile
 	if err := json.Unmarshal(data, &profile); err != nil {
-		return fmt.Errorf("tls: failed to unmarshal profile: %w", err)
+		return utlserrors.New("tls: failed to unmarshal profile").Base(err).AtError()
 	}
 
 	return r.Register(&profile)
@@ -334,7 +365,7 @@ func (r *ProfileRegistry) Import(data []byte) error {
 func (r *ProfileRegistry) ImportAll(data []byte) error {
 	var profiles map[string]*FingerprintProfile
 	if err := json.Unmarshal(data, &profiles); err != nil {
-		return fmt.Errorf("tls: failed to unmarshal profiles: %w", err)
+		return utlserrors.New("tls: failed to unmarshal profiles").Base(err).AtError()
 	}
 
 	for _, profile := range profiles {

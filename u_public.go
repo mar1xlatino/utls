@@ -9,6 +9,7 @@ import (
 	"crypto/ecdh"
 	"crypto/mlkem"
 	"crypto/x509"
+	"errors"
 	"hash"
 	"time"
 )
@@ -466,7 +467,11 @@ func UnmarshalClientHello(data []byte) *PubClientHelloMsg {
 // Marshal allows external code to convert a ClientHello object back into
 // raw bytes.
 func (chm *PubClientHelloMsg) Marshal() ([]byte, error) {
-	return chm.getPrivatePtr().marshal()
+	p := chm.getPrivatePtr()
+	if p == nil {
+		return nil, errors.New("tls: cannot marshal nil ClientHelloMsg")
+	}
+	return p.marshal()
 }
 
 // A CipherSuite is a specific combination of key agreement, cipher and MAC

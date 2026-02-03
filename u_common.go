@@ -5,12 +5,12 @@
 package tls
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
 	"runtime"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/helper"
 	"golang.org/x/crypto/cryptobyte"
 )
@@ -391,7 +391,7 @@ func (chs *ClientHelloSpec) ReadCipherSuites(b []byte) error {
 	for !s.Empty() {
 		var suite uint16
 		if !s.ReadUint16(&suite) {
-			return errors.New("unable to read ciphersuite")
+			return utlserrors.New("unable to read ciphersuite").AtError()
 		}
 		cipherSuites = append(cipherSuites, unGREASEUint16(suite))
 	}
@@ -463,21 +463,25 @@ func (chs *ClientHelloSpec) ReadTLSExtensions(b []byte, allowBluntMimicry bool, 
 // If a padding extension already exists, this method does nothing.
 // This is useful for ensuring fingerprint consistency across connections.
 func (chs *ClientHelloSpec) AlwaysAddPadding() {
+	utlserrors.LogDebug(context.Background(), "spec: AlwaysAddPadding checking extensions count=", len(chs.Extensions))
 	alreadyHasPadding := false
 	for idx, ext := range chs.Extensions {
 		if _, ok := ext.(*UtlsPaddingExtension); ok {
 			alreadyHasPadding = true
+			utlserrors.LogDebug(context.Background(), "spec: AlwaysAddPadding already has padding extension")
 			break
 		}
 		if _, ok := ext.(PreSharedKeyExtension); ok {
 			alreadyHasPadding = true // PSK must be last, so we can't append padding after it
 			// instead we will insert padding before PSK
 			chs.Extensions = append(chs.Extensions[:idx], append([]TLSExtension{&UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle}}, chs.Extensions[idx:]...)...)
+			utlserrors.LogDebug(context.Background(), "spec: AlwaysAddPadding inserted padding before PSK at idx=", idx)
 			break
 		}
 	}
 	if !alreadyHasPadding {
 		chs.Extensions = append(chs.Extensions, &UtlsPaddingExtension{GetPaddingLen: BoringPaddingStyle})
+		utlserrors.LogDebug(context.Background(), "spec: AlwaysAddPadding appended new padding extension")
 	}
 }
 
@@ -527,6 +531,7 @@ func IsFFDHEGroup(group CurveID) bool {
 //
 // Returns the number of FFDHE groups that were removed (from both extensions combined).
 func (chs *ClientHelloSpec) RemoveFFDHEGroups() int {
+	utlserrors.LogDebug(context.Background(), "spec: RemoveFFDHEGroups starting")
 	removed := 0
 
 	for _, ext := range chs.Extensions {
@@ -557,6 +562,7 @@ func (chs *ClientHelloSpec) RemoveFFDHEGroups() int {
 		}
 	}
 
+	utlserrors.LogDebug(context.Background(), "spec: RemoveFFDHEGroups removed=", removed, " groups")
 	return removed
 }
 
@@ -599,9 +605,11 @@ func (chs *ClientHelloSpec) EnsureMinSessionIDLength(minLen int) bool {
 	}
 
 	if currentLen < minLen {
+		utlserrors.LogDebug(context.Background(), "spec: EnsureMinSessionIDLength updating from=", currentLen, " to=", minLen)
 		chs.SessionIDLength = minLen
 		return true
 	}
+	utlserrors.LogDebug(context.Background(), "spec: EnsureMinSessionIDLength currentLen=", currentLen, " already >= minLen=", minLen)
 	return false
 }
 
@@ -643,24 +651,26 @@ func EnsureMinSessionIDLength(spec *ClientHelloSpec, minLen int) bool {
 // TLSVersMin/TLSVersMax are set to 0 if supported_versions is present.
 // To prevent conflict, they should be set manually if needed BEFORE calling this function.
 func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
+	utlserrors.LogDebug(context.Background(), "spec: ImportTLSClientHello starting import")
 	var tlsExtensionTypes []uint16
 	var err error
 
 	if data["cipher_suites"] == nil {
-		return errors.New("cipher_suites is required")
+		return utlserrors.New("cipher_suites is required").AtError()
 	}
 	chs.CipherSuites, err = helper.Uint8to16(data["cipher_suites"])
 	if err != nil {
 		return err
 	}
+	utlserrors.LogDebug(context.Background(), "spec: ImportTLSClientHello cipherSuites count=", len(chs.CipherSuites))
 
 	if data["compression_methods"] == nil {
-		return errors.New("compression_methods is required")
+		return utlserrors.New("compression_methods is required").AtError()
 	}
 	chs.CompressionMethods = data["compression_methods"]
 
 	if data["extensions"] == nil {
-		return errors.New("extensions is required")
+		return utlserrors.New("extensions is required").AtError()
 	}
 	tlsExtensionTypes, err = helper.Uint8to16(data["extensions"])
 	if err != nil {
@@ -674,13 +684,13 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 			return fmt.Errorf("unsupported extension %d", extType)
 		}
 		if extension == nil || !ok {
-			log.Printf("[Warning] Unsupported extension %d added as a &GenericExtension without Data", extType)
+			utlserrors.LogWarning(context.Background(), "Unsupported extension ", extType, " added as a &GenericExtension without Data")
 			chs.Extensions = append(chs.Extensions, &GenericExtension{extType, []byte{}})
 		} else {
 			switch extType {
 			case extensionSupportedPoints:
 				if data["pt_fmts"] == nil {
-					return errors.New("pt_fmts is required")
+					return utlserrors.New("pt_fmts is required").AtError()
 				}
 				_, err = extWriter.Write(data["pt_fmts"])
 				if err != nil {
@@ -688,7 +698,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionSignatureAlgorithms:
 				if data["sig_algs"] == nil {
-					return errors.New("sig_algs is required")
+					return utlserrors.New("sig_algs is required").AtError()
 				}
 				_, err = extWriter.Write(data["sig_algs"])
 				if err != nil {
@@ -699,7 +709,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				chs.TLSVersMax = 0
 
 				if data["supported_versions"] == nil {
-					return errors.New("supported_versions is required")
+					return utlserrors.New("supported_versions is required").AtError()
 				}
 
 				// need to add uint8 length prefix
@@ -712,7 +722,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionSupportedCurves:
 				if data["curves"] == nil {
-					return errors.New("curves is required")
+					return utlserrors.New("curves is required").AtError()
 				}
 
 				_, err = extWriter.Write(data["curves"])
@@ -721,7 +731,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionALPN:
 				if data["alpn"] == nil {
-					return errors.New("alpn is required")
+					return utlserrors.New("alpn is required").AtError()
 				}
 
 				_, err = extWriter.Write(data["alpn"])
@@ -730,14 +740,14 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionKeyShare:
 				if data["key_share"] == nil {
-					return errors.New("key_share is required")
+					return utlserrors.New("key_share is required").AtError()
 				}
 
 				// need to add (zero) data per each key share, [10, 10, 0, 1] => [10, 10, 0, 1, 0]
 				// Each key share entry is 4 bytes: 2 bytes group ID + 2 bytes length
 				keyShareData := data["key_share"]
 				if len(keyShareData)%4 != 0 {
-					return errors.New("key_share data length must be divisible by 4")
+					return utlserrors.New("key_share data length must be divisible by 4").AtError()
 				}
 
 				// Maximum reasonable key share length (ML-KEM + ECDHE hybrid is ~1216 bytes)
@@ -774,7 +784,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionPSKModes:
 				if data["psk_key_exchange_modes"] == nil {
-					return errors.New("psk_key_exchange_modes is required")
+					return utlserrors.New("psk_key_exchange_modes is required").AtError()
 				}
 
 				// need to add uint8 length prefix
@@ -787,7 +797,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case utlsExtensionCompressCertificate:
 				if data["cert_compression_algs"] == nil {
-					return errors.New("cert_compression_algs is required")
+					return utlserrors.New("cert_compression_algs is required").AtError()
 				}
 
 				// need to add uint8 length prefix
@@ -800,7 +810,7 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 				}
 			case extensionRecordSizeLimit:
 				if data["record_size_limit"] == nil {
-					return errors.New("record_size_limit is required")
+					return utlserrors.New("record_size_limit is required").AtError()
 				}
 
 				_, err = extWriter.Write(data["record_size_limit"]) // uint16 as []byte
@@ -817,13 +827,11 @@ func (chs *ClientHelloSpec) ImportTLSClientHello(data map[string][]byte) error {
 					ext.SupportedProtocols = []string{"h2"}
 				}
 			case extensionPreSharedKey:
-				log.Printf("[Warning] PSK extension added without data")
+				utlserrors.LogWarning(context.Background(), "PSK extension added without data")
 			default:
 				if !isGREASEUint16(extType) {
-					log.Printf("[Warning] extension %d added without data", extType)
-				} /*else {
-					log.Printf("[Warning] GREASE extension added but ID/Data discarded. They will be automatically re-GREASEd on ApplyPreset() call.")
-				}*/
+					utlserrors.LogWarning(context.Background(), "extension ", extType, " added without data")
+				}
 			}
 			chs.Extensions = append(chs.Extensions, extWriter)
 		}
@@ -847,8 +855,9 @@ func (chs *ClientHelloSpec) ImportTLSClientHelloFromJSON(jsonB []byte) error {
 //
 // ctrlFlags: []bool{bluntMimicry, realPSK}
 func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
+	utlserrors.LogDebug(context.Background(), "spec: FromRaw parsing ClientHello rawLen=", len(raw))
 	if chs == nil {
-		return errors.New("cannot unmarshal into nil ClientHelloSpec")
+		return utlserrors.New("cannot unmarshal into nil ClientHelloSpec").AtError()
 	}
 
 	var bluntMimicry = false
@@ -867,11 +876,11 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 	var recordVersion uint16
 	if !s.ReadUint8(&contentType) || // record type
 		!s.ReadUint16(&recordVersion) || !s.Skip(2) { // record version and length
-		return errors.New("unable to read record type, version, and length")
+		return utlserrors.New("unable to read record type, version, and length").AtError()
 	}
 
 	if recordType(contentType) != recordTypeHandshake {
-		return errors.New("record is not a handshake")
+		return utlserrors.New("record is not a handshake").AtError()
 	}
 
 	var handshakeVersion uint16
@@ -879,21 +888,22 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 
 	if !s.ReadUint8(&handshakeType) || !s.Skip(3) || // message type and 3 byte length
 		!s.ReadUint16(&handshakeVersion) || !s.Skip(32) { // 32 byte random
-		return errors.New("unable to read handshake message type, length, and random")
+		return utlserrors.New("unable to read handshake message type, length, and random").AtError()
 	}
 
 	if handshakeType != typeClientHello {
-		return errors.New("handshake message is not a ClientHello")
+		return utlserrors.New("handshake message is not a ClientHello").AtError()
 	}
 
 	chs.TLSVersMin = recordVersion
 	chs.TLSVersMax = handshakeVersion
+	utlserrors.LogDebug(context.Background(), "spec: FromRaw TLSVersMin=", recordVersion, " TLSVersMax=", handshakeVersion)
 
 	// Parse session ID and preserve its length for fingerprint accuracy.
 	// Firefox/Safari use empty session ID for fresh TLS 1.3 connections.
 	var sessionID cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&sessionID) {
-		return errors.New("unable to read session id")
+		return utlserrors.New("unable to read session id").AtError()
 	}
 	sessionIDLen := len(sessionID)
 	if sessionIDLen == 0 {
@@ -906,17 +916,18 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 	// CipherSuites
 	var cipherSuitesBytes cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&cipherSuitesBytes) {
-		return errors.New("unable to read ciphersuites")
+		return utlserrors.New("unable to read ciphersuites").AtError()
 	}
 
 	if err := chs.ReadCipherSuites(cipherSuitesBytes); err != nil {
 		return err
 	}
+	utlserrors.LogDebug(context.Background(), "spec: FromRaw cipherSuites count=", len(chs.CipherSuites))
 
 	// CompressionMethods
 	var compressionMethods cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&compressionMethods) {
-		return errors.New("unable to read compression methods")
+		return utlserrors.New("unable to read compression methods").AtError()
 	}
 
 	if err := chs.ReadCompressionMethods(compressionMethods); err != nil {
@@ -930,22 +941,25 @@ func (chs *ClientHelloSpec) FromRaw(raw []byte, ctrlFlags ...bool) error {
 
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) {
-		return errors.New("unable to read extensions data")
+		return utlserrors.New("unable to read extensions data").AtError()
 	}
 
 	if err := chs.ReadTLSExtensions(extensions, bluntMimicry, realPSK); err != nil {
 		return err
 	}
+	utlserrors.LogDebug(context.Background(), "spec: FromRaw extensions count=", len(chs.Extensions))
 
 	// if extension list includes padding, we update the padding-to-len according to
 	// the raw ClientHello length
 	for _, ext := range chs.Extensions {
 		if paddingExt, ok := ext.(*UtlsPaddingExtension); ok {
 			paddingExt.GetPaddingLen = AlwaysPadToLen(len(raw) - 5)
+			utlserrors.LogDebug(context.Background(), "spec: FromRaw padding extension found, adjusting to len=", len(raw)-5)
 			break
 		}
 	}
 
+	utlserrors.LogDebug(context.Background(), "spec: FromRaw complete sessionIDLength=", chs.SessionIDLength)
 	return nil
 }
 
@@ -986,7 +1000,7 @@ var (
 	HelloFirefox_145 = ClientHelloID{helloFirefox, "145", nil, nil} // Extension shuffling (NSS 3.84+)
 
 	// Chrome profiles (106+ have extension shuffling)
-	HelloChrome_Auto        = HelloChrome_142
+	HelloChrome_Auto        = HelloChrome_144
 	HelloChrome_106_Shuffle = ClientHelloID{helloChrome, "106", nil, nil} // First version with extension shuffling
 
 	// Chrome w/ PSK (session resumption)
@@ -1005,6 +1019,8 @@ var (
 	HelloChrome_131 = ClientHelloID{helloChrome, "131", nil, nil}
 	HelloChrome_133 = ClientHelloID{helloChrome, "133", nil, nil} // New ALPS codepoint (17613)
 	HelloChrome_142 = ClientHelloID{helloChrome, "142", nil, nil} // October 2025
+	HelloChrome_143 = ClientHelloID{helloChrome, "143", nil, nil} // December 2025 (same TLS fingerprint as 142)
+	HelloChrome_144 = ClientHelloID{helloChrome, "144", nil, nil} // January 2026 (same TLS fingerprint as 142)
 
 	// iOS (Safari-based, no extension shuffling)
 	HelloIOS_Auto = HelloIOS_26
@@ -1105,6 +1121,18 @@ func unGREASEUint16(v uint16) uint16 {
 	} else {
 		return v
 	}
+}
+
+// NextGREASEValue returns the next GREASE value in the sequence.
+// GREASE values form a ring of 16 values: 0x0a0a, 0x1a1a, ..., 0xfafa.
+// This function rotates to the next value, wrapping from 0xfafa to 0x0a0a.
+// Used to resolve collisions when multiple GREASE extensions would have
+// the same type identifier (which violates RFC 8446 Section 4.2).
+func NextGREASEValue(v uint16) uint16 {
+	if v >= 0xfafa {
+		return 0x0a0a
+	}
+	return v + 0x1010
 }
 
 var utlsSupportedCipherSuites = cipherSuites

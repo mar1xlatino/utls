@@ -1741,6 +1741,9 @@ func TestCloneHash(t *testing.T) {
 	h1.Write([]byte("test"))
 	s1 := h1.Sum(nil)
 	h2 := cloneHash(h1, crypto.SHA256)
+	if h2 == nil {
+		t.Fatal("cloneHash returned nil")
+	}
 	s2 := h2.Sum(nil)
 	if !bytes.Equal(s1, s2) {
 		t.Error("cloned hash generated a different sum")
@@ -2152,7 +2155,7 @@ func TestHandshakeContextHierarchy(t *testing.T) {
 	conn := Server(s, serverConfig)
 	err := conn.HandshakeContext(ctx)
 	if err != nil {
-		t.Errorf("Unexpected server handshake error: %v", err)
+		t.Fatalf("Unexpected server handshake error: %v", err)
 	}
 	select {
 	case <-innerCtx.Done():

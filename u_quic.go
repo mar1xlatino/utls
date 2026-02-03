@@ -57,8 +57,9 @@ package tls
 
 import (
 	"context"
-	"errors"
 	"fmt"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // UQUICConn represents a connection which uses a QUIC implementation as the
@@ -110,11 +111,11 @@ func newUQUICConn(uconn *UConn) *UQUICConn {
 // Start must be called at most once.
 func (q *UQUICConn) Start(ctx context.Context) error {
 	if q.conn.quic.started {
-		return quicError(errors.New("tls: Start called more than once"))
+		return quicError(utlserrors.New("tls: Start called more than once").AtError())
 	}
 	q.conn.quic.started = true
 	if q.conn.config.MinVersion < VersionTLS13 {
-		return quicError(errors.New("tls: Config MinVersion must be at least TLS 1.3"))
+		return quicError(utlserrors.New("tls: Config MinVersion must be at least TLS 1.3").AtError())
 	}
 	go q.conn.HandshakeContext(ctx)
 	if _, ok := <-q.conn.quic.blockedc; !ok {
@@ -172,7 +173,7 @@ func (q *UQUICConn) Close() error {
 func (q *UQUICConn) HandleData(level QUICEncryptionLevel, data []byte) error {
 	c := q.conn
 	if c.in.level != level {
-		return quicError(c.in.setErrorLocked(errors.New("tls: handshake data received at wrong level")))
+		return quicError(c.in.setErrorLocked(utlserrors.New("tls: handshake data received at wrong level").AtError()))
 	}
 	c.quic.readbuf = data
 	<-c.quic.signalc
@@ -212,13 +213,13 @@ func (q *UQUICConn) HandleData(level QUICEncryptionLevel, data []byte) error {
 func (q *UQUICConn) SendSessionTicket(opts QUICSessionTicketOptions) error {
 	c := q.conn
 	if !c.isHandshakeComplete.Load() {
-		return quicError(errors.New("tls: SendSessionTicket called before handshake completed"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called before handshake completed").AtError())
 	}
 	if c.isClient {
-		return quicError(errors.New("tls: SendSessionTicket called on the client"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called on the client").AtError())
 	}
 	if q.sessionTicketSent {
-		return quicError(errors.New("tls: SendSessionTicket called multiple times"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called multiple times").AtError())
 	}
 	q.sessionTicketSent = true
 	return quicError(c.sendSessionTicket(opts.EarlyData, opts.Extra))

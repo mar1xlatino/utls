@@ -118,7 +118,7 @@ func TestAutoAliasesPointToLatest(t *testing.T) {
 		auto   ClientHelloID
 		latest ClientHelloID
 	}{
-		{HelloChrome_Auto, HelloChrome_142},
+		{HelloChrome_Auto, HelloChrome_144}, // Updated: Chrome 144 is current stable (January 2026)
 		{HelloFirefox_Auto, HelloFirefox_145},
 		{HelloSafari_Auto, HelloSafari_26},
 		{HelloEdge_Auto, HelloEdge_142},

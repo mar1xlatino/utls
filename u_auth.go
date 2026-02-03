@@ -18,25 +18,26 @@
 package tls
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// Deprecation warning guards - log once per process lifetime
+// Warning guards - log once per process lifetime
 var (
-	deriveAuthKeyDeprecatedOnce         sync.Once
-	deriveAuthKeyWithSaltDeprecatedOnce sync.Once
+	deriveAuthKeyInsecureWarningOnce         sync.Once
+	deriveAuthKeyWithSaltInsecureWarningOnce sync.Once
+	verifyFuncTimingWarningOnce              sync.Once
 )
 
 // AuthMode defines where authentication data is embedded.
@@ -127,6 +128,32 @@ type AuthConfig struct {
 	//
 	// If in doubt, leave this nil to use the secure default implementation.
 	VerifyFunc func(authData, expected []byte) bool
+
+	// ValidateVerifyFuncTiming enables runtime timing validation of custom VerifyFunc.
+	// When true and VerifyFunc is set, verification calls are timed to detect
+	// non-constant-time implementations that could leak information through timing.
+	//
+	// How it works:
+	//   1. Times the VerifyFunc call with actual data
+	//   2. Times the VerifyFunc call with obviously non-matching data (zeroed bytes)
+	//   3. Compares timing difference against threshold (10% variance)
+	//   4. Logs security warning if timing variance exceeds threshold
+	//
+	// Performance Impact:
+	//   - Each verification performs one additional VerifyFunc call
+	//   - Overhead is minimal in practice (microseconds per verification)
+	//
+	// Recommended Settings:
+	//   - Development/Testing: true (catch timing vulnerabilities early)
+	//   - Production (security-critical): true (runtime protection)
+	//   - Production (performance-critical): false (avoid overhead)
+	//
+	// Note: This validation is statistical and may not detect all timing
+	// vulnerabilities. It serves as a defense-in-depth measure. Always use
+	// subtle.ConstantTimeCompare in your custom VerifyFunc implementation.
+	//
+	// Default: false (for backwards compatibility and performance)
+	ValidateVerifyFuncTiming bool
 }
 
 // Validate checks if the AuthConfig is valid.
@@ -138,7 +165,7 @@ type AuthConfig struct {
 // from other goroutines are not safe.
 func (c *AuthConfig) Validate() error {
 	if c == nil {
-		return errors.New("tls: auth config is nil")
+		return utlserrors.New("tls: auth config is nil").AtError()
 	}
 	if len(c.Key) < 32 {
 		return fmt.Errorf("tls: auth key must be at least 32 bytes, got %d", len(c.Key))
@@ -182,11 +209,12 @@ func (c *AuthConfig) Clone() *AuthConfig {
 		return nil
 	}
 	clone := &AuthConfig{
-		Mode:                 c.Mode,
-		UseEntropyShortID:    c.UseEntropyShortID,
-		ShortIDWindowSeconds: c.ShortIDWindowSeconds,
-		ComputeFunc:          c.ComputeFunc,
-		VerifyFunc:           c.VerifyFunc,
+		Mode:                     c.Mode,
+		UseEntropyShortID:        c.UseEntropyShortID,
+		ShortIDWindowSeconds:     c.ShortIDWindowSeconds,
+		ComputeFunc:              c.ComputeFunc,
+		VerifyFunc:               c.VerifyFunc,
+		ValidateVerifyFuncTiming: c.ValidateVerifyFuncTiming,
 	}
 	if c.Key != nil {
 		clone.Key = make([]byte, len(c.Key))
@@ -564,7 +592,7 @@ func GenerateEntropySessionID(authKey, publicKey []byte) ([]byte, error) {
 	// Compute full HMAC for authentication
 	authHMAC := ComputeAuthHMAC(authKey, publicKey, now)
 	if authHMAC == nil {
-		return nil, errors.New("failed to compute auth HMAC")
+		return nil, utlserrors.New("tls: failed to compute auth HMAC").AtError()
 	}
 
 	// Construct session ID
@@ -734,10 +762,16 @@ func (a *Authenticator) VerifyClientAuth(publicKey, authData []byte) *AuthResult
 	var hmacMatch int
 	if a.config.VerifyFunc != nil {
 		expected := a.ComputeClientAuth(publicKey)
-		if a.config.VerifyFunc(authData, expected) {
-			hmacMatch = 1
+
+		// Optional timing validation for custom VerifyFunc
+		if a.config.ValidateVerifyFuncTiming {
+			hmacMatch = a.verifyWithTimingValidation(authData, expected)
 		} else {
-			hmacMatch = 0
+			if a.config.VerifyFunc(authData, expected) {
+				hmacMatch = 1
+			} else {
+				hmacMatch = 0
+			}
 		}
 	} else {
 		if VerifyAuthHMACWithWindow(a.config.Key, publicKey, authData, 30) {
@@ -771,6 +805,69 @@ func (a *Authenticator) VerifyClientAuth(publicKey, authData []byte) *AuthResult
 	}
 
 	return result
+}
+
+// verifyWithTimingValidation calls the custom VerifyFunc with timing validation.
+// This detects non-constant-time implementations by comparing execution times
+// for matching vs non-matching data. Returns 1 if verification succeeds, 0 otherwise.
+//
+// Security Properties:
+//   - Times verification with actual data
+//   - Times verification with obviously non-matching data (zeroed bytes)
+//   - Warns if timing difference exceeds 10% threshold
+//   - Warning is logged once per process lifetime to avoid log spam
+//
+// Note: This is a heuristic detection method and may not catch all timing
+// vulnerabilities. It serves as defense-in-depth, not a guarantee.
+func (a *Authenticator) verifyWithTimingValidation(authData, expected []byte) int {
+	// Time the verification with actual data
+	start1 := time.Now()
+	result := a.config.VerifyFunc(authData, expected)
+	elapsed1 := time.Since(start1)
+
+	// Create obviously non-matching data (all zeros, different from any valid HMAC)
+	nonMatch := make([]byte, len(expected))
+	// nonMatch is already zeroed by make()
+
+	// Time the verification with non-matching data
+	start2 := time.Now()
+	_ = a.config.VerifyFunc(authData, nonMatch)
+	elapsed2 := time.Since(start2)
+
+	// Calculate absolute timing difference
+	var diff time.Duration
+	if elapsed1 > elapsed2 {
+		diff = elapsed1 - elapsed2
+	} else {
+		diff = elapsed2 - elapsed1
+	}
+
+	// Warn if timing differs significantly (> 10% of the longer duration)
+	// Use the longer duration as the baseline to avoid false positives
+	// from very fast operations where noise dominates
+	baseline := elapsed1
+	if elapsed2 > baseline {
+		baseline = elapsed2
+	}
+
+	// Only check if baseline is significant (> 100ns) to avoid noise issues
+	if baseline > 100*time.Nanosecond {
+		threshold := time.Duration(float64(baseline) * 0.10) // 10% threshold
+		if diff > threshold {
+			verifyFuncTimingWarningOnce.Do(func() {
+				utlserrors.LogWarning(context.Background(),
+					"SECURITY WARNING: Custom VerifyFunc may have timing side-channel vulnerability. "+
+						"Timing difference detected between matching and non-matching data "+
+						"(diff=%v, threshold=%v). Ensure your VerifyFunc uses subtle.ConstantTimeCompare. "+
+						"This warning appears once per process.", diff, threshold)
+			})
+		}
+	}
+
+	if result {
+		return 1
+	}
+	return 0
 }
 
 // GenerateSessionIDWithAuth generates a session ID containing auth data.
@@ -843,53 +940,91 @@ func GenerateRandomSessionID() ([]byte, error) {
 	return sessionID, nil
 }
 
-// DeriveAuthKey derives an authentication key from a password/passphrase.
+// DeriveAuthKey was a key derivation function that used single SHA-512 hash.
 //
-// # SECURITY CRITICAL WARNING - DO NOT USE IN NEW CODE
+// REMOVED: This function now panics. It was catastrophically insecure for password-based
+// key derivation as a single SHA-512 hash provides ZERO protection against brute-force attacks.
+// Modern GPUs can compute billions of SHA-512 hashes per second.
 //
-// This function uses a single SHA-512 hash which provides ZERO protection
-// against brute-force attacks. Modern GPUs can compute billions of SHA-512
-// hashes per second, meaning:
+// Migration guide:
+//   - For new code: Use DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000
+//   - For legacy compatibility ONLY: Use DeriveAuthKeyInsecure (same behavior, explicit name)
+//
+// Deprecated: This function panics. Use DeriveAuthKeySecure for new code,
+// or DeriveAuthKeyInsecure for legacy compatibility only.
+func DeriveAuthKey(password string) []byte {
+	panic("DeriveAuthKey is REMOVED due to critical security vulnerabilities. " +
+		"Use DeriveAuthKeySecure(password, salt, iterations) for new code. " +
+		"If you MUST maintain backwards compatibility with existing deployments, " +
+		"use DeriveAuthKeyInsecure(password) which has the same behavior but an explicit name.")
+}
+
+// DeriveAuthKeyInsecure derives an authentication key using single SHA-512 hash.
+//
+// SECURITY CRITICAL WARNING: This function is INSECURE for password-based key derivation.
+// A single SHA-512 hash provides ZERO protection against brute-force attacks.
+// Modern GPUs can compute billions of SHA-512 hashes per second, meaning:
 //   - 8-character password: cracked in seconds
 //   - 12-character password: cracked in hours to days
 //   - Any dictionary word: cracked instantly
 //
-// This function exists only for backwards compatibility with existing deployments.
-// It will be removed in a future major version.
+// This function exists ONLY for backwards compatibility with existing deployments
+// that cannot migrate to secure key derivation. The explicit "Insecure" suffix
+// ensures users consciously acknowledge the security risk.
 //
 // For new code, use DeriveAuthKeySecure() with:
 //   - A random 32-byte salt (use GenerateAuthSalt())
 //   - At least 100,000 iterations (more for high-security applications)
-//
-// Or better, use a modern password hashing library:
-//   - Argon2id (recommended)
-//   - scrypt
-//   - bcrypt
-//
-// Deprecated: DeriveAuthKey uses single SHA-512 which is insecure. Use DeriveAuthKeySecure instead.
-func DeriveAuthKey(password string) []byte {
-	deriveAuthKeyDeprecatedOnce.Do(func() {
-		log.Printf("[Warning] DeriveAuthKey is deprecated and insecure: uses single SHA-512 hash " +
-			"which can be brute-forced at billions of attempts/second on modern GPUs. " +
-			"Migrate to DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000.")
+func DeriveAuthKeyInsecure(password string) []byte {
+	deriveAuthKeyInsecureWarningOnce.Do(func() {
+		utlserrors.LogWarning(context.Background(),
+			"SECURITY WARNING: DeriveAuthKeyInsecure uses single SHA-512 hash "+
+				"which can be brute-forced at billions of attempts/second on modern GPUs. "+
+				"This function should ONLY be used for backwards compatibility with existing deployments. "+
+				"Migrate to DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000 as soon as possible.")
 	})
 	h := sha512.Sum512([]byte(password))
 	return h[:]
 }
 
-// DeriveAuthKeyWithSalt derives an authentication key with salt.
-// Uses HMAC-SHA-512 for key derivation.
+// DeriveAuthKeyWithSalt was a key derivation function that used single HMAC-SHA-512 iteration.
 //
-// SECURITY WARNING: This uses a single HMAC iteration which provides
-// some protection against rainbow tables but is still vulnerable to
-// brute-force attacks. For production use, prefer DeriveAuthKeySecure().
+// REMOVED: This function now panics. While it provides protection against rainbow tables,
+// a single HMAC iteration is still vulnerable to brute-force attacks on modern hardware.
 //
-// Deprecated: Use DeriveAuthKeySecure for new code.
+// Migration guide:
+//   - For new code: Use DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000
+//   - For legacy compatibility ONLY: Use DeriveAuthKeyWithSaltInsecure (same behavior, explicit name)
+//
+// Deprecated: This function panics. Use DeriveAuthKeySecure for new code,
+// or DeriveAuthKeyWithSaltInsecure for legacy compatibility only.
 func DeriveAuthKeyWithSalt(password string, salt []byte) []byte {
-	deriveAuthKeyWithSaltDeprecatedOnce.Do(func() {
-		log.Printf("[Warning] DeriveAuthKeyWithSalt is deprecated: uses single HMAC iteration " +
-			"which is vulnerable to brute-force attacks. " +
-			"Migrate to DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000.")
+	panic("DeriveAuthKeyWithSalt is REMOVED due to security vulnerabilities. " +
+		"Use DeriveAuthKeySecure(password, salt, iterations) for new code. " +
+		"If you MUST maintain backwards compatibility with existing deployments, " +
+		"use DeriveAuthKeyWithSaltInsecure(password, salt) which has the same behavior but an explicit name.")
+}
+
+// DeriveAuthKeyWithSaltInsecure derives an authentication key with salt using single HMAC-SHA-512.
+//
+// SECURITY WARNING: This function uses a single HMAC iteration which provides
+// some protection against rainbow tables but is still VULNERABLE to brute-force attacks.
+// Modern GPUs can compute billions of HMAC-SHA-512 operations per second.
+//
+// This function exists ONLY for backwards compatibility with existing deployments
+// that cannot migrate to secure key derivation. The explicit "Insecure" suffix
+// ensures users consciously acknowledge the security risk.
+//
+// For new code, use DeriveAuthKeySecure() with:
+//   - A random 32-byte salt (use GenerateAuthSalt())
+//   - At least 100,000 iterations (more for high-security applications)
+func DeriveAuthKeyWithSaltInsecure(password string, salt []byte) []byte {
+	deriveAuthKeyWithSaltInsecureWarningOnce.Do(func() {
+		utlserrors.LogWarning(context.Background(),
+			"SECURITY WARNING: DeriveAuthKeyWithSaltInsecure uses single HMAC iteration "+
+				"which is vulnerable to brute-force attacks on modern hardware. "+
+				"This function should ONLY be used for backwards compatibility with existing deployments. "+
+				"Migrate to DeriveAuthKeySecure(password, salt, iterations) with iterations >= 100000 as soon as possible.")
 	})
 	if len(salt) == 0 {
 		return nil // Security: require salt

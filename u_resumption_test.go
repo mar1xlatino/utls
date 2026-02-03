@@ -146,11 +146,15 @@ func testTLS13BasicResumptionWithServer(t *testing.T, serverAddr, serverName str
 		t.Skipf("Failed to dial first connection (network issue): %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf) // This profile supports PSK resumption
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -218,11 +222,16 @@ func testTLS13BasicResumptionWithServer(t *testing.T, serverAddr, serverName str
 			continue
 		}
 
-		tlsConn2 := UClient(tcpConn2, &Config{
+		tlsConn2, err := UClient(tcpConn2, &Config{
 			ServerName:         serverName,
 			ClientSessionCache: cache,
 			OmitEmptyPsk:       true,
 		}, HelloChrome_112_PSK_Shuf)
+		if err != nil {
+			tcpConn2.Close()
+			lastErr = fmt.Errorf("UClient failed: %w", err)
+			continue
+		}
 
 		if err := tlsConn2.Handshake(); err != nil {
 			tcpConn2.Close()
@@ -279,11 +288,15 @@ func TestTLS13PSKIdentityExtension(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -320,11 +333,15 @@ func TestTLS13PSKIdentityExtension(t *testing.T) {
 		t.Fatalf("Failed to dial second connection: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	// Build handshake state without connecting to inspect ClientHello
 	if err := tlsConn2.BuildHandshakeState(); err != nil {
@@ -394,11 +411,15 @@ func TestTLS13ResumptionAcrossProfiles(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -431,11 +452,15 @@ func TestTLS13ResumptionAcrossProfiles(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -457,11 +482,15 @@ func TestTLS13ResumptionAcrossProfiles(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn3 := UClient(tcpConn3, &Config{
+	tlsConn3, err := UClient(tcpConn3, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloFirefox_120) // Note: Firefox does not have UtlsPreSharedKeyExtension by default
+	if err != nil {
+		tcpConn3.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn3.Handshake(); err != nil {
 		tcpConn3.Close()
@@ -516,11 +545,15 @@ func TestClientSessionCacheOperations(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -564,11 +597,15 @@ func TestClientSessionCacheOperations(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -612,11 +649,15 @@ func TestTLS12SessionTicketResumption(t *testing.T) {
 	}
 
 	// Use profile that supports TLS 1.2 session tickets
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -653,11 +694,15 @@ func TestTLS12SessionTicketResumption(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -692,10 +737,14 @@ func TestResumptionWithGoLangProfile(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 	}, HelloGolang)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -735,10 +784,15 @@ func TestResumptionWithGoLangProfile(t *testing.T) {
 			continue
 		}
 
-		tlsConn2 := UClient(tcpConn2, &Config{
+		tlsConn2, err := UClient(tcpConn2, &Config{
 			ServerName:         serverName,
 			ClientSessionCache: cache,
 		}, HelloGolang)
+		if err != nil {
+			tcpConn2.Close()
+			lastErr = fmt.Errorf("UClient failed: %w", err)
+			continue
+		}
 
 		if err := tlsConn2.Handshake(); err != nil {
 			tcpConn2.Close()
@@ -791,11 +845,15 @@ func TestResumptionFingerprintPreservation(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	// Build handshake state to inspect ClientHello
 	if err := tlsConn1.BuildHandshakeState(); err != nil {
@@ -833,11 +891,15 @@ func TestResumptionFingerprintPreservation(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.BuildHandshakeState(); err != nil {
 		tcpConn2.Close()
@@ -892,11 +954,15 @@ func TestMultipleResumptions(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -928,11 +994,16 @@ func TestMultipleResumptions(t *testing.T) {
 			continue
 		}
 
-		tlsConn := UClient(tcpConn, &Config{
+		tlsConn, err := UClient(tcpConn, &Config{
 			ServerName:         serverName,
 			ClientSessionCache: cache,
 			OmitEmptyPsk:       true,
 		}, HelloChrome_112_PSK_Shuf)
+		if err != nil {
+			tcpConn.Close()
+			t.Logf("UClient failed for resumption %d: %v", i+1, err)
+			continue
+		}
 
 		if err := tlsConn.Handshake(); err != nil {
 			tcpConn.Close()
@@ -978,11 +1049,15 @@ func TestConcurrentResumptions(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1019,11 +1094,16 @@ func TestConcurrentResumptions(t *testing.T) {
 				return
 			}
 
-			tlsConn := UClient(tcpConn, &Config{
+			tlsConn, err := UClient(tcpConn, &Config{
 				ServerName:         serverName,
 				ClientSessionCache: cache,
 				OmitEmptyPsk:       true,
 			}, HelloChrome_112_PSK_Shuf)
+			if err != nil {
+				tcpConn.Close()
+				errs <- fmt.Errorf("goroutine %d: UClient failed: %w", idx, err)
+				return
+			}
 
 			if err := tlsConn.Handshake(); err != nil {
 				tcpConn.Close()
@@ -1072,11 +1152,15 @@ func TestNoResumptionWithDisabledCache(t *testing.T) {
 			t.Fatalf("Connection %d: Failed to dial: %v", i+1, err)
 		}
 
-		tlsConn := UClient(tcpConn, &Config{
+		tlsConn, err := UClient(tcpConn, &Config{
 			ServerName:         serverName,
 			ClientSessionCache: nil, // No cache
 			OmitEmptyPsk:       true,
 		}, HelloChrome_112_PSK_Shuf)
+		if err != nil {
+			tcpConn.Close()
+			t.Fatalf("Connection %d: UClient failed: %v", i+1, err)
+		}
 
 		if err := tlsConn.Handshake(); err != nil {
 			tcpConn.Close()
@@ -1112,12 +1196,16 @@ func TestNoResumptionWithSessionTicketsDisabled(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:             serverName,
 		ClientSessionCache:     cache,
 		SessionTicketsDisabled: true, // Disabled
 		OmitEmptyPsk:           true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1142,12 +1230,16 @@ func TestNoResumptionWithSessionTicketsDisabled(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:             serverName,
 		ClientSessionCache:     cache,
 		SessionTicketsDisabled: true,
 		OmitEmptyPsk:           true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -1185,11 +1277,15 @@ func TestResumptionWithDifferentServerNames(t *testing.T) {
 		t.Fatalf("Failed to dial %s: %v", servers[0].name, err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         servers[0].name,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1216,11 +1312,15 @@ func TestResumptionWithDifferentServerNames(t *testing.T) {
 		t.Fatalf("Failed to dial %s: %v", servers[1].name, err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         servers[1].name,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -1253,11 +1353,15 @@ func TestEarlyDataRejection(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1283,11 +1387,15 @@ func TestEarlyDataRejection(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	// The handshake should succeed even if early data is not supported
 	if err := tlsConn2.Handshake(); err != nil {
@@ -1321,11 +1429,15 @@ func TestHandshakeStatePSKFields(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1356,11 +1468,15 @@ func TestHandshakeStatePSKFields(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn2 := UClient(tcpConn2, &Config{
+	tlsConn2, err := UClient(tcpConn2, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn2.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn2.Handshake(); err != nil {
 		tcpConn2.Close()
@@ -1400,11 +1516,15 @@ func BenchmarkResumption(b *testing.B) {
 		b.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn := UClient(tcpConn, &Config{
+	tlsConn, err := UClient(tcpConn, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn.Close()
+		b.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn.Handshake(); err != nil {
 		tcpConn.Close()
@@ -1431,11 +1551,16 @@ func BenchmarkResumption(b *testing.B) {
 				b.Fatalf("Failed to dial: %v", err)
 			}
 
-			tlsConn := UClient(tcpConn, &Config{
+			tlsConn, err := UClient(tcpConn, &Config{
 				ServerName:         serverName,
 				ClientSessionCache: cache,
 				OmitEmptyPsk:       true,
 			}, HelloChrome_112_PSK_Shuf)
+			if err != nil {
+				tcpConn.Close()
+				cancel()
+				b.Fatalf("UClient failed: %v", err)
+			}
 
 			if err := tlsConn.Handshake(); err != nil {
 				tcpConn.Close()
@@ -1458,11 +1583,16 @@ func BenchmarkResumption(b *testing.B) {
 				b.Fatalf("Failed to dial: %v", err)
 			}
 
-			tlsConn := UClient(tcpConn, &Config{
+			tlsConn, err := UClient(tcpConn, &Config{
 				ServerName:         serverName,
 				ClientSessionCache: nil, // No cache
 				OmitEmptyPsk:       true,
 			}, HelloChrome_112_PSK_Shuf)
+			if err != nil {
+				tcpConn.Close()
+				cancel()
+				b.Fatalf("UClient failed: %v", err)
+			}
 
 			if err := tlsConn.Handshake(); err != nil {
 				tcpConn.Close()
@@ -1492,11 +1622,15 @@ func TestResumptionErrorRecovery(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 
-	tlsConn1 := UClient(tcpConn1, &Config{
+	tlsConn1, err := UClient(tcpConn1, &Config{
 		ServerName:         serverName,
 		ClientSessionCache: cache,
 		OmitEmptyPsk:       true,
 	}, HelloChrome_112_PSK_Shuf)
+	if err != nil {
+		tcpConn1.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 
 	if err := tlsConn1.Handshake(); err != nil {
 		tcpConn1.Close()
@@ -1525,11 +1659,16 @@ func TestResumptionErrorRecovery(t *testing.T) {
 			continue
 		}
 
-		tlsConn := UClient(tcpConn, &Config{
+		tlsConn, err := UClient(tcpConn, &Config{
 			ServerName:         serverName,
 			ClientSessionCache: cache,
 			OmitEmptyPsk:       true,
 		}, HelloChrome_112_PSK_Shuf)
+		if err != nil {
+			tcpConn.Close()
+			t.Logf("Connection %d: UClient failed: %v", i+1, err)
+			continue
+		}
 
 		err = tlsConn.Handshake()
 		if err != nil {

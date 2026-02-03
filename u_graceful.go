@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // TLSErrorType classifies TLS errors for graceful degradation decisions.
@@ -350,6 +352,7 @@ type GracefulConn struct {
 	lastHealthy   time.Time
 	healthCheckCh chan struct{}
 	healthDone    chan struct{}
+	closeOnce     sync.Once // Ensures healthDone channel is closed exactly once
 }
 
 // NewGracefulConn creates a GracefulConn wrapper around a UConn.
@@ -395,11 +398,15 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
 
+	utlserrors.LogDebug(ctx, "graceful: initiating handshake with recovery")
+
 	var lastErr error
 	totalAttempts := 0
 
 	for {
 		totalAttempts++
+
+		utlserrors.LogDebug(ctx, "graceful: handshake attempt", totalAttempts)
 
 		// Attempt handshake
 		err := gc.UConn.HandshakeContext(ctx)
@@ -408,13 +415,20 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 			gc.lastHealthy = time.Now()
 			gc.lastError = nil
 
+			utlserrors.LogDebug(ctx, "graceful: handshake succeeded after", totalAttempts, "attempts")
+
 			// Notify recovery if we had failures before
 			if totalAttempts > 1 && gc.config.OnRecovery != nil {
 				action := "retry"
 				if gc.downgraded {
 					action = "version-downgrade"
 				}
-				gc.config.OnRecovery(action, totalAttempts)
+				// Release lock before callback to prevent deadlock if callback
+				// calls methods on GracefulConn that also acquire gc.mu
+				onRecovery := gc.config.OnRecovery
+				gc.mu.Unlock()
+				onRecovery(action, totalAttempts)
+				gc.mu.Lock()
 			}
 			return nil
 		}
@@ -425,10 +439,23 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 
 		// Classify the error
 		errType := ClassifyError(err)
+		utlserrors.LogDebug(ctx, "graceful: handshake failed, error type:", errType.String(), "error:", err)
 
 		// Call error callback if configured
 		if gc.config.OnError != nil {
-			if !gc.config.OnError(err, errType, totalAttempts) {
+			// Capture state and release lock before callback to prevent deadlock
+			// if callback calls methods on GracefulConn that also acquire gc.mu
+			errCopy := err
+			typeCopy := errType
+			attemptsCopy := totalAttempts
+			onError := gc.config.OnError
+
+			gc.mu.Unlock()
+			proceed := onError(errCopy, typeCopy, attemptsCopy)
+			gc.mu.Lock()
+
+			if !proceed {
+				utlserrors.LogDebug(ctx, "graceful: recovery aborted by OnError callback")
 				return &ClassifiedError{Err: err, Type: errType, Original: err}
 			}
 		}
@@ -437,13 +464,15 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 		switch errType {
 		case ErrorTransient:
 			if gc.transRetries >= gc.config.MaxTransientRetries {
+				utlserrors.LogDebug(ctx, "graceful: max transient retries exceeded:", gc.transRetries)
 				return &ClassifiedError{Err: err, Type: errType, Original: err}
 			}
 			gc.transRetries++
+			utlserrors.LogDebug(ctx, "graceful: transient error, retry", gc.transRetries)
 
 			// Reconnect for transient errors
 			if err := gc.reconnect(ctx); err != nil {
-				return &ClassifiedError{Err: fmt.Errorf("reconnect failed: %w", err), Type: ErrorPermanent, Original: lastErr}
+				return &ClassifiedError{Err: utlserrors.New("reconnect failed").Base(err).AtError(), Type: ErrorPermanent, Original: lastErr}
 			}
 
 			// Apply backoff delay
@@ -451,49 +480,58 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 
 		case ErrorHRRRetry:
 			if !gc.config.RetryOnHRRFailure || gc.hrrRetries >= gc.config.MaxHRRRetries {
+				utlserrors.LogDebug(ctx, "graceful: HRR retry not allowed or max retries exceeded")
 				return &ClassifiedError{Err: err, Type: errType, Original: err}
 			}
 			gc.hrrRetries++
+			utlserrors.LogDebug(ctx, "graceful: HRR failure, retry", gc.hrrRetries)
 
 			// Reconnect with potentially different key share
 			if err := gc.reconnect(ctx); err != nil {
-				return &ClassifiedError{Err: fmt.Errorf("HRR reconnect failed: %w", err), Type: ErrorPermanent, Original: lastErr}
+				return &ClassifiedError{Err: utlserrors.New("HRR reconnect failed").Base(err).AtError(), Type: ErrorPermanent, Original: lastErr}
 			}
 
 		case ErrorDowngrade:
 			if !gc.config.AllowVersionDowngrade || gc.downgraded {
+				utlserrors.LogDebug(ctx, "graceful: version downgrade not allowed or already downgraded")
 				return &ClassifiedError{Err: err, Type: errType, Original: err}
 			}
 
+			utlserrors.LogDebug(ctx, "graceful: attempting version downgrade to TLS 1.2")
 			// Attempt version downgrade
 			if err := gc.downgradeVersion(ctx); err != nil {
-				return &ClassifiedError{Err: fmt.Errorf("version downgrade failed: %w", err), Type: ErrorPermanent, Original: lastErr}
+				return &ClassifiedError{Err: utlserrors.New("version downgrade failed").Base(err).AtError(), Type: ErrorPermanent, Original: lastErr}
 			}
 			gc.downgraded = true
 
 		case ErrorRecoverable:
 			// Try reconnect once for recoverable errors
 			if gc.transRetries > 0 {
+				utlserrors.LogDebug(ctx, "graceful: recoverable error, but already retried")
 				return &ClassifiedError{Err: err, Type: errType, Original: err}
 			}
 			gc.transRetries++
+			utlserrors.LogDebug(ctx, "graceful: recoverable error, attempting reconnect")
 
 			if err := gc.reconnect(ctx); err != nil {
-				return &ClassifiedError{Err: fmt.Errorf("recovery reconnect failed: %w", err), Type: ErrorPermanent, Original: lastErr}
+				return &ClassifiedError{Err: utlserrors.New("recovery reconnect failed").Base(err).AtError(), Type: ErrorPermanent, Original: lastErr}
 			}
 
 		case ErrorPermanent:
 			// No recovery for permanent errors
 			gc.healthy.Store(false)
+			utlserrors.LogDebug(ctx, "graceful: permanent error, no recovery possible")
 			return &ClassifiedError{Err: err, Type: errType, Original: err}
 
 		default:
+			utlserrors.LogDebug(ctx, "graceful: unknown error type, failing")
 			return &ClassifiedError{Err: err, Type: errType, Original: err}
 		}
 
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
+			utlserrors.LogDebug(ctx, "graceful: context cancelled during recovery")
 			return ctx.Err()
 		default:
 		}
@@ -503,27 +541,35 @@ func (gc *GracefulConn) HandshakeWithRecovery(ctx context.Context) error {
 // reconnect creates a new underlying connection and reinitializes the TLS state.
 func (gc *GracefulConn) reconnect(ctx context.Context) error {
 	if gc.dialer == nil {
-		return errors.New("no dialer configured for reconnection")
+		utlserrors.LogDebug(ctx, "graceful: reconnect failed - no dialer configured")
+		return utlserrors.New("no dialer configured for reconnection").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "graceful: closing existing connection for reconnect")
 
 	// Close existing connection (ignore errors)
 	if gc.UConn != nil && gc.UConn.conn != nil {
 		gc.UConn.conn.Close()
 	}
 
+	utlserrors.LogDebug(ctx, "graceful: dialing new connection")
+
 	// Create new underlying connection
 	conn, err := gc.dialer()
 	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
+		utlserrors.LogDebug(ctx, "graceful: dial failed:", err)
+		return utlserrors.New("dial failed").Base(err).AtError()
 	}
 
 	// Create new UConn with same configuration
 	newUConn, err := UClient(conn, gc.tlsConfig, gc.helloID)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("create UConn failed: %w", err)
+		utlserrors.LogDebug(ctx, "graceful: create UConn failed:", err)
+		return utlserrors.New("create UConn failed").Base(err).AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "graceful: reconnect successful")
 	gc.UConn = newUConn
 	return nil
 }
@@ -531,18 +577,24 @@ func (gc *GracefulConn) reconnect(ctx context.Context) error {
 // downgradeVersion attempts to reconnect with TLS 1.2 instead of TLS 1.3.
 func (gc *GracefulConn) downgradeVersion(ctx context.Context) error {
 	if gc.dialer == nil {
-		return errors.New("no dialer configured for version downgrade")
+		utlserrors.LogDebug(ctx, "graceful: downgrade failed - no dialer configured")
+		return utlserrors.New("no dialer configured for version downgrade").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "graceful: closing existing connection for version downgrade")
 
 	// Close existing connection
 	if gc.UConn != nil && gc.UConn.conn != nil {
 		gc.UConn.conn.Close()
 	}
 
+	utlserrors.LogDebug(ctx, "graceful: dialing new connection for TLS 1.2 downgrade")
+
 	// Create new underlying connection
 	conn, err := gc.dialer()
 	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
+		utlserrors.LogDebug(ctx, "graceful: dial failed during downgrade:", err)
+		return utlserrors.New("dial failed").Base(err).AtError()
 	}
 
 	// Create config with TLS 1.2 max version
@@ -553,9 +605,11 @@ func (gc *GracefulConn) downgradeVersion(ctx context.Context) error {
 	newUConn, err := UClient(conn, downgradedConfig, gc.helloID)
 	if err != nil {
 		conn.Close()
-		return fmt.Errorf("create downgraded UConn failed: %w", err)
+		utlserrors.LogDebug(ctx, "graceful: create downgraded UConn failed:", err)
+		return utlserrors.New("create downgraded UConn failed").Base(err).AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "graceful: version downgrade to TLS 1.2 successful")
 	gc.UConn = newUConn
 	gc.tlsConfig = downgradedConfig
 	return nil
@@ -614,13 +668,19 @@ func (gc *GracefulConn) IsHealthy() bool {
 // This can detect half-closed connections and verify the peer is still responsive.
 // Returns nil if the connection is healthy, error otherwise.
 func (gc *GracefulConn) Ping() error {
+	ctx := context.Background()
+
 	if gc.UConn == nil {
-		return errors.New("connection not initialized")
+		utlserrors.LogDebug(ctx, "graceful: ping failed - connection not initialized")
+		return utlserrors.New("connection not initialized").AtError()
 	}
 
 	if !gc.UConn.isHandshakeComplete.Load() {
-		return errors.New("handshake not complete")
+		utlserrors.LogDebug(ctx, "graceful: ping failed - handshake not complete")
+		return utlserrors.New("handshake not complete").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "graceful: sending ping")
 
 	// Set a short deadline for the ping operation
 	deadline := time.Now().Add(5 * time.Second)
@@ -633,7 +693,8 @@ func (gc *GracefulConn) Ping() error {
 	_, err := gc.UConn.Write(nil)
 	if err != nil && !errors.Is(err, io.EOF) {
 		gc.healthy.Store(false)
-		return fmt.Errorf("ping failed: %w", err)
+		utlserrors.LogDebug(ctx, "graceful: ping failed:", err)
+		return utlserrors.New("ping failed").Base(err).AtError()
 	}
 
 	gc.healthMu.Lock()
@@ -641,6 +702,7 @@ func (gc *GracefulConn) Ping() error {
 	gc.healthMu.Unlock()
 	gc.healthy.Store(true)
 
+	utlserrors.LogDebug(ctx, "graceful: ping successful")
 	return nil
 }
 
@@ -668,16 +730,26 @@ func (gc *GracefulConn) healthCheckLoop() {
 
 // Close closes the connection and stops health checking.
 func (gc *GracefulConn) Close() error {
-	// Stop health check goroutine
-	if gc.healthDone != nil {
-		close(gc.healthDone)
-	}
+	ctx := context.Background()
+
+	utlserrors.LogDebug(ctx, "graceful: initiating close")
+
+	// Stop health check goroutine (sync.Once ensures channel is closed exactly once)
+	gc.closeOnce.Do(func() {
+		if gc.healthDone != nil {
+			utlserrors.LogDebug(ctx, "graceful: stopping health check goroutine")
+			close(gc.healthDone)
+		}
+	})
 
 	gc.healthy.Store(false)
 
 	if gc.UConn != nil {
+		utlserrors.LogDebug(ctx, "graceful: closing underlying connection")
 		return gc.UConn.Close()
 	}
+
+	utlserrors.LogDebug(ctx, "graceful: close complete")
 	return nil
 }
 
@@ -744,7 +816,9 @@ func WrapWithGraceful(uconn *UConn, config *GracefulConfig) *GracefulConn {
 	// Extract remote address for reconnection
 	var remoteAddr string
 	if uconn.conn != nil {
-		remoteAddr = uconn.conn.RemoteAddr().String()
+		if addr := uconn.conn.RemoteAddr(); addr != nil {
+			remoteAddr = addr.String()
+		}
 	}
 
 	var dialer func() (net.Conn, error)
@@ -829,10 +903,10 @@ func GetRecommendedAction(err error) string {
 // when necessary for compatibility with legacy servers.
 func CreateDowngradedSpec(original *ClientHelloSpec, maxVersion uint16) (*ClientHelloSpec, error) {
 	if original == nil {
-		return nil, errors.New("tls: cannot downgrade nil ClientHelloSpec")
+		return nil, utlserrors.New("tls: cannot downgrade nil ClientHelloSpec").AtError()
 	}
 	if maxVersion < VersionTLS10 || maxVersion > VersionTLS13 {
-		return nil, fmt.Errorf("tls: invalid max version 0x%04x", maxVersion)
+		return nil, utlserrors.New("tls: invalid max version", fmt.Sprintf("0x%04x", maxVersion)).AtError()
 	}
 
 	// Create a shallow copy first

@@ -5,15 +5,19 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
 	"sync"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // This file contains the known CT log public keys.
@@ -32,10 +36,15 @@ import (
 var DefaultCTLogs = make(map[[32]byte]*CTLogInfo)
 
 func init() {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "CT: initializing default CT logs, count:", len(knownCTLogs))
+
 	// Initialize DefaultCTLogs with known CT logs
+	successCount := 0
 	for _, log := range knownCTLogs {
 		pubKey, logID, err := parseLogKey(log.PublicKeyB64)
 		if err != nil {
+			utlserrors.LogDebug(ctx, "CT: failed to parse log key for", log.Name, ":", err)
 			continue // Skip logs with unparseable keys
 		}
 		DefaultCTLogs[logID] = &CTLogInfo{
@@ -45,7 +54,11 @@ func init() {
 			URL:       log.URL,
 			Operator:  log.Operator,
 		}
+		successCount++
+		utlserrors.LogDebug(ctx, "CT: registered log:", log.Name, "ID:", hex.EncodeToString(logID[:8]), "...")
 	}
+
+	utlserrors.LogDebug(ctx, "CT: initialized", successCount, "CT logs successfully")
 }
 
 // ctLogEntry is the internal representation of a CT log before parsing
@@ -287,6 +300,9 @@ type CTLogRegistry struct {
 
 // NewCTLogRegistry creates a new registry initialized with the default logs
 func NewCTLogRegistry() *CTLogRegistry {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "CT: creating new log registry with default logs")
+
 	r := &CTLogRegistry{
 		logs: make(map[[32]byte]*CTLogInfo),
 	}
@@ -297,6 +313,7 @@ func NewCTLogRegistry() *CTLogRegistry {
 		r.logs[id] = &logCopy
 	}
 
+	utlserrors.LogDebug(ctx, "CT: registry initialized with", len(r.logs), "logs")
 	return r
 }
 
@@ -313,6 +330,7 @@ func (r *CTLogRegistry) Add(log *CTLogInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.logs[log.LogID] = log
+	utlserrors.LogDebug(context.Background(), "CT: added log to registry:", log.Name, "ID:", hex.EncodeToString(log.LogID[:8]), "...")
 }
 
 // Remove removes a CT log from the registry
@@ -320,6 +338,7 @@ func (r *CTLogRegistry) Remove(logID [32]byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.logs, logID)
+	utlserrors.LogDebug(context.Background(), "CT: removed log from registry, ID:", hex.EncodeToString(logID[:8]), "...")
 }
 
 // All returns a copy of all logs in the registry
@@ -337,9 +356,12 @@ func (r *CTLogRegistry) All() map[[32]byte]*CTLogInfo {
 
 // AddFromBase64 adds a log from its base64-encoded public key
 func (r *CTLogRegistry) AddFromBase64(name, url, operator, publicKeyB64 string) error {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "CT: adding log from base64:", name)
+
 	pubKey, logID, err := parseLogKey(publicKeyB64)
 	if err != nil {
-		return err
+		return utlserrors.New("tls: failed to parse CT log public key for ", name).Base(err).AtError()
 	}
 
 	r.Add(&CTLogInfo{
@@ -350,6 +372,7 @@ func (r *CTLogRegistry) AddFromBase64(name, url, operator, publicKeyB64 string) 
 		Operator:  operator,
 	})
 
+	utlserrors.LogDebug(ctx, "CT: successfully added log:", name, "ID:", hex.EncodeToString(logID[:8]), "...")
 	return nil
 }
 

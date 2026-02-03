@@ -5,6 +5,7 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -13,10 +14,12 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/binary"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // SCT (Signed Certificate Timestamp) validation for Certificate Transparency
@@ -34,11 +37,32 @@ const (
 	logEntryTypeX509    uint16 = 0
 	logEntryTypePrecert uint16 = 1
 
-	// Minimum number of valid SCTs required
-	// Chrome requires 2+ SCTs from different logs for certificates valid > 15 months
-	// For simplicity, we require at least 1 valid SCT
-	minValidSCTCount = 1
+	// Minimum number of valid SCTs required based on certificate validity period.
+	// Per Chrome's CT policy (https://googlechrome.github.io/CertificateTransparency/ct_policy.html):
+	// - Certificates valid <= 15 months: minimum 1 SCT required
+	// - Certificates valid > 15 months: minimum 2 SCTs from different log operators required
+	// This prevents a single CT log compromise from defeating protection for long-lived certificates.
+	minValidSCTCountShort = 1 // For certificates valid <= 15 months
+	minValidSCTCountLong  = 2 // For certificates valid > 15 months
+
+	// certificateValidityThreshold is the validity period threshold (15 months)
+	// above which additional SCTs are required. 15 months = 15 * 30.44 days (average month).
+	certificateValidityThreshold = 15 * 30 * 24 * time.Hour // ~456 days
 )
+
+// getMinSCTCount returns the minimum number of valid SCTs required for the given certificate
+// based on Chrome's Certificate Transparency policy. Long-lived certificates (validity > 15 months)
+// require more SCTs to ensure protection against single log operator compromise.
+func getMinSCTCount(cert *x509.Certificate) int {
+	if cert == nil {
+		return minValidSCTCountLong // Conservative default for nil certificate
+	}
+	validity := cert.NotAfter.Sub(cert.NotBefore)
+	if validity > certificateValidityThreshold {
+		return minValidSCTCountLong
+	}
+	return minValidSCTCountShort
+}
 
 // SignedCertificateTimestamp represents an SCT per RFC 6962 Section 3.2
 type SignedCertificateTimestamp struct {
@@ -81,10 +105,17 @@ type CTLogInfo struct {
 //	    digitally-signed struct { ... }
 //	} SignedCertificateTimestamp;
 func ParseSCT(data []byte) (*SignedCertificateTimestamp, error) {
+	return ParseSCTWithContext(context.Background(), data)
+}
+
+// ParseSCTWithContext parses an SCT from its wire format with context for logging.
+func ParseSCTWithContext(ctx context.Context, data []byte) (*SignedCertificateTimestamp, error) {
+	utlserrors.LogDebug(ctx, "CT: parsing SCT, data length:", len(data))
+
 	// Minimum size: version(1) + logID(32) + timestamp(8) + extensions length(2) + sig algo(2) + sig length(2) = 47
 	const minSCTSize = 1 + 32 + 8 + 2 + 2 + 2
 	if len(data) < minSCTSize {
-		return nil, errors.New("tls: SCT too short")
+		return nil, utlserrors.New("tls: SCT too short").AtError()
 	}
 
 	sct := &SignedCertificateTimestamp{}
@@ -93,7 +124,7 @@ func ParseSCT(data []byte) (*SignedCertificateTimestamp, error) {
 	// Version (1 byte)
 	sct.Version = data[offset]
 	if sct.Version != sctVersionV1 {
-		return nil, fmt.Errorf("tls: unsupported SCT version %d, expected %d", sct.Version, sctVersionV1)
+		return nil, utlserrors.New("tls: unsupported SCT version ", sct.Version, ", expected ", sctVersionV1).AtError()
 	}
 	offset++
 
@@ -101,19 +132,23 @@ func ParseSCT(data []byte) (*SignedCertificateTimestamp, error) {
 	copy(sct.LogID[:], data[offset:offset+32])
 	offset += 32
 
+	utlserrors.LogDebug(ctx, "CT: SCT log ID:", hex.EncodeToString(sct.LogID[:8]), "...")
+
 	// Timestamp (8 bytes - milliseconds since Unix epoch)
 	sct.Timestamp = binary.BigEndian.Uint64(data[offset : offset+8])
 	offset += 8
 
+	utlserrors.LogDebug(ctx, "CT: SCT timestamp:", sct.Time().Format(time.RFC3339))
+
 	// Extensions length (2 bytes) + data
 	if len(data) < offset+2 {
-		return nil, errors.New("tls: SCT extensions length truncated")
+		return nil, utlserrors.New("tls: SCT extensions length truncated").AtError()
 	}
 	extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 
 	if len(data) < offset+extLen {
-		return nil, errors.New("tls: SCT extensions data truncated")
+		return nil, utlserrors.New("tls: SCT extensions data truncated").AtError()
 	}
 	if extLen > 0 {
 		sct.Extensions = make([]byte, extLen)
@@ -123,24 +158,28 @@ func ParseSCT(data []byte) (*SignedCertificateTimestamp, error) {
 
 	// Signature algorithm (2 bytes: hash + signature)
 	if len(data) < offset+2 {
-		return nil, errors.New("tls: SCT signature algorithm truncated")
+		return nil, utlserrors.New("tls: SCT signature algorithm truncated").AtError()
 	}
 	sct.Signature.Algorithm.Hash = data[offset]
 	sct.Signature.Algorithm.Signature = data[offset+1]
 	offset += 2
 
+	utlserrors.LogDebug(ctx, "CT: SCT signature algorithm: hash=", sct.Signature.Algorithm.Hash, " sig=", sct.Signature.Algorithm.Signature)
+
 	// Signature length (2 bytes) + data
 	if len(data) < offset+2 {
-		return nil, errors.New("tls: SCT signature length truncated")
+		return nil, utlserrors.New("tls: SCT signature length truncated").AtError()
 	}
 	sigLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 
 	if len(data) < offset+sigLen {
-		return nil, errors.New("tls: SCT signature data truncated")
+		return nil, utlserrors.New("tls: SCT signature data truncated").AtError()
 	}
 	sct.Signature.Signature = make([]byte, sigLen)
 	copy(sct.Signature.Signature, data[offset:offset+sigLen])
+
+	utlserrors.LogDebug(ctx, "CT: SCT parsed successfully, signature length:", sigLen)
 
 	return sct, nil
 }
@@ -165,11 +204,18 @@ func (sct *SignedCertificateTimestamp) Time() time.Time {
 //	    CtExtensions extensions;
 //	}
 func (sct *SignedCertificateTimestamp) Verify(cert *x509.Certificate, issuerKeyHash []byte, logKey crypto.PublicKey) error {
+	return sct.VerifyWithContext(context.Background(), cert, issuerKeyHash, logKey)
+}
+
+// VerifyWithContext verifies the SCT signature against a certificate with context for logging.
+func (sct *SignedCertificateTimestamp) VerifyWithContext(ctx context.Context, cert *x509.Certificate, issuerKeyHash []byte, logKey crypto.PublicKey) error {
+	utlserrors.LogDebug(ctx, "CT: verifying SCT for log ID:", hex.EncodeToString(sct.LogID[:8]), "...")
+
 	if cert == nil {
-		return errors.New("tls: certificate is nil")
+		return utlserrors.New("tls: certificate is nil").AtError()
 	}
 	if logKey == nil {
-		return errors.New("tls: log public key is nil")
+		return utlserrors.New("tls: log public key is nil").AtError()
 	}
 
 	// Determine entry type and build signed data
@@ -180,15 +226,17 @@ func (sct *SignedCertificateTimestamp) Verify(cert *x509.Certificate, issuerKeyH
 	isPrecert := hasPoisonExtension(cert)
 
 	if isPrecert {
+		utlserrors.LogDebug(ctx, "CT: certificate is a precertificate")
 		if issuerKeyHash == nil {
-			return errors.New("tls: issuer key hash required for precertificate SCT verification")
+			return utlserrors.New("tls: issuer key hash required for precertificate SCT verification").AtError()
 		}
 		signedData, err = sct.buildPrecertSignedData(cert, issuerKeyHash)
 	} else {
+		utlserrors.LogDebug(ctx, "CT: certificate is a standard X.509 certificate")
 		signedData, err = sct.buildCertSignedData(cert)
 	}
 	if err != nil {
-		return fmt.Errorf("tls: failed to build SCT signed data: %w", err)
+		return utlserrors.New("tls: failed to build SCT signed data").Base(err).AtError()
 	}
 
 	// Hash the signed data
@@ -199,7 +247,13 @@ func (sct *SignedCertificateTimestamp) Verify(cert *x509.Certificate, issuerKeyH
 
 	// Verify the signature
 	// Note: Ed25519 requires the raw signedData, not the hash
-	return sct.verifySignature(hash, signedData, logKey)
+	if err := sct.verifySignature(hash, signedData, logKey); err != nil {
+		utlserrors.LogDebug(ctx, "CT: SCT signature verification failed")
+		return err
+	}
+
+	utlserrors.LogDebug(ctx, "CT: SCT signature verified successfully")
+	return nil
 }
 
 // buildCertSignedData builds the signed data for an X.509 certificate entry
@@ -326,11 +380,11 @@ func (sct *SignedCertificateTimestamp) hashSignedData(data []byte) ([]byte, erro
 	case 6: // SHA-512
 		hashFunc = crypto.SHA512
 	default:
-		return nil, fmt.Errorf("tls: unsupported SCT hash algorithm %d", sct.Signature.Algorithm.Hash)
+		return nil, utlserrors.New("tls: unsupported SCT hash algorithm ", sct.Signature.Algorithm.Hash).AtError()
 	}
 
 	if !hashFunc.Available() {
-		return nil, fmt.Errorf("tls: hash algorithm %d not available", sct.Signature.Algorithm.Hash)
+		return nil, utlserrors.New("tls: hash algorithm ", sct.Signature.Algorithm.Hash, " not available").AtError()
 	}
 
 	h := hashFunc.New()
@@ -345,35 +399,38 @@ func (sct *SignedCertificateTimestamp) verifySignature(hash, signedData []byte, 
 	case 1: // RSA
 		rsaKey, ok := pubKey.(*rsa.PublicKey)
 		if !ok {
-			return errors.New("tls: SCT signature algorithm RSA but key is not RSA")
+			return utlserrors.New("tls: SCT signature algorithm RSA but key is not RSA").AtError()
 		}
 		hashFunc := sct.getHashFunc()
-		return rsa.VerifyPKCS1v15(rsaKey, hashFunc, hash, sct.Signature.Signature)
+		if err := rsa.VerifyPKCS1v15(rsaKey, hashFunc, hash, sct.Signature.Signature); err != nil {
+			return utlserrors.New("tls: invalid RSA signature in SCT").Base(err).AtError()
+		}
+		return nil
 
 	case 3: // ECDSA
 		ecdsaKey, ok := pubKey.(*ecdsa.PublicKey)
 		if !ok {
-			return errors.New("tls: SCT signature algorithm ECDSA but key is not ECDSA")
+			return utlserrors.New("tls: SCT signature algorithm ECDSA but key is not ECDSA").AtError()
 		}
 		// ECDSA signature is DER-encoded
 		if !verifyECDSASignature(ecdsaKey, hash, sct.Signature.Signature) {
-			return errors.New("tls: invalid ECDSA signature in SCT")
+			return utlserrors.New("tls: invalid ECDSA signature in SCT").AtError()
 		}
 		return nil
 
 	case 7: // Ed25519 (RFC 8422)
 		ed25519Key, ok := pubKey.(ed25519.PublicKey)
 		if !ok {
-			return errors.New("tls: SCT signature algorithm Ed25519 but key is not Ed25519")
+			return utlserrors.New("tls: SCT signature algorithm Ed25519 but key is not Ed25519").AtError()
 		}
 		// Ed25519 uses the raw message, not a hash (RFC 8032)
 		if !ed25519.Verify(ed25519Key, signedData, sct.Signature.Signature) {
-			return errors.New("tls: invalid Ed25519 signature in SCT")
+			return utlserrors.New("tls: invalid Ed25519 signature in SCT").AtError()
 		}
 		return nil
 
 	default:
-		return fmt.Errorf("tls: unsupported SCT signature algorithm %d", sct.Signature.Algorithm.Signature)
+		return utlserrors.New("tls: unsupported SCT signature algorithm ", sct.Signature.Algorithm.Signature).AtError()
 	}
 }
 
@@ -450,8 +507,15 @@ func extractTBSCertificateForCT(cert *x509.Certificate) ([]byte, error) {
 // 2. OCSP response extension
 // 3. X.509v3 certificate extension
 func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]byte, logs map[[32]byte]*CTLogInfo) error {
+	return ValidateSCTsWithContext(context.Background(), cert, chain, scts, logs)
+}
+
+// ValidateSCTsWithContext validates SCTs with context for logging.
+func ValidateSCTsWithContext(ctx context.Context, cert *x509.Certificate, chain []*x509.Certificate, scts [][]byte, logs map[[32]byte]*CTLogInfo) error {
+	utlserrors.LogDebug(ctx, "CT: validating SCTs, count:", len(scts))
+
 	if len(scts) == 0 {
-		return errors.New("tls: no SCTs provided for certificate transparency validation")
+		return utlserrors.New("tls: no SCTs provided for certificate transparency validation").AtError()
 	}
 
 	if logs == nil {
@@ -459,8 +523,11 @@ func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]by
 	}
 
 	if len(logs) == 0 {
-		return errors.New("tls: no CT logs configured for validation")
+		return utlserrors.New("tls: no CT logs configured for validation").AtError()
 	}
+
+	requiredSCTs := getMinSCTCount(cert)
+	utlserrors.LogDebug(ctx, "CT: checking policy, required SCTs:", requiredSCTs)
 
 	// Calculate issuer key hash for precertificate validation
 	var issuerKeyHash []byte
@@ -472,8 +539,10 @@ func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]by
 	var lastError error
 	seenLogs := make(map[[32]byte]bool) // Track unique valid logs
 
-	for _, sctData := range scts {
-		sct, err := ParseSCT(sctData)
+	for i, sctData := range scts {
+		utlserrors.LogDebug(ctx, "CT: processing SCT", i+1, "of", len(scts))
+
+		sct, err := ParseSCTWithContext(ctx, sctData)
 		if err != nil {
 			lastError = err
 			continue
@@ -482,13 +551,16 @@ func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]by
 		// Look up the log by its ID
 		log, ok := logs[sct.LogID]
 		if !ok {
-			lastError = fmt.Errorf("tls: unknown CT log ID %x", sct.LogID[:8])
+			utlserrors.LogDebug(ctx, "CT: unknown log ID:", hex.EncodeToString(sct.LogID[:8]), "...")
+			lastError = utlserrors.New("tls: unknown CT log ID ", hex.EncodeToString(sct.LogID[:8])).AtError()
 			continue
 		}
 
+		utlserrors.LogDebug(ctx, "CT: validating SCT from log:", log.Name)
+
 		// Verify the SCT signature
-		if err := sct.Verify(cert, issuerKeyHash, log.PublicKey); err != nil {
-			lastError = fmt.Errorf("tls: SCT from log %s failed verification: %w", log.Name, err)
+		if err := sct.VerifyWithContext(ctx, cert, issuerKeyHash, log.PublicKey); err != nil {
+			lastError = utlserrors.New("tls: SCT from log ", log.Name, " failed verification").Base(err).AtError()
 			continue
 		}
 
@@ -496,7 +568,8 @@ func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]by
 		now := time.Now()
 		sctTime := sct.Time()
 		if sctTime.After(now.Add(24 * time.Hour)) {
-			lastError = fmt.Errorf("tls: SCT timestamp from log %s is in the future", log.Name)
+			utlserrors.LogDebug(ctx, "CT: SCT timestamp from log", log.Name, "is in the future:", sctTime.Format(time.RFC3339))
+			lastError = utlserrors.New("tls: SCT timestamp from log ", log.Name, " is in the future").AtError()
 			continue
 		}
 
@@ -504,16 +577,18 @@ func ValidateSCTs(cert *x509.Certificate, chain []*x509.Certificate, scts [][]by
 		if !seenLogs[sct.LogID] {
 			seenLogs[sct.LogID] = true
 			validCount++
+			utlserrors.LogDebug(ctx, "CT: valid SCT from log:", log.Name, ", total valid:", validCount)
 		}
 	}
 
-	if validCount < minValidSCTCount {
+	if validCount < requiredSCTs {
 		if lastError != nil {
-			return fmt.Errorf("tls: insufficient valid SCTs (%d < %d): %w", validCount, minValidSCTCount, lastError)
+			return utlserrors.New("tls: insufficient valid SCTs (", validCount, " < ", requiredSCTs, ")").Base(lastError).AtError()
 		}
-		return fmt.Errorf("tls: insufficient valid SCTs (%d < %d)", validCount, minValidSCTCount)
+		return utlserrors.New("tls: insufficient valid SCTs (", validCount, " < ", requiredSCTs, ")").AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "CT: policy satisfied with", validCount, "valid SCTs")
 	return nil
 }
 
@@ -542,13 +617,13 @@ func ExtractSCTsFromCertificate(cert *x509.Certificate) ([][]byte, error) {
 // Format: uint16 list_length + (uint16 sct_length + sct_data)*
 func parseSCTList(data []byte) ([][]byte, error) {
 	if len(data) < 2 {
-		return nil, errors.New("tls: SCT list too short")
+		return nil, utlserrors.New("tls: SCT list too short").AtError()
 	}
 
 	// Total list length
 	listLen := int(binary.BigEndian.Uint16(data[:2]))
 	if len(data) < 2+listLen {
-		return nil, errors.New("tls: SCT list length mismatch")
+		return nil, utlserrors.New("tls: SCT list length mismatch").AtError()
 	}
 
 	var scts [][]byte
@@ -557,13 +632,13 @@ func parseSCTList(data []byte) ([][]byte, error) {
 
 	for offset < end {
 		if offset+2 > end {
-			return nil, errors.New("tls: SCT length truncated")
+			return nil, utlserrors.New("tls: SCT length truncated").AtError()
 		}
 		sctLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 		offset += 2
 
 		if offset+sctLen > end {
-			return nil, errors.New("tls: SCT data truncated")
+			return nil, utlserrors.New("tls: SCT data truncated").AtError()
 		}
 		sct := make([]byte, sctLen)
 		copy(sct, data[offset:offset+sctLen])
@@ -646,6 +721,6 @@ func ValidateSCTsDetailed(cert *x509.Certificate, chain []*x509.Certificate, sct
 		}
 	}
 
-	result.Valid = result.ValidSCTs >= minValidSCTCount
+	result.Valid = result.ValidSCTs >= getMinSCTCount(cert)
 	return result
 }

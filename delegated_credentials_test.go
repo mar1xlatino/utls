@@ -160,7 +160,7 @@ func TestDCParseTrailingData(t *testing.T) {
 
 	_, err = parseDelegatedCredential(data)
 	if err == nil {
-		t.Error("Expected error for trailing data, got nil")
+		t.Fatal("Expected error for trailing data, got nil")
 	}
 	if !strings.Contains(err.Error(), "trailing") {
 		t.Errorf("Error should mention trailing data: %v", err)
@@ -174,6 +174,7 @@ func TestDCValidityPeriod(t *testing.T) {
 	}
 
 	certNotBefore := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	certNotAfter := certNotBefore.AddDate(1, 0, 0) // Certificate valid for 1 year
 
 	testCases := []struct {
 		name      string
@@ -209,7 +210,82 @@ func TestDCValidityPeriod(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			valid := dc.IsValid(certNotBefore, tc.now)
+			valid := dc.IsValid(certNotBefore, certNotAfter, tc.now)
+			if valid != tc.wantValid {
+				t.Errorf("IsValid() = %v, want %v", valid, tc.wantValid)
+			}
+		})
+	}
+}
+
+// TestDCValidityAgainstCertExpiry tests that DC cannot outlive certificate
+func TestDCValidityAgainstCertExpiry(t *testing.T) {
+	certNotBefore := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	testCases := []struct {
+		name         string
+		dcValidTime  uint32
+		certNotAfter time.Time
+		now          time.Time
+		wantValid    bool
+	}{
+		{
+			name:         "DC expires before cert - valid in middle",
+			dcValidTime:  3600, // 1 hour
+			certNotAfter: certNotBefore.AddDate(1, 0, 0),
+			now:          certNotBefore.Add(30 * time.Minute),
+			wantValid:    true,
+		},
+		{
+			name:         "DC validity extends beyond cert - now before cert expiry",
+			dcValidTime:  7200, // 2 hours
+			certNotAfter: certNotBefore.Add(1 * time.Hour),
+			now:          certNotBefore.Add(30 * time.Minute),
+			wantValid:    true, // Still valid because now < certNotAfter
+		},
+		{
+			name:         "DC validity extends beyond cert - now at cert expiry",
+			dcValidTime:  7200, // 2 hours (DC claims valid until +2h)
+			certNotAfter: certNotBefore.Add(1 * time.Hour),
+			now:          certNotBefore.Add(1 * time.Hour), // Exactly at cert expiry
+			wantValid:    false, // Invalid: DC capped at cert expiry
+		},
+		{
+			name:         "DC validity extends beyond cert - now between cert and DC expiry",
+			dcValidTime:  7200, // 2 hours (DC claims valid until +2h)
+			certNotAfter: certNotBefore.Add(1 * time.Hour),
+			now:          certNotBefore.Add(90 * time.Minute), // 1.5 hours (past cert expiry)
+			wantValid:    false, // Invalid: DC capped at cert expiry
+		},
+		{
+			name:         "cert already expired",
+			dcValidTime:  3600,
+			certNotAfter: certNotBefore.Add(-1 * time.Hour), // Cert expired before notBefore (invalid cert)
+			now:          certNotBefore,
+			wantValid:    false,
+		},
+		{
+			name:         "cert expires exactly at DC expiry",
+			dcValidTime:  3600, // 1 hour
+			certNotAfter: certNotBefore.Add(1 * time.Hour),
+			now:          certNotBefore.Add(30 * time.Minute),
+			wantValid:    true,
+		},
+		{
+			name:         "cert expires exactly at DC expiry - check at boundary",
+			dcValidTime:  3600, // 1 hour
+			certNotAfter: certNotBefore.Add(1 * time.Hour),
+			now:          certNotBefore.Add(1 * time.Hour), // Exactly at expiry
+			wantValid:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dc := &DelegatedCredential{
+				ValidTime: tc.dcValidTime,
+			}
+			valid := dc.IsValid(certNotBefore, tc.certNotAfter, tc.now)
 			if valid != tc.wantValid {
 				t.Errorf("IsValid() = %v, want %v", valid, tc.wantValid)
 			}
@@ -493,7 +569,7 @@ func TestDCVerifyWithoutDelegationUsage(t *testing.T) {
 
 	err = dc.Verify(cert)
 	if err == nil {
-		t.Error("Expected error when verifying DC against cert without DelegationUsage")
+		t.Fatal("Expected error when verifying DC against cert without DelegationUsage")
 	}
 	if !strings.Contains(err.Error(), "DelegationUsage") {
 		t.Errorf("Error should mention DelegationUsage: %v", err)

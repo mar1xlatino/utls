@@ -63,8 +63,9 @@ type MemoryBudget struct {
 	disabled            atomic.Bool
 
 	// Reconciliation control
-	reconcileStop chan struct{}
-	reconcileOnce sync.Once
+	reconcileStop     chan struct{}
+	reconcileOnce     sync.Once
+	reconcileStopOnce sync.Once // Ensures channel is closed exactly once
 }
 
 var globalMemoryBudget *MemoryBudget
@@ -556,19 +557,19 @@ func StartReconciliation() {
 }
 
 // StopReconciliation stops the background reconciliation goroutine.
-// Safe to call even if not started.
+// Safe to call even if not started. Thread-safe for concurrent calls.
 func StopReconciliation() {
 	mb := globalMemoryBudget
 	if mb == nil || mb.reconcileStop == nil {
 		return
 	}
 
-	select {
-	case <-mb.reconcileStop:
-		// Already stopped
-	default:
+	// Use sync.Once to ensure channel is closed exactly once.
+	// This prevents the race where two goroutines both see the channel
+	// as open and attempt to close it concurrently.
+	mb.reconcileStopOnce.Do(func() {
 		close(mb.reconcileStop)
-	}
+	})
 }
 
 // reconcileLoop runs periodically to detect and correct budget drift.

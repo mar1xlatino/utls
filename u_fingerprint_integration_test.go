@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -173,8 +174,8 @@ func TestApplyProfile_WithNilUConn(t *testing.T) {
 	}
 
 	expectedMsg := "tls: cannot apply profile to nil UConn"
-	if err.Error() != expectedMsg {
-		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("error message should contain %q, got %q", expectedMsg, err.Error())
 	}
 }
 
@@ -251,8 +252,8 @@ func TestApplyFingerprintProfile_WithNilProfile(t *testing.T) {
 	}
 
 	expectedMsg := "tls: cannot apply nil profile"
-	if err.Error() != expectedMsg {
-		t.Errorf("unexpected error message: got %q, want %q", err.Error(), expectedMsg)
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("error message should contain %q, got %q", expectedMsg, err.Error())
 	}
 }
 

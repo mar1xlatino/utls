@@ -5,15 +5,17 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdh"
 	"crypto/md5"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"io"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // A keyAgreement implements the client and server side of a TLS 1.0–1.2 key
@@ -40,8 +42,8 @@ type keyAgreement interface {
 	cleanup()
 }
 
-var errClientKeyExchange = errors.New("tls: invalid ClientKeyExchange message")
-var errServerKeyExchange = errors.New("tls: invalid ServerKeyExchange message")
+var errClientKeyExchange = utlserrors.New("tls: invalid ClientKeyExchange message").AtError()
+var errServerKeyExchange = utlserrors.New("tls: invalid ServerKeyExchange message").AtError()
 
 // rsaKeyAgreement implements the standard TLS key agreement where the client
 // encrypts the pre-master secret to the server's public key.
@@ -52,6 +54,10 @@ func (ka rsaKeyAgreement) generateServerKeyExchange(config *Config, cert *Certif
 }
 
 func (ka rsaKeyAgreement) processClientKeyExchange(config *Config, cert *Certificate, ckx *clientKeyExchangeMsg, version uint16) ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: RSA key agreement: processing client key exchange")
+	}
+
 	if len(ckx.ciphertext) < 2 {
 		return nil, errClientKeyExchange
 	}
@@ -63,12 +69,12 @@ func (ka rsaKeyAgreement) processClientKeyExchange(config *Config, cert *Certifi
 
 	priv, ok := cert.PrivateKey.(crypto.Decrypter)
 	if !ok {
-		return nil, errors.New("tls: certificate private key does not implement crypto.Decrypter")
+		return nil, utlserrors.New("tls: certificate private key does not implement crypto.Decrypter").AtError()
 	}
 	// Perform constant time RSA PKCS #1 v1.5 decryption
 	preMasterSecret, err := priv.Decrypt(config.rand(), ciphertext, &rsa.PKCS1v15DecryptOptions{SessionKeyLen: 48})
 	if err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: RSA key agreement decryption failed").Base(err).AtError()
 	}
 	// We don't check the version number in the premaster secret. For one,
 	// by checking it, we would leak information about the validity of the
@@ -76,35 +82,47 @@ func (ka rsaKeyAgreement) processClientKeyExchange(config *Config, cert *Certifi
 	// benefit against a downgrade attack and some implementations send the
 	// wrong version anyway. See the discussion at the end of section
 	// 7.4.7.1 of RFC 4346.
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: RSA key agreement: pre-master secret derived")
+	}
 	return preMasterSecret, nil
 }
 
 func (ka rsaKeyAgreement) processServerKeyExchange(config *Config, clientHello *clientHelloMsg, serverHello *serverHelloMsg, cert *x509.Certificate, skx *serverKeyExchangeMsg) error {
-	return errors.New("tls: unexpected ServerKeyExchange")
+	return utlserrors.New("tls: unexpected ServerKeyExchange").AtError()
 }
 
 func (ka rsaKeyAgreement) generateClientKeyExchange(config *Config, clientHello *clientHelloMsg, cert *x509.Certificate) ([]byte, *clientKeyExchangeMsg, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: RSA key agreement: generating client key exchange")
+	}
+
 	preMasterSecret := make([]byte, 48)
 	preMasterSecret[0] = byte(clientHello.vers >> 8)
 	preMasterSecret[1] = byte(clientHello.vers)
 	_, err := io.ReadFull(config.rand(), preMasterSecret[2:])
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, utlserrors.New("tls: failed to generate pre-master secret").Base(err).AtError()
 	}
 
 	rsaKey, ok := cert.PublicKey.(*rsa.PublicKey)
 	if !ok {
-		return nil, nil, errors.New("tls: server certificate contains incorrect key type for selected ciphersuite")
+		return nil, nil, utlserrors.New("tls: server certificate contains incorrect key type for selected ciphersuite").AtError()
 	}
 	encrypted, err := rsa.EncryptPKCS1v15(config.rand(), rsaKey, preMasterSecret)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, utlserrors.New("tls: RSA encryption failed").Base(err).AtError()
 	}
 	ckx := new(clientKeyExchangeMsg)
 	ckx.ciphertext = make([]byte, len(encrypted)+2)
 	ckx.ciphertext[0] = byte(len(encrypted) >> 8)
 	ckx.ciphertext[1] = byte(len(encrypted))
 	copy(ckx.ciphertext[2:], encrypted)
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: RSA key agreement: client key exchange generated")
+	}
 	return preMasterSecret, ckx, nil
 }
 
@@ -185,17 +203,25 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
 	}
 
 	if curveID == 0 {
-		return nil, errors.New("tls: no supported elliptic curves offered")
+		return nil, utlserrors.New("tls: no supported elliptic curves offered").AtError()
 	}
 	if _, ok := curveForCurveID(curveID); !ok {
-		return nil, errors.New("tls: CurvePreferences includes unsupported curve")
+		return nil, utlserrors.New("tls: CurvePreferences includes unsupported curve").AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: using curve:", curveID)
 	}
 
 	key, err := generateECDHEKey(config.rand(), curveID)
 	if err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to generate ECDHE key").Base(err).AtError()
 	}
 	ka.key = key
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: generated ephemeral key pair")
+	}
 
 	// See RFC 4492, Section 5.4.
 	ecdhePublic := key.PublicKey().Bytes()
@@ -208,7 +234,8 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
 
 	priv, ok := cert.PrivateKey.(crypto.Signer)
 	if !ok {
-		return nil, fmt.Errorf("tls: certificate private key of type %T does not implement crypto.Signer", cert.PrivateKey)
+		return nil, utlserrors.New("tls: certificate private key of type ", fmt.Sprintf("%T", cert.PrivateKey),
+			" does not implement crypto.Signer").AtError()
 	}
 
 	var signatureAlgorithm SignatureScheme
@@ -230,7 +257,7 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
 		}
 	}
 	if (sigType == signaturePKCS1v15 || sigType == signatureRSAPSS) != ka.isRSA {
-		return nil, errors.New("tls: certificate cannot be used with the selected cipher suite")
+		return nil, utlserrors.New("tls: certificate cannot be used with the selected cipher suite").AtError()
 	}
 
 	signed := hashForServerKeyExchange(sigType, sigHash, ka.version, clientHello.random, hello.random, serverECDHEParams)
@@ -241,7 +268,7 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
 	}
 	sig, err := priv.Sign(config.rand(), signed, signOpts)
 	if err != nil {
-		return nil, errors.New("tls: failed to sign ECDHE parameters: " + err.Error())
+		return nil, utlserrors.New("tls: failed to sign ECDHE parameters").Base(err).AtError()
 	}
 
 	skx := new(serverKeyExchangeMsg)
@@ -265,6 +292,10 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
 }
 
 func (ka *ecdheKeyAgreement) processClientKeyExchange(config *Config, cert *Certificate, ckx *clientKeyExchangeMsg, version uint16) ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: processing client key exchange")
+	}
+
 	if len(ckx.ciphertext) == 0 || int(ckx.ciphertext[0]) != len(ckx.ciphertext)-1 {
 		return nil, errClientKeyExchange
 	}
@@ -278,6 +309,9 @@ func (ka *ecdheKeyAgreement) processClientKeyExchange(config *Config, cert *Cert
 		return nil, errClientKeyExchange
 	}
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: shared secret computed")
+	}
 	return preMasterSecret, nil
 }
 
@@ -286,7 +320,7 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
 		return errServerKeyExchange
 	}
 	if skx.key[0] != 3 { // named curve
-		return errors.New("tls: server selected unsupported curve")
+		return utlserrors.New("tls: server selected unsupported curve").AtError()
 	}
 	curveID := CurveID(skx.key[1])<<8 | CurveID(skx.key[2])
 
@@ -303,12 +337,16 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
 	}
 
 	if _, ok := curveForCurveID(curveID); !ok {
-		return errors.New("tls: server selected unsupported curve")
+		return utlserrors.New("tls: server selected unsupported curve").AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: server selected curve:", curveID)
 	}
 
 	key, err := generateECDHEKey(config.rand(), curveID)
 	if err != nil {
-		return err
+		return utlserrors.New("tls: failed to generate ECDHE key").Base(err).AtError()
 	}
 	ka.key = key
 
@@ -319,6 +357,10 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
 	ka.preMasterSecret, err = key.ECDH(peerKey)
 	if err != nil {
 		return errServerKeyExchange
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: ECDHE key agreement: computed shared secret")
 	}
 
 	ourPublicKey := key.PublicKey().Bytes()
@@ -337,7 +379,7 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
 		}
 
 		if !isSupportedSignatureAlgorithm(signatureAlgorithm, clientHello.supportedSignatureAlgorithms) {
-			return errors.New("tls: certificate used with invalid signature algorithm")
+			return utlserrors.New("tls: certificate used with invalid signature algorithm").AtError()
 		}
 		sigType, sigHash, err = typeAndHashFromSignatureScheme(signatureAlgorithm)
 		if err != nil {
@@ -361,14 +403,14 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
 
 	signed := hashForServerKeyExchange(sigType, sigHash, ka.version, clientHello.random, serverHello.random, serverECDHEParams)
 	if err := verifyHandshakeSignature(sigType, cert.PublicKey, sigHash, signed, sig); err != nil {
-		return errors.New("tls: invalid signature by the server certificate: " + err.Error())
+		return utlserrors.New("tls: invalid signature by the server certificate").Base(err).AtError()
 	}
 	return nil
 }
 
 func (ka *ecdheKeyAgreement) generateClientKeyExchange(config *Config, clientHello *clientHelloMsg, cert *x509.Certificate) ([]byte, *clientKeyExchangeMsg, error) {
 	if ka.ckx == nil {
-		return nil, nil, errors.New("tls: missing ServerKeyExchange message")
+		return nil, nil, utlserrors.New("tls: missing ServerKeyExchange message").AtError()
 	}
 
 	return ka.preMasterSecret, ka.ckx, nil

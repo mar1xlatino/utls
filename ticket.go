@@ -5,16 +5,16 @@
 package tls
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
-	"errors"
-	"fmt"
 	"io"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -28,17 +28,17 @@ var (
 	//   - Tickets from a different server or cluster
 	// This error is not returned by DecryptTicket (which returns nil, nil for
 	// backward compatibility) but can be used by custom UnwrapSession implementations.
-	ErrTicketDecryptionFailed = errors.New("tls: session ticket decryption failed")
+	ErrTicketDecryptionFailed = utlserrors.New("tls: session ticket decryption failed").AtError()
 
 	// ErrTicketTooShort indicates the session ticket is shorter than the minimum
 	// required length (AES block size + HMAC-SHA256 size).
-	ErrTicketTooShort = errors.New("tls: session ticket too short")
+	ErrTicketTooShort = utlserrors.New("tls: session ticket too short").AtError()
 
 	// ErrTicketParsingFailed indicates the session ticket was successfully decrypted
 	// (MAC verification passed) but the decrypted payload could not be parsed.
 	// This is a security-relevant condition: a cryptographically valid ticket with
 	// corrupt contents may indicate data corruption, a bug, or a sophisticated attack.
-	ErrTicketParsingFailed = errors.New("tls: session ticket parsing failed after successful decryption")
+	ErrTicketParsingFailed = utlserrors.New("tls: session ticket parsing failed after successful decryption").AtError()
 )
 
 // A SessionState is a resumable session.
@@ -176,7 +176,7 @@ func (s *SessionState) Bytes() ([]byte, error) {
 			b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
 				// We elide the first certificate because it's always the leaf.
 				if len(chain) == 0 {
-					b.SetError(errors.New("tls: internal error: empty verified chain"))
+					b.SetError(utlserrors.New("tls: internal error: empty verified chain").AtError())
 					return
 				}
 				for _, cert := range chain[1:] {
@@ -240,12 +240,12 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 		!s.ReadUint8(&earlyData) ||
 		len(ss.secret) == 0 ||
 		!unmarshalCertificate(&s, &cert) {
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding").AtError()
 	}
 	for !extra.Empty() {
 		var e []byte
 		if !readUint24LengthPrefixed(&extra, &e) {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: malformed extra data").AtError()
 		}
 		ss.Extra = append(ss.Extra, e)
 	}
@@ -255,7 +255,7 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	case 1:
 		ss.extMasterSecret = true
 	default:
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding: invalid extMasterSecret value").AtError()
 	}
 	switch earlyData {
 	case 0:
@@ -263,7 +263,7 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	case 1:
 		ss.EarlyData = true
 	default:
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding: invalid earlyData value").AtError()
 	}
 	for _, cert := range cert.Certificate {
 		c, err := globalCertCache.newCert(cert)
@@ -277,22 +277,22 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	ss.scts = cert.SignedCertificateTimestamps
 	var chainList cryptobyte.String
 	if !s.ReadUint24LengthPrefixed(&chainList) {
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding: missing chain list").AtError()
 	}
 	for !chainList.Empty() {
 		var certList cryptobyte.String
 		if !chainList.ReadUint24LengthPrefixed(&certList) {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: malformed certificate chain").AtError()
 		}
 		var chain []*x509.Certificate
 		if len(ss.peerCertificates) == 0 {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: empty peer certificates").AtError()
 		}
 		chain = append(chain, ss.peerCertificates[0])
 		for !certList.Empty() {
 			var cert []byte
 			if !readUint24LengthPrefixed(&certList, &cert) {
-				return nil, errors.New("tls: invalid session encoding")
+				return nil, utlserrors.New("tls: invalid session encoding: malformed certificate").AtError()
 			}
 			c, err := globalCertCache.newCert(cert)
 			if err != nil {
@@ -306,7 +306,7 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	if ss.EarlyData {
 		var alpn []byte
 		if !readUint8LengthPrefixed(&s, &alpn) {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: missing ALPN for early data").AtError()
 		}
 		ss.alpnProtocol = string(alpn)
 	}
@@ -315,36 +315,38 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 		// This is required for RFC 8446 Section 4.2.10 ticket age validation during 0-RTT.
 		if ss.version >= VersionTLS13 && ss.EarlyData {
 			if !s.ReadUint32(&ss.ageAdd) {
-				return nil, errors.New("tls: invalid session encoding: missing ageAdd for server-side 0-RTT")
+				return nil, utlserrors.New("tls: invalid session encoding: missing ageAdd for server-side 0-RTT").AtError()
 			}
 		}
 		if !s.Empty() {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: trailing data in server session").AtError()
 		}
+		utlserrors.LogDebug(context.Background(), "session: parsed server-side session state, version=", ss.version, ", earlyData=", ss.EarlyData)
 		return ss, nil
 	}
 	ss.isClient = true
 	if len(ss.peerCertificates) == 0 {
-		return nil, errors.New("tls: no server certificates in client session")
+		return nil, utlserrors.New("tls: no server certificates in client session").AtError()
 	}
 	if ss.version < VersionTLS13 {
 		if !s.Empty() {
-			return nil, errors.New("tls: invalid session encoding")
+			return nil, utlserrors.New("tls: invalid session encoding: trailing data in TLS 1.2 client session").AtError()
 		}
+		utlserrors.LogDebug(context.Background(), "session: parsed TLS 1.2 client session state")
 		return ss, nil
 	}
 	if !s.ReadUint64(&ss.useBy) || !s.ReadUint32(&ss.ageAdd) {
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding: missing TLS 1.3 client fields").AtError()
 	}
 	// [uTLS] Parse maxEarlyDataSize when EarlyData is enabled.
 	// This is critical for 0-RTT session resumption.
 	if ss.EarlyData {
 		if !s.ReadUint32(&ss.maxEarlyDataSize) {
-			return nil, errors.New("tls: invalid session encoding: missing maxEarlyDataSize for early data")
+			return nil, utlserrors.New("tls: invalid session encoding: missing maxEarlyDataSize for early data").AtError()
 		}
 	}
 	if !s.Empty() {
-		return nil, errors.New("tls: invalid session encoding")
+		return nil, utlserrors.New("tls: invalid session encoding: trailing data in TLS 1.3 client session").AtError()
 	}
 
 	// RFC 8446 Section 4.6.1: "Servers MUST NOT use any value greater than
@@ -353,9 +355,10 @@ func ParseSessionState(data []byte) (*SessionState, error) {
 	// maxSessionTicketLifetime is 7 * 24 * time.Hour = 604800 seconds.
 	const maxLifetimeSeconds = uint64(7 * 24 * 60 * 60) // 604800 seconds
 	if ss.useBy > ss.createdAt && (ss.useBy-ss.createdAt) > maxLifetimeSeconds {
-		return nil, errors.New("tls: session ticket lifetime exceeds maximum allowed by RFC 8446")
+		return nil, utlserrors.New("tls: session ticket lifetime exceeds maximum allowed by RFC 8446").AtError()
 	}
 
+	utlserrors.LogDebug(context.Background(), "session: parsed TLS 1.3 client session state, earlyData=", ss.EarlyData, ", maxEarlyDataSize=", ss.maxEarlyDataSize)
 	return ss, nil
 }
 
@@ -380,21 +383,24 @@ func (c *Conn) sessionState() *SessionState {
 // EncryptTicket encrypts a ticket with the [Config]'s configured (or default)
 // session ticket keys. It can be used as a [Config.WrapSession] implementation.
 func (c *Config) EncryptTicket(cs ConnectionState, ss *SessionState) ([]byte, error) {
+	utlserrors.LogDebug(context.Background(), "session: encrypting ticket for cipher=", ss.cipherSuite, ", version=", ss.version)
 	ticketKeys, err := c.ticketKeys(nil)
 	if err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to get ticket keys").Base(err).AtError()
 	}
 	stateBytes, err := ss.Bytes()
 	if err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to serialize session state").Base(err).AtError()
 	}
 	return c.encryptTicket(stateBytes, ticketKeys)
 }
 
 func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, error) {
 	if len(ticketKeys) == 0 {
-		return nil, errors.New("tls: internal error: session ticket keys unavailable")
+		return nil, utlserrors.New("tls: internal error: session ticket keys unavailable").AtError()
 	}
+
+	utlserrors.LogDebug(context.Background(), "session ticket: encrypting, stateSize=", len(state))
 
 	encrypted := make([]byte, aes.BlockSize+len(state)+sha256.Size)
 	iv := encrypted[:aes.BlockSize]
@@ -403,12 +409,12 @@ func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, er
 	macBytes := encrypted[len(encrypted)-sha256.Size:]
 
 	if _, err := io.ReadFull(c.rand(), iv); err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to generate IV for session ticket").Base(err).AtError()
 	}
 	key := ticketKeys[0]
 	block, err := aes.NewCipher(key.aesKey[:])
 	if err != nil {
-		return nil, errors.New("tls: failed to create cipher while encrypting ticket: " + err.Error())
+		return nil, utlserrors.New("tls: failed to create cipher while encrypting ticket").Base(err).AtError()
 	}
 	cipher.NewCTR(block, iv).XORKeyStream(ciphertext, state)
 
@@ -416,6 +422,7 @@ func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, er
 	mac.Write(authenticated)
 	mac.Sum(macBytes[:0])
 
+	utlserrors.LogDebug(context.Background(), "session ticket: encrypted successfully, size=", len(encrypted))
 	return encrypted, nil
 }
 
@@ -431,14 +438,16 @@ func (c *Config) encryptTicket(state []byte, ticketKeys []ticketKey) ([]byte, er
 // This indicates a cryptographically valid ticket with corrupt contents,
 // which may be a security concern.
 func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionState, error) {
+	utlserrors.LogDebug(context.Background(), "session: decrypting ticket, identitySize=", len(identity))
 	ticketKeys, err := c.ticketKeys(nil)
 	if err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to get ticket keys").Base(err).AtError()
 	}
 	stateBytes := c.decryptTicket(identity, ticketKeys)
 	if stateBytes == nil {
 		// Decryption failed (MAC mismatch, ticket too short, etc.)
 		// This is expected for old/forged tickets - return nil to ignore
+		utlserrors.LogDebug(context.Background(), "session: ticket decryption failed (MAC mismatch or invalid)")
 		return nil, nil
 	}
 	s, err := ParseSessionState(stateBytes)
@@ -447,13 +456,17 @@ func (c *Config) DecryptTicket(identity []byte, cs ConnectionState) (*SessionSta
 		// This is unexpected and may indicate data corruption, a bug in
 		// ticket generation, or a sophisticated attack. Return error so
 		// callers can log/monitor this condition.
-		return nil, fmt.Errorf("%w: %w", ErrTicketParsingFailed, err)
+		return nil, utlserrors.New("tls: session ticket parsing failed after successful decryption").Base(err).AtError()
 	}
+	utlserrors.LogDebug(context.Background(), "session: ticket decrypted successfully, version=", s.version)
 	return s, nil
 }
 
 func (c *Config) decryptTicket(encrypted []byte, ticketKeys []ticketKey) []byte {
+	utlserrors.LogDebug(context.Background(), "session ticket: decrypting, size=", len(encrypted))
+
 	if len(encrypted) < aes.BlockSize+sha256.Size {
+		utlserrors.LogDebug(context.Background(), "session ticket: too short, minSize=", aes.BlockSize+sha256.Size)
 		return nil
 	}
 
@@ -531,8 +544,10 @@ func (c *Config) decryptTicket(encrypted []byte, ticketKeys []ticketKey) []byte 
 	// Return nil if no key matched (foundMask == 0)
 	// Use constant-time check to avoid branch timing leak
 	if foundMask == 0 {
+		utlserrors.LogDebug(context.Background(), "session ticket: decryption failed, no key matched")
 		return nil
 	}
+	utlserrors.LogDebug(context.Background(), "session ticket: decrypted successfully, plaintextSize=", len(result))
 	return result
 }
 

@@ -1,10 +1,12 @@
 package memcontrol
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"os"
 	"sync/atomic"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // LogLevel represents logging verbosity.
@@ -26,6 +28,26 @@ type Logger struct {
 
 var globalLogger = &Logger{}
 
+// logLevelToSeverity converts memcontrol LogLevel to utlserrors Severity.
+// The values map directly: Error(1), Warning(2), Info(3), Debug(4).
+// LogLevelOff(0) maps to SeverityUnknown(0) which disables all logging.
+func logLevelToSeverity(level LogLevel) utlserrors.Severity {
+	switch level {
+	case LogLevelOff:
+		return utlserrors.SeverityUnknown
+	case LogLevelError:
+		return utlserrors.SeverityError
+	case LogLevelWarn:
+		return utlserrors.SeverityWarning
+	case LogLevelInfo:
+		return utlserrors.SeverityInfo
+	case LogLevelDebug:
+		return utlserrors.SeverityDebug
+	default:
+		return utlserrors.SeverityWarning
+	}
+}
+
 func init() {
 	// Default to warnings only, can be overridden by env or SetLogLevel
 	level := LogLevelWarn
@@ -35,11 +57,19 @@ func init() {
 		level = LogLevelOff
 	}
 	globalLogger.level.Store(int32(level))
+
+	// Sync with utlserrors package for delegated logging
+	utlserrors.SetLogLevel(logLevelToSeverity(level))
 }
 
 // SetLogLevel sets the global logging level.
+// When no custom handler is set, also syncs with utlserrors package.
 func SetLogLevel(level LogLevel) {
 	globalLogger.level.Store(int32(level))
+	// Sync with utlserrors when using delegated logging (no custom handler)
+	if globalLogger.handler.Load() == nil {
+		utlserrors.SetLogLevel(logLevelToSeverity(level))
+	}
 }
 
 // GetLogLevel returns the current logging level.
@@ -47,7 +77,7 @@ func GetLogLevel() LogLevel {
 	return LogLevel(globalLogger.level.Load())
 }
 
-// SetLogHandler sets a custom log handler. If nil, uses default log.Printf.
+// SetLogHandler sets a custom log handler. If nil, delegates to utlserrors package.
 // The handler receives the log level and formatted message.
 //
 // Example with zerolog:
@@ -67,6 +97,8 @@ func GetLogLevel() LogLevel {
 func SetLogHandler(handler func(level LogLevel, msg string)) {
 	if handler == nil {
 		globalLogger.handler.Store(nil)
+		// Sync log level with utlserrors when switching back to delegated logging
+		utlserrors.SetLogLevel(logLevelToSeverity(GetLogLevel()))
 		return
 	}
 	globalLogger.handler.Store(&handler)
@@ -91,19 +123,19 @@ func logf(level LogLevel, format string, args ...any) {
 		return
 	}
 
-	// Default to standard log with level prefix
-	var prefix string
+	// Delegate to utlserrors package with [memcontrol] prefix
+	ctx := context.Background()
+	prefixedMsg := "[memcontrol] " + msg
 	switch level {
 	case LogLevelError:
-		prefix = "[ERROR]"
+		utlserrors.LogError(ctx, prefixedMsg)
 	case LogLevelWarn:
-		prefix = "[WARN]"
+		utlserrors.LogWarning(ctx, prefixedMsg)
 	case LogLevelInfo:
-		prefix = "[INFO]"
+		utlserrors.LogInfo(ctx, prefixedMsg)
 	case LogLevelDebug:
-		prefix = "[DEBUG]"
+		utlserrors.LogDebug(ctx, prefixedMsg)
 	}
-	log.Printf("%s [memcontrol] %s", prefix, msg)
 }
 
 // sprintf formats a string (logging is not performance critical)

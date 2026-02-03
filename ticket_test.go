@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -288,7 +289,9 @@ func TestTicketTooShort(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			shortTicket := make([]byte, tc.length)
-			rand.Read(shortTicket)
+			if _, err := rand.Read(shortTicket); err != nil {
+				t.Fatalf("rand.Read failed: %v", err)
+			}
 
 			decrypted, err := config.DecryptTicket(shortTicket, ConnectionState{})
 			if err != nil {
@@ -313,7 +316,9 @@ func TestTicketMinimumValidLength(t *testing.T) {
 	// This would represent zero-length plaintext
 	minLength := aes.BlockSize + sha256.Size
 	ticket := make([]byte, minLength)
-	rand.Read(ticket)
+	if _, err := rand.Read(ticket); err != nil {
+		t.Fatalf("rand.Read failed: %v", err)
+	}
 
 	// This should not panic, but will likely fail MAC
 	decrypted, err := config.DecryptTicket(ticket, ConnectionState{})
@@ -775,12 +780,12 @@ func TestTicketDecryptionError(t *testing.T) {
 				t.Fatalf("encryptTicket failed: %v", err)
 			}
 
-			// DecryptTicket should return ErrTicketParsingFailed
+			// DecryptTicket should return an error containing the parsing failed message
 			result, err := config.DecryptTicket(encryptedTicket, ConnectionState{})
 			if err == nil {
 				t.Error("DecryptTicket should return error for invalid session state")
-			} else if !errors.Is(err, ErrTicketParsingFailed) {
-				t.Errorf("DecryptTicket should return ErrTicketParsingFailed, got: %v", err)
+			} else if !strings.Contains(err.Error(), "session ticket parsing failed") {
+				t.Errorf("DecryptTicket should return error about parsing failure, got: %v", err)
 			}
 			if result != nil {
 				t.Error("DecryptTicket should return nil session state for parsing failure")
@@ -975,10 +980,10 @@ func TestSetSessionTicketKeysEmptyError(t *testing.T) {
 		t.Fatal("SetSessionTicketKeys should return error for empty keys")
 	}
 
-	// Verify the error message
-	expectedMsg := "tls: keys must have at least one key"
-	if err.Error() != expectedMsg {
-		t.Errorf("expected error message %q, got %q", expectedMsg, err.Error())
+	// Verify the error message contains the expected text
+	expectedSubstr := "tls: keys must have at least one key"
+	if !strings.Contains(err.Error(), expectedSubstr) {
+		t.Errorf("expected error message to contain %q, got %q", expectedSubstr, err.Error())
 	}
 
 	// nil slice should also return an error

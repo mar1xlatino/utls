@@ -13,7 +13,7 @@ import (
 	"crypto/mlkem"
 	"crypto/rsa"
 	"crypto/subtle"
-	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"slices"
@@ -22,6 +22,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/byteorder"
 	"github.com/refraction-networking/utls/internal/fips140tls"
 	"github.com/refraction-networking/utls/internal/hkdf"
@@ -69,6 +70,10 @@ type serverHandshakeStateTLS13 struct {
 func (hs *serverHandshakeStateTLS13) handshake() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 handshake starting")
+	}
+
 	// For an overview of the TLS 1.3 handshake, see RFC 8446, Section 2.
 	if err := hs.processClientHello(); err != nil {
 		return err
@@ -104,11 +109,19 @@ func (hs *serverHandshakeStateTLS13) handshake() error {
 
 	c.isHandshakeComplete.Store(true)
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 handshake completed successfully")
+	}
+
 	return nil
 }
 
 func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	c := hs.c
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 processing ClientHello, SNI:", hs.clientHello.serverName)
+	}
 
 	hs.hello = new(serverHelloMsg)
 
@@ -119,7 +132,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 
 	if len(hs.clientHello.supportedVersions) == 0 {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: client used the legacy version field to negotiate TLS 1.3")
+		return utlserrors.New("tls: client used the legacy version field to negotiate TLS 1.3").AtError()
 	}
 
 	// Abort if the client is doing a fallback and landing lower than what we
@@ -137,7 +150,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 			// could defeat this by adding an arbitrary high version otherwise.
 			if c.vers < c.config.maxSupportedVersion(roleServer) {
 				c.sendAlert(alertInappropriateFallback)
-				return errors.New("tls: client using inappropriate protocol fallback")
+				return utlserrors.New("tls: client using inappropriate protocol fallback").AtError()
 			}
 			break
 		}
@@ -146,7 +159,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	if len(hs.clientHello.compressionMethods) != 1 ||
 		hs.clientHello.compressionMethods[0] != compressionNone {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: TLS 1.3 client supports illegal compression methods")
+		return utlserrors.New("tls: TLS 1.3 client supports illegal compression methods").AtError()
 	}
 
 	hs.hello.random = make([]byte, 32)
@@ -162,21 +175,21 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		c.sendAlert(alertHandshakeFailure)
 		if c.handshakes > 0 {
 			// Client is attempting renegotiation, which is not allowed in TLS 1.3
-			return errors.New("tls: renegotiation not supported in TLS 1.3")
+			return utlserrors.New("tls: renegotiation not supported in TLS 1.3").AtError()
 		}
-		return errors.New("tls: initial handshake had non-empty renegotiation extension")
+		return utlserrors.New("tls: initial handshake had non-empty renegotiation extension").AtError()
 	}
 
 	if hs.clientHello.earlyData && c.quic != nil {
 		if len(hs.clientHello.pskIdentities) == 0 {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: early_data without pre_shared_key")
+			return utlserrors.New("tls: early_data without pre_shared_key").AtError()
 		}
 	} else if hs.clientHello.earlyData && c.config.ServerMaxEarlyData > 0 {
 		// [uTLS] Non-QUIC 0-RTT support: allow early_data when ServerMaxEarlyData is configured
 		if len(hs.clientHello.pskIdentities) == 0 {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: early_data without pre_shared_key")
+			return utlserrors.New("tls: early_data without pre_shared_key").AtError()
 		}
 	} else if hs.clientHello.earlyData {
 		// See RFC 8446, Section 4.2.10 for the complicated behavior required
@@ -186,7 +199,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		// replace a server or join a pool. That's the same requirement that
 		// applies to mixing or replacing with any TLS 1.2 server.
 		c.sendAlert(alertUnsupportedExtension)
-		return errors.New("tls: client sent unexpected early data")
+		return utlserrors.New("tls: client sent unexpected early data").AtError()
 	}
 
 	// RFC 9001 Section 8.4: A client MUST NOT request the use of the TLS 1.3
@@ -194,7 +207,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	// with a non-empty legacy_session_id field as a connection error.
 	if c.quic != nil && len(hs.clientHello.sessionId) > 0 {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: QUIC client sent non-empty legacy_session_id")
+		return utlserrors.New("tls: QUIC client sent non-empty legacy_session_id").AtError()
 	}
 
 	hs.hello.sessionId = hs.clientHello.sessionId
@@ -215,11 +228,15 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	}
 	if hs.suite == nil {
 		c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: no cipher suite supported by both client and server")
+		return utlserrors.New("tls: no cipher suite supported by both client and server").AtError()
 	}
 	c.cipherSuite = hs.suite.id
 	hs.hello.cipherSuite = hs.suite.id
 	hs.transcript = hs.suite.hash.New()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 selected cipher suite", fmt.Sprintf("0x%04x", hs.suite.id))
+	}
 
 	// First, if a post-quantum key exchange is available, use one. See
 	// draft-ietf-tls-key-share-prediction-01, Section 4 for why this must be
@@ -235,7 +252,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	})
 	if len(preferredGroups) == 0 {
 		c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: no key exchanges supported by both client and server")
+		return utlserrors.New("tls: no key exchanges supported by both client and server").AtError()
 	}
 	hasKeyShare := func(group CurveID) bool {
 		for _, ks := range hs.clientHello.keyShares {
@@ -275,7 +292,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		ecdhGroup = X25519
 		if len(ecdhData) != mlkem.EncapsulationKeySize768+x25519PublicKeySize {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid X25519MLKEM768 client key share")
+			return utlserrors.New("tls: invalid X25519MLKEM768 client key share").AtError()
 		}
 		ecdhData = ecdhData[mlkem.EncapsulationKeySize768:]
 	}
@@ -284,7 +301,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		ecdhGroup = CurveP256
 		if len(ecdhData) != p256PublicKeySize+mlkem.EncapsulationKeySize768 {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid SecP256r1MLKEM768 client key share")
+			return utlserrors.New("tls: invalid SecP256r1MLKEM768 client key share").AtError()
 		}
 		ecdhData = ecdhData[:p256PublicKeySize]
 	}
@@ -293,7 +310,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		ecdhGroup = CurveP384
 		if len(ecdhData) != p384PublicKeySize+mlkem1024EncapsulationKeySize {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid SecP384r1MLKEM1024 client key share")
+			return utlserrors.New("tls: invalid SecP384r1MLKEM1024 client key share").AtError()
 		}
 		ecdhData = ecdhData[:p384PublicKeySize]
 	}
@@ -302,7 +319,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		// was incorrect or inconsistent with other fields. This applies when
 		// the negotiated curve cannot be used.
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: CurvePreferences includes unsupported curve")
+		return utlserrors.New("tls: CurvePreferences includes unsupported curve").AtError()
 	}
 	key, err := generateECDHEKey(c.config.rand(), ecdhGroup)
 	if err != nil {
@@ -313,18 +330,18 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	peerKey, err := key.Curve().NewPublicKey(ecdhData)
 	if err != nil {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: invalid client key share")
+		return utlserrors.New("tls: invalid client key share").AtError()
 	}
 	hs.sharedKey, err = key.ECDH(peerKey)
 	if err != nil {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: invalid client key share")
+		return utlserrors.New("tls: invalid client key share").AtError()
 	}
 	if selectedGroup == X25519MLKEM768 {
 		k, err := mlkem.NewEncapsulationKey768(clientKeyShare.data[:mlkem.EncapsulationKeySize768])
 		if err != nil {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid X25519MLKEM768 client key share")
+			return utlserrors.New("tls: invalid X25519MLKEM768 client key share").AtError()
 		}
 		mlkemSharedSecret, ciphertext := k.Encapsulate()
 		// draft-ietf-tls-ecdhe-mlkem-03, Section 3.1.3: "For
@@ -344,7 +361,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		k, err := mlkem.NewEncapsulationKey768(clientKeyShare.data[p256PublicKeySize:])
 		if err != nil {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid SecP256r1MLKEM768 client key share")
+			return utlserrors.New("tls: invalid SecP256r1MLKEM768 client key share").AtError()
 		}
 		mlkemSharedSecret, ciphertext := k.Encapsulate()
 		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.3: "For SecP256r1MLKEM768,
@@ -361,7 +378,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		k, err := mlkem.NewEncapsulationKey1024(clientKeyShare.data[p384PublicKeySize:])
 		if err != nil {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: invalid SecP384r1MLKEM1024 client key share")
+			return utlserrors.New("tls: invalid SecP384r1MLKEM1024 client key share").AtError()
 		}
 		mlkemSharedSecret, ciphertext := k.Encapsulate()
 		// draft-ietf-tls-ecdhe-mlkem-03, Section 4.3: "For SecP384r1MLKEM1024,
@@ -387,19 +404,19 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		for _, v := range hs.clientHello.supportedVersions {
 			if v < VersionTLS13 {
 				c.sendAlert(alertProtocolVersion)
-				return errors.New("tls: client offered TLS version older than TLS 1.3")
+				return utlserrors.New("tls: client offered TLS version older than TLS 1.3").AtError()
 			}
 		}
 		// RFC 9001 Section 8.2.
 		if hs.clientHello.quicTransportParameters == nil {
 			c.sendAlert(alertMissingExtension)
-			return errors.New("tls: client did not send a quic_transport_parameters extension")
+			return utlserrors.New("tls: client did not send a quic_transport_parameters extension").AtError()
 		}
 		c.quicSetTransportParameters(hs.clientHello.quicTransportParameters)
 	} else {
 		if hs.clientHello.quicTransportParameters != nil {
 			c.sendAlert(alertUnsupportedExtension)
-			return errors.New("tls: client sent an unexpected quic_transport_parameters extension")
+			return utlserrors.New("tls: client sent an unexpected quic_transport_parameters extension").AtError()
 		}
 	}
 
@@ -410,7 +427,14 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 checking for session resumption")
+	}
+
 	if c.config.SessionTicketsDisabled {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 session tickets disabled")
+		}
 		return nil
 	}
 
@@ -427,7 +451,7 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 
 	if len(hs.clientHello.pskIdentities) != len(hs.clientHello.pskBinders) {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: invalid or missing PSK binders")
+		return utlserrors.New("tls: invalid or missing PSK binders").AtError()
 	}
 	if len(hs.clientHello.pskIdentities) == 0 {
 		return nil
@@ -555,7 +579,7 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 		transcript := cloneHash(hs.transcript, hs.suite.hash)
 		if transcript == nil {
 			c.sendAlert(alertInternalError)
-			return errors.New("tls: internal error: failed to clone hash")
+			return utlserrors.New("tls: internal error: failed to clone hash").AtError()
 		}
 		clientHelloBytes, err := hs.clientHello.marshalWithoutBinders()
 		if err != nil {
@@ -620,7 +644,7 @@ func (hs *serverHandshakeStateTLS13) checkForResumption() error {
 	if hasValidWithBadBinder && selectedIndex == -1 {
 		// All valid sessions had bad binders - this is an attack
 		c.sendAlert(alertDecryptError)
-		return errors.New("tls: invalid PSK binder")
+		return utlserrors.New("tls: invalid PSK binder").AtError()
 	}
 
 	// No valid PSK found - this is not an error, just no resumption
@@ -718,7 +742,14 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 
 	// Only one of PSK and certificates are used at a time.
 	if hs.usingPSK {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 using PSK, skipping certificate selection")
+		}
 		return nil
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 selecting certificate")
 	}
 
 	// signature_algorithms is required in TLS 1.3. See RFC 8446, Section 4.2.3.
@@ -788,6 +819,10 @@ func (hs *serverHandshakeStateTLS13) doHelloRetryRequest(selectedGroup CurveID) 
 		// Compute the acceptance message.
 		helloRetryRequest.encryptedClientHello = make([]byte, 8)
 		confTranscript := cloneHash(hs.transcript, hs.suite.hash)
+		if confTranscript == nil {
+			c.sendAlert(alertInternalError)
+			return nil, utlserrors.New("tls: internal error: failed to clone transcript hash for ECH").AtError()
+		}
 		if err := transcriptMsg(helloRetryRequest, confTranscript); err != nil {
 			return nil, err
 		}
@@ -830,36 +865,36 @@ func (hs *serverHandshakeStateTLS13) doHelloRetryRequest(selectedGroup CurveID) 
 	if hs.echContext != nil {
 		if len(clientHello.encryptedClientHello) == 0 {
 			c.sendAlert(alertMissingExtension)
-			return nil, errors.New("tls: second client hello missing encrypted client hello extension")
+			return nil, utlserrors.New("tls: second client hello missing encrypted client hello extension").AtError()
 		}
 
 		echType, echCiphersuite, configID, encap, payload, err := parseECHExt(clientHello.encryptedClientHello)
 		if err != nil {
 			c.sendAlert(alertDecodeError)
-			return nil, errors.New("tls: client sent invalid encrypted client hello extension")
+			return nil, utlserrors.New("tls: client sent invalid encrypted client hello extension").AtError()
 		}
 
 		if echType == outerECHExt && hs.echContext.inner || echType == innerECHExt && !hs.echContext.inner {
 			c.sendAlert(alertDecodeError)
-			return nil, errors.New("tls: unexpected switch in encrypted client hello extension type")
+			return nil, utlserrors.New("tls: unexpected switch in encrypted client hello extension type").AtError()
 		}
 
 		if echType == outerECHExt {
 			if echCiphersuite != hs.echContext.ciphersuite || configID != hs.echContext.configID || len(encap) != 0 {
 				c.sendAlert(alertIllegalParameter)
-				return nil, errors.New("tls: second client hello encrypted client hello extension does not match")
+				return nil, utlserrors.New("tls: second client hello encrypted client hello extension does not match").AtError()
 			}
 
 			encodedInner, err := decryptECHPayload(hs.echContext.hpkeContext, clientHello.original, payload)
 			if err != nil {
 				c.sendAlert(alertDecryptError)
-				return nil, errors.New("tls: failed to decrypt second client hello encrypted client hello extension payload")
+				return nil, utlserrors.New("tls: failed to decrypt second client hello encrypted client hello extension payload").AtError()
 			}
 
 			echInner, err := decodeInnerClientHello(clientHello, encodedInner)
 			if err != nil {
 				c.sendAlert(alertIllegalParameter)
-				return nil, errors.New("tls: client sent invalid encrypted client hello extension")
+				return nil, utlserrors.New("tls: client sent invalid encrypted client hello extension").AtError()
 			}
 
 			clientHello = echInner
@@ -868,23 +903,23 @@ func (hs *serverHandshakeStateTLS13) doHelloRetryRequest(selectedGroup CurveID) 
 
 	if len(clientHello.keyShares) != 1 {
 		c.sendAlert(alertIllegalParameter)
-		return nil, errors.New("tls: client didn't send one key share in second ClientHello")
+		return nil, utlserrors.New("tls: client didn't send one key share in second ClientHello").AtError()
 	}
 	ks := &clientHello.keyShares[0]
 
 	if ks.group != selectedGroup {
 		c.sendAlert(alertIllegalParameter)
-		return nil, errors.New("tls: client sent unexpected key share in second ClientHello")
+		return nil, utlserrors.New("tls: client sent unexpected key share in second ClientHello").AtError()
 	}
 
 	if clientHello.earlyData {
 		c.sendAlert(alertIllegalParameter)
-		return nil, errors.New("tls: client indicated early data in second ClientHello")
+		return nil, utlserrors.New("tls: client indicated early data in second ClientHello").AtError()
 	}
 
 	if illegalClientHelloChange(clientHello, hs.clientHello) {
 		c.sendAlert(alertIllegalParameter)
-		return nil, errors.New("tls: client illegally modified second ClientHello")
+		return nil, utlserrors.New("tls: client illegally modified second ClientHello").AtError()
 	}
 
 	c.didHRR = true
@@ -955,9 +990,17 @@ func illegalClientHelloChange(ch, ch1 *clientHelloMsg) bool {
 func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 sending server parameters")
+	}
+
 	if hs.echContext != nil {
 		copy(hs.hello.random[32-8:], make([]byte, 8))
 		echTranscript := cloneHash(hs.transcript, hs.suite.hash)
+		if echTranscript == nil {
+			c.sendAlert(alertInternalError)
+			return utlserrors.New("tls: internal error: failed to clone transcript hash for ECH confirmation").AtError()
+		}
 		echTranscript.Write(hs.clientHello.original)
 		if err := transcriptMsg(hs.hello, echTranscript); err != nil {
 			return err
@@ -1100,6 +1143,10 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		return nil
 	}
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 sending server certificate")
+	}
+
 	if hs.requestClientCert() {
 		// Request a client certificate
 		certReq := new(certificateRequestMsgTLS13)
@@ -1107,6 +1154,10 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		certReq.scts = true
 		certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms()
 		if c.config.ClientCAs != nil {
+			// Note: Subjects() is deprecated for system cert pools because it
+			// won't include system roots. However, ClientCAs is user-configured
+			// and not the system pool, so this usage is correct and safe.
+			//lint:ignore SA1019 ClientCAs is user-configured, not a system cert pool
 			certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
 		}
 
@@ -1160,7 +1211,7 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 	signer, ok := hs.cert.PrivateKey.(crypto.Signer)
 	if !ok {
 		c.sendAlert(alertInternalError)
-		return errors.New("tls: server certificate private key does not implement crypto.Signer")
+		return utlserrors.New("tls: server certificate private key does not implement crypto.Signer").AtError()
 	}
 	sig, err := signer.Sign(c.config.rand(), signed, signOpts)
 	if err != nil {
@@ -1171,7 +1222,7 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		} else {
 			c.sendAlert(alertInternalError)
 		}
-		return errors.New("tls: failed to sign handshake: " + err.Error())
+		return utlserrors.New("tls: failed to sign handshake").Base(err).AtError()
 	}
 	certVerifyMsg.signature = sig
 
@@ -1184,6 +1235,10 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 
 func (hs *serverHandshakeStateTLS13) sendServerFinished() error {
 	c := hs.c
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 sending server Finished")
+	}
 
 	verifyData, err := hs.suite.finishedHash(c.out.trafficSecret, hs.transcript)
 	if err != nil {
@@ -1304,7 +1359,7 @@ func (hs *serverHandshakeStateTLS13) sendSessionTickets() error {
 func (c *Conn) sendSessionTicket(earlyData bool, extra [][]byte) error {
 	suite := cipherSuiteTLS13ByID(c.cipherSuite)
 	if suite == nil {
-		return errors.New("tls: internal error: unknown cipher suite")
+		return utlserrors.New("tls: internal error: unknown cipher suite").AtError()
 	}
 	// ticket_nonce, which must be unique per connection, is always left at
 	// zero because we only ever send one ticket per connection.
@@ -1370,6 +1425,10 @@ func (c *Conn) sendSessionTicket(earlyData bool, extra [][]byte) error {
 func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 reading client certificate")
+	}
+
 	if !hs.requestClientCert() {
 		// Make sure the connection is still being verified whether or not
 		// the server requested a client certificate.
@@ -1425,7 +1484,7 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 		// See RFC 8446, Section 4.4.3.
 		if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms()) {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: client certificate used with invalid signature algorithm")
+			return utlserrors.New("tls: client certificate used with invalid signature algorithm").AtError()
 		}
 		sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerify.signatureAlgorithm)
 		if err != nil {
@@ -1433,13 +1492,13 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 		}
 		if sigType == signaturePKCS1v15 || sigHash == crypto.SHA1 {
 			c.sendAlert(alertIllegalParameter)
-			return errors.New("tls: client certificate used with invalid signature algorithm")
+			return utlserrors.New("tls: client certificate used with invalid signature algorithm").AtError()
 		}
 		signed := signedMessage(sigHash, clientSignatureContext, hs.transcript)
 		if err := verifyHandshakeSignature(sigType, c.peerCertificates[0].PublicKey,
 			sigHash, signed, certVerify.signature); err != nil {
 			c.sendAlert(alertDecryptError)
-			return errors.New("tls: invalid signature by the client certificate: " + err.Error())
+			return utlserrors.New("tls: invalid signature by the client certificate").Base(err).AtError()
 		}
 
 		if err := transcriptMsg(certVerify, hs.transcript); err != nil {
@@ -1459,6 +1518,10 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
 func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.3 reading client Finished")
+	}
+
 	// finishedMsg is not included in the transcript.
 	msg, err := c.readHandshake(nil)
 	if err != nil {
@@ -1473,7 +1536,7 @@ func (hs *serverHandshakeStateTLS13) readClientFinished() error {
 
 	if !hmac.Equal(hs.clientFinished, finished.verifyData) {
 		c.sendAlert(alertDecryptError)
-		return errors.New("tls: invalid client finished hash")
+		return utlserrors.New("tls: invalid client finished hash").AtError()
 	}
 
 	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)
@@ -1517,7 +1580,7 @@ func (hs *serverHandshakeStateTLS13) compressCertificate(certMsg *certificateMsg
 	}
 	// Skip the 4-byte header (message type + uint24 length)
 	if len(certBytes) < 4 {
-		return nil, errors.New("tls: certificate message too short")
+		return nil, utlserrors.New("tls: certificate message too short").AtError()
 	}
 	uncompressedPayload := certBytes[4:]
 
@@ -1531,7 +1594,7 @@ func (hs *serverHandshakeStateTLS13) compressCertificate(certMsg *certificateMsg
 	case CertCompressionZstd:
 		compressedPayload = compressZstd(uncompressedPayload)
 	default:
-		return nil, errors.New("tls: unsupported compression algorithm")
+		return nil, utlserrors.New("tls: unsupported compression algorithm").AtError()
 	}
 
 	// RFC 8879 Section 4.2.1: If the length of the resulting compressed data

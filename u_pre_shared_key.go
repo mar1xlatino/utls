@@ -1,15 +1,15 @@
 package tls
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/cryptobyte"
 )
 
-var ErrEmptyPsk = errors.New("tls: empty psk detected; remove the psk extension for this connection or set OmitEmptyPsk to true to conceal it")
+var ErrEmptyPsk = utlserrors.New("tls: empty psk detected; remove the psk extension for this connection or set OmitEmptyPsk to true to conceal it").AtError()
 
 type PreSharedKeyCommon struct {
 	Identities  []PskIdentity
@@ -113,7 +113,7 @@ type UnimplementedPreSharedKeyExtension struct{}
 func (UnimplementedPreSharedKeyExtension) mustEmbedUnimplementedPreSharedKeyExtension() {}
 
 // ErrUnimplementedPreSharedKeyExtension is returned when an unimplemented PreSharedKeyExtension method is called.
-var ErrUnimplementedPreSharedKeyExtension = errors.New("tls: PreSharedKeyExtension method is not implemented; you must embed UnimplementedPreSharedKeyExtension and override all methods")
+var ErrUnimplementedPreSharedKeyExtension = utlserrors.New("tls: PreSharedKeyExtension method is not implemented; you must embed UnimplementedPreSharedKeyExtension and override all methods").AtError()
 
 func (*UnimplementedPreSharedKeyExtension) IsInitialized() bool {
 	// Returns false as default; callers should override this method
@@ -184,6 +184,11 @@ func (e *UtlsPreSharedKeyExtension) InitializeByUtls(session *SessionState, earl
 	e.cipherSuite = cipherSuiteTLS13ByID(e.Session.cipherSuite)
 	e.Identities = identities
 	e.Binders = make([][]byte, 0, len(e.Identities))
+	// Guard against nil cipherSuite from unknown cipher suite ID.
+	// This should not happen in normal use, but prevents nil pointer panic.
+	if e.cipherSuite == nil {
+		return
+	}
 	for i := 0; i < len(e.Identities); i++ {
 		e.Binders = append(e.Binders, make([]byte, e.cipherSuite.hash.Size()))
 	}
@@ -315,20 +320,21 @@ func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 	}
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
-		return 0, errors.New("tls: pre_shared_key binder count must match identity count")
+		return 0, utlserrors.New("tls: pre_shared_key binder count must match identity count").AtError()
 	}
 	// RFC 8446 Section 4.2.11: opaque identity<1..2^16-1>
 	for i, identity := range e.Identities {
 		if len(identity.Label) == 0 {
-			return 0, fmt.Errorf("tls: pre_shared_key identity %d has empty label", i)
+			return 0, utlserrors.New("tls: pre_shared_key identity ", i, " has empty label").AtError()
 		}
 	}
 	// RFC 8446 Section 4.2.11: PskBinderEntry<32..255>
 	for i, binder := range e.Binders {
 		if len(binder) < 32 || len(binder) > 255 {
-			return 0, fmt.Errorf("tls: pre_shared_key binder %d size %d out of range [32,255]", i, len(binder))
+			return 0, utlserrors.New("tls: pre_shared_key binder ", i, " size ", len(binder), " out of range [32,255]").AtError()
 		}
 	}
+	utlserrors.LogDebug(context.Background(), "PSK: reading extension, identities=", len(e.Identities))
 	return readPskIntoBytes(b, e.Identities, e.Binders)
 }
 
@@ -341,7 +347,7 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 		private = hello.getPrivatePtr()
 	}
 	if private == nil {
-		return errors.New("tls: cannot get private client hello pointer for PSK binder computation")
+		return utlserrors.New("tls: cannot get private client hello pointer for PSK binder computation").AtError()
 	}
 	private.original = hello.Raw
 	private.pskBinders = e.Binders // set the placeholder to the private Hello
@@ -350,6 +356,7 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 	// During HRR, binders must be calculated with a special transcript that includes
 	// MessageHash(CH1) + HRR, which is done by the standard library code.
 	if e.hrrBindersPrecomputed {
+		utlserrors.LogDebug(context.Background(), "PSK: using pre-computed HRR binders")
 		// Use the pre-computed binders - just update the raw bytes
 		helloBytes, err := private.marshalWithoutBinders()
 		if err != nil {
@@ -368,7 +375,7 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 			}
 		})
 		if out, err := b.Bytes(); err != nil || len(out) != len(private.original) {
-			return errors.New("tls: internal error: failed to update binders")
+			return utlserrors.New("tls: internal error: failed to update HRR binders").AtError()
 		}
 		// Reset the flag after use
 		e.hrrBindersPrecomputed = false
@@ -411,11 +418,12 @@ func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) er
 		}
 	})
 	if out, err := b.Bytes(); err != nil || len(out) != len(private.original) {
-		return errors.New("tls: internal error: failed to update binders")
+		return utlserrors.New("tls: internal error: failed to update binders").AtError()
 	}
 
 	//--- mirror loadSession() end ---//
 	e.Binders = pskBinders
+	utlserrors.LogDebug(context.Background(), "PSK: binder computed and patched")
 
 	// no need to care about other PSK related fields, they will be handled separately
 
@@ -489,16 +497,16 @@ func (e *FakePreSharedKeyExtension) Read(b []byte) (int, error) {
 	}
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
-		return 0, errors.New("tls: FakePreSharedKeyExtension.Read failed: binder count must match identity count")
+		return 0, utlserrors.New("tls: FakePreSharedKeyExtension.Read failed: binder count must match identity count").AtError()
 	}
 	for _, b := range e.Binders {
 		if !(anyTrue(validHashLen, func(_ int, valid *int) bool {
 			return len(b) == *valid
 		})) {
-			return 0, errors.New("tls: FakePreSharedKeyExtension.Read failed: invalid binder size")
+			return 0, utlserrors.New("tls: FakePreSharedKeyExtension.Read failed: invalid binder size").AtError()
 		}
 	}
-
+	utlserrors.LogDebug(context.Background(), "PSK (fake): reading extension, identities=", len(e.Identities))
 	return readPskIntoBytes(b, e.Identities, e.Binders)
 }
 
@@ -523,39 +531,39 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 	var identitiesLength uint16
 	if !s.ReadUint16(&identitiesLength) {
-		return 0, errors.New("tls: invalid PSK extension")
+		return 0, utlserrors.New("tls: invalid PSK extension: cannot read identities length").AtError()
 	}
 
 	// identities
 	for identitiesLength > 0 {
 		// Check bounds BEFORE subtraction to prevent integer underflow
 		if identitiesLength < 2 {
-			return 0, errors.New("tls: invalid PSK extension: truncated identity length")
+			return 0, utlserrors.New("tls: invalid PSK extension: truncated identity length").AtError()
 		}
 		var identityLength uint16
 		if !s.ReadUint16(&identityLength) {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, utlserrors.New("tls: invalid PSK extension: cannot read identity length").AtError()
 		}
 		identitiesLength -= 2
 
 		if identityLength > identitiesLength {
-			return 0, errors.New("tls: invalid PSK extension: identity length exceeds remaining data")
+			return 0, utlserrors.New("tls: invalid PSK extension: identity length exceeds remaining data").AtError()
 		}
 
 		var identity []byte
 		if !s.ReadBytes(&identity, int(identityLength)) {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, utlserrors.New("tls: invalid PSK extension: cannot read identity").AtError()
 		}
 
 		identitiesLength -= identityLength // identity
 
 		// Check bounds BEFORE subtraction to prevent integer underflow
 		if identitiesLength < 4 {
-			return 0, errors.New("tls: invalid PSK extension: truncated obfuscated ticket age")
+			return 0, utlserrors.New("tls: invalid PSK extension: truncated obfuscated ticket age").AtError()
 		}
 		var obfuscatedTicketAge uint32
 		if !s.ReadUint32(&obfuscatedTicketAge) {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, utlserrors.New("tls: invalid PSK extension: cannot read obfuscated ticket age").AtError()
 		}
 
 		e.Identities = append(e.Identities, PskIdentity{
@@ -568,28 +576,28 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 	var bindersLength uint16
 	if !s.ReadUint16(&bindersLength) {
-		return 0, errors.New("tls: invalid PSK extension")
+		return 0, utlserrors.New("tls: invalid PSK extension: cannot read binders length").AtError()
 	}
 
 	// binders
 	for bindersLength > 0 {
 		// Check bounds BEFORE subtraction to prevent integer underflow
 		if bindersLength < 1 {
-			return 0, errors.New("tls: invalid PSK extension: truncated binder length")
+			return 0, utlserrors.New("tls: invalid PSK extension: truncated binder length").AtError()
 		}
 		var binderLength uint8
 		if !s.ReadUint8(&binderLength) {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, utlserrors.New("tls: invalid PSK extension: cannot read binder length").AtError()
 		}
 		bindersLength -= 1
 
 		if uint16(binderLength) > bindersLength {
-			return 0, errors.New("tls: invalid PSK extension: binder length exceeds remaining data")
+			return 0, utlserrors.New("tls: invalid PSK extension: binder length exceeds remaining data").AtError()
 		}
 
 		var binder []byte
 		if !s.ReadBytes(&binder, int(binderLength)) {
-			return 0, errors.New("tls: invalid PSK extension")
+			return 0, utlserrors.New("tls: invalid PSK extension: cannot read binder").AtError()
 		}
 
 		e.Binders = append(e.Binders, binder)
@@ -599,14 +607,15 @@ func (e *FakePreSharedKeyExtension) Write(b []byte) (n int, err error) {
 
 	// RFC 8446: number of binders must match number of identities
 	if len(e.Identities) != len(e.Binders) {
-		return 0, errors.New("tls: invalid PSK extension: binder count must match identity count")
+		return 0, utlserrors.New("tls: invalid PSK extension: binder count must match identity count").AtError()
 	}
 
 	// Reject trailing data
 	if !s.Empty() {
-		return 0, errors.New("tls: invalid PSK extension: trailing data")
+		return 0, utlserrors.New("tls: invalid PSK extension: trailing data").AtError()
 	}
 
+	utlserrors.LogDebug(context.Background(), "PSK (fake): parsed extension, identities=", len(e.Identities))
 	return fullLen, nil
 }
 
@@ -617,12 +626,12 @@ func (e *FakePreSharedKeyExtension) UnmarshalJSON(data []byte) error {
 	}
 
 	if err := json.Unmarshal(data, &pskAccepter); err != nil {
-		return err
+		return utlserrors.New("tls: failed to unmarshal PSK JSON").Base(err).AtError()
 	}
 
 	// RFC 8446: number of binders must match number of identities
 	if len(pskAccepter.PskIdentities) != len(pskAccepter.PskBinders) {
-		return errors.New("tls: invalid PSK JSON: binder count must match identity count")
+		return utlserrors.New("tls: invalid PSK JSON: binder count must match identity count").AtError()
 	}
 
 	e.Identities = pskAccepter.PskIdentities

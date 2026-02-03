@@ -2,17 +2,18 @@ package boring
 
 import (
 	"crypto/cipher"
-	"errors"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 const Enabled bool = false
 
 func NewGCMTLS(_ cipher.Block) (cipher.AEAD, error) {
-	return nil, errors.New("boring not implemented")
+	return nil, utlserrors.New("tls: boring not implemented").AtError()
 }
 
 func NewGCMTLS13(_ cipher.Block) (cipher.AEAD, error) {
-	return nil, errors.New("boring not implemented")
+	return nil, utlserrors.New("tls: boring not implemented").AtError()
 }
 
 func Unreachable() {

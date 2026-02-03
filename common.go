@@ -16,7 +16,6 @@ import (
 	"crypto/rsa"
 	"crypto/sha512"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,6 +25,7 @@ import (
 	"time"
 	_ "unsafe" // for linkname
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/fips140tls"
 )
 
@@ -728,6 +728,19 @@ type Config struct {
 	// This field is ignored when InsecureSkipVerify is true.
 	InsecureSkipTimeVerify bool // [uTLS]
 
+	// InsecureMaxExpiredAge is the maximum time a certificate can be expired
+	// when InsecureSkipTimeVerify is true. This prevents accepting certificates
+	// that expired years ago, which could indicate a stolen or compromised certificate.
+	//
+	// Default value (0) means 30 days maximum expired age.
+	// Set to a positive duration to specify a custom maximum age.
+	// Set to a negative value (e.g., -1) for unlimited age (DANGEROUS: accepts
+	// any expired certificate regardless of how long ago it expired).
+	//
+	// This field is only used when InsecureSkipTimeVerify is true.
+	// [uTLS] Security hardening for InsecureSkipTimeVerify.
+	InsecureMaxExpiredAge time.Duration // [uTLS]
+
 	// AcceptDelegatedCredentials controls whether the client will accept and
 	// verify Delegated Credentials (RFC 9345) from the server. When true, if
 	// the server presents a delegated credential in the Certificate message,
@@ -798,7 +811,13 @@ type Config struct {
 	// InsecureServerNameToVerify is used to verify the hostname on the returned
 	// certificates. It is intended to use with spoofed ServerName.
 	// If InsecureServerNameToVerify is "*", crypto/tls will do normal
-	// certificate validation but ignore certifacate's DNSName.
+	// certificate validation but ignore certificate's DNSName.
+	//
+	// SECURITY WARNING: Setting InsecureServerNameToVerify to "*" completely
+	// disables hostname verification, accepting certificates from ANY domain.
+	// This makes the connection vulnerable to man-in-the-middle (MITM) attacks
+	// where an attacker with any valid certificate can intercept traffic.
+	// Only use "*" for testing purposes, NEVER in production environments.
 	//
 	// This field is ignored when InsecureSkipVerify is true.
 	InsecureServerNameToVerify string // [uTLS]
@@ -1185,6 +1204,8 @@ func (c *Config) Clone() *Config {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
+	utlserrors.LogDebug(context.Background(), "config: cloning Config, ServerName=", c.ServerName, " MinVersion=", c.MinVersion, " MaxVersion=", c.MaxVersion)
+
 	// Deep copy NameToCertificate map to prevent shared state
 	var nameToCert map[string]*Certificate
 	if c.NameToCertificate != nil {
@@ -1285,6 +1306,7 @@ func (c *Config) Clone() *Config {
 		ClientCAs:                           c.ClientCAs,
 		InsecureSkipVerify:                  c.InsecureSkipVerify,
 		InsecureSkipTimeVerify:              c.InsecureSkipTimeVerify,
+		InsecureMaxExpiredAge:               c.InsecureMaxExpiredAge, // [uTLS]
 		AcceptDelegatedCredentials:          c.AcceptDelegatedCredentials, // [uTLS]
 		InsecureServerNameToVerify:          c.InsecureServerNameToVerify,
 		OmitEmptyPsk:                        c.OmitEmptyPsk,
@@ -1444,7 +1466,7 @@ func (c *Config) ticketKeys(configForClient *Config) ([]ticketKey, error) {
 // compromised.
 func (c *Config) SetSessionTicketKeys(keys [][32]byte) error {
 	if len(keys) == 0 {
-		return errors.New("tls: keys must have at least one key")
+		return utlserrors.New("tls: keys must have at least one key").AtError()
 	}
 
 	newKeys := make([]ticketKey, len(keys))
@@ -1490,8 +1512,11 @@ func (c *Config) cipherSuites() []uint16 {
 		// 	return defaultCipherSuitesFIPS
 		// }
 		// [uTLS] SECTION END
-		return defaultCipherSuites()
+		suites := defaultCipherSuites()
+		utlserrors.LogDebug(context.Background(), "config: using default cipherSuites count=", len(suites))
+		return suites
 	}
+	utlserrors.LogDebug(context.Background(), "config: using custom cipherSuites count=", len(c.CipherSuites))
 	// [uTLS] SECTION BEGIN
 	// if fips140tls.Required() {
 	// 	cipherSuites := slices.Clone(c.CipherSuites)
@@ -1547,6 +1572,7 @@ func (c *Config) supportedVersions(isClient bool) []uint16 {
 		}
 		versions = append(versions, v)
 	}
+	utlserrors.LogDebug(context.Background(), "config: supportedVersions isClient=", isClient, " versions=", versions)
 	return versions
 }
 
@@ -1589,6 +1615,7 @@ func (c *Config) curvePreferences(version uint16) []CurveID {
 	if version < VersionTLS13 {
 		curvePreferences = slices.DeleteFunc(curvePreferences, isTLS13OnlyKeyExchange)
 	}
+	utlserrors.LogDebug(context.Background(), "config: curvePreferences version=", version, " curves=", curvePreferences)
 	return curvePreferences
 }
 
@@ -1608,10 +1635,12 @@ func (c *Config) mutualVersion(isClient bool, peerVersions []uint16) (uint16, bo
 	for _, peerVersion := range peerVersions {
 		for _, v := range supportedVersions {
 			if v == peerVersion {
+				utlserrors.LogDebug(context.Background(), "config: mutualVersion selected=", v, " peerVersions=", peerVersions)
 				return v, true
 			}
 		}
 	}
+	utlserrors.LogDebug(context.Background(), "config: mutualVersion no common version, peer=", peerVersions, " supported=", supportedVersions)
 	return 0, false
 }
 
@@ -1624,25 +1653,29 @@ func (c *Config) mutualVersion(isClient bool, peerVersions []uint16) (uint16, bo
 // See go.dev/issue/67401.
 //
 //go:linkname errNoCertificates
-var errNoCertificates = errors.New("tls: no certificates configured")
+var errNoCertificates = utlserrors.New("tls: no certificates configured").AtError()
 
 // getCertificate returns the best certificate for the given ClientHelloInfo,
 // defaulting to the first element of c.Certificates.
 func (c *Config) getCertificate(clientHello *ClientHelloInfo) (*Certificate, error) {
+	utlserrors.LogDebug(context.Background(), "config: getCertificate for ServerName=", clientHello.ServerName, " certCount=", len(c.Certificates))
 	if c.GetCertificate != nil &&
 		(len(c.Certificates) == 0 || len(clientHello.ServerName) > 0) {
 		cert, err := c.GetCertificate(clientHello)
 		if cert != nil || err != nil {
+			utlserrors.LogDebug(context.Background(), "config: getCertificate callback returned cert=", cert != nil, " err=", err)
 			return cert, err
 		}
 	}
 
 	if len(c.Certificates) == 0 {
+		utlserrors.LogDebug(context.Background(), "config: getCertificate no certificates configured")
 		return nil, errNoCertificates
 	}
 
 	if len(c.Certificates) == 1 {
 		// There's only one choice, so no point doing any work.
+		utlserrors.LogDebug(context.Background(), "config: getCertificate using single certificate")
 		return &c.Certificates[0], nil
 	}
 
@@ -1653,10 +1686,12 @@ func (c *Config) getCertificate(clientHello *ClientHelloInfo) (*Certificate, err
 		}
 		if len(name) > 0 {
 			labels := strings.Split(name, ".")
-			labels[0] = "*"
-			wildcardName := strings.Join(labels, ".")
-			if cert, ok := c.NameToCertificate[wildcardName]; ok {
-				return cert, nil
+			if len(labels) > 0 {
+				labels[0] = "*"
+				wildcardName := strings.Join(labels, ".")
+				if cert, ok := c.NameToCertificate[wildcardName]; ok {
+					return cert, nil
+				}
 			}
 		}
 	}
@@ -1694,7 +1729,7 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 	}
 	vers, ok := config.mutualVersion(roleServer, chi.SupportedVersions)
 	if !ok {
-		return errors.New("no mutually supported protocol versions")
+		return utlserrors.New("no mutually supported protocol versions").AtError()
 	}
 
 	// If the client specified the name they are trying to connect to, the
@@ -1762,7 +1797,7 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 
 	// The only signed key exchange we support is ECDHE.
 	if !supportsECDHE(config, vers, chi.SupportedCurves, chi.SupportedPoints) {
-		return supportsRSAFallback(errors.New("client doesn't support ECDHE, can only use legacy RSA key exchange"))
+		return supportsRSAFallback(utlserrors.New("client doesn't support ECDHE, can only use legacy RSA key exchange").AtWarning())
 	}
 
 	var ecdsaCipherSuite bool
@@ -1788,12 +1823,12 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 				}
 			}
 			if !curveOk {
-				return errors.New("client doesn't support certificate curve")
+				return utlserrors.New("client doesn't support certificate curve").AtError()
 			}
 			ecdsaCipherSuite = true
 		case ed25519.PublicKey:
 			if vers < VersionTLS12 || len(chi.SignatureSchemes) == 0 {
-				return errors.New("connection doesn't support Ed25519")
+				return utlserrors.New("connection doesn't support Ed25519").AtError()
 			}
 			ecdsaCipherSuite = true
 		case *rsa.PublicKey:
@@ -1826,7 +1861,7 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 		return true
 	})
 	if cipherSuite == nil {
-		return supportsRSAFallback(errors.New("client doesn't support any cipher suites compatible with the certificate"))
+		return supportsRSAFallback(utlserrors.New("client doesn't support any cipher suites compatible with the certificate").AtWarning())
 	}
 
 	return nil
@@ -1861,7 +1896,7 @@ func (cri *CertificateRequestInfo) SupportsCertificate(c *Certificate) error {
 			}
 		}
 	}
-	return errors.New("chain is not signed by an acceptable CA")
+	return utlserrors.New("chain is not signed by an acceptable CA").AtError()
 }
 
 // BuildNameToCertificate parses c.Certificates and builds c.NameToCertificate
@@ -1872,6 +1907,9 @@ func (cri *CertificateRequestInfo) SupportsCertificate(c *Certificate) error {
 // with a given name. Leave that field nil to let the library select the first
 // compatible chain from Certificates.
 func (c *Config) BuildNameToCertificate() {
+	if c == nil {
+		return
+	}
 	c.NameToCertificate = make(map[string]*Certificate)
 	for i := range c.Certificates {
 		cert := &c.Certificates[i]
@@ -2136,7 +2174,7 @@ func fipsAllowedChains(chains [][]*x509.Certificate) ([][]*x509.Certificate, err
 	}
 
 	if len(permittedChains) == 0 {
-		return nil, errors.New("tls: no FIPS compatible certificate chains found")
+		return nil, utlserrors.New("tls: no FIPS compatible certificate chains found").AtError()
 	}
 
 	return permittedChains, nil

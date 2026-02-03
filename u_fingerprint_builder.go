@@ -5,9 +5,10 @@
 package tls
 
 import (
-	"errors"
 	"fmt"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ProfileBuilder creates custom profiles from a base profile.
@@ -562,4 +563,4 @@ func SafariProfile(version int, platform string) *ProfileBuilder {
 }
 
 // ErrInvalidProfile is returned when a profile fails validation.
-var ErrInvalidProfile = errors.New("tls: invalid fingerprint profile")
+var ErrInvalidProfile = utlserrors.New("tls: invalid fingerprint profile").AtError()

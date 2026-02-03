@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ResilientDialer provides TLS connection establishment with retry logic,
@@ -220,6 +222,8 @@ func (d *ResilientDialer) DialWithResult(ctx context.Context, network, addr stri
 // dial is the internal implementation of connection establishment.
 func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallback bool) *DialResult {
 	startTime := time.Now()
+	utlserrors.LogDebug(ctx, "resilient: starting dial to:", addr, "fallback:", fallback)
+
 	result := &DialResult{
 		ProfileAttempts: make(map[string]int),
 		Errors:          make([]DialAttemptError, 0),
@@ -230,10 +234,12 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 		// Only use first profile when not in fallback mode
 		profiles = profiles[:1]
 	}
+	utlserrors.LogDebug(ctx, "resilient: profiles to try:", len(profiles))
 
 	for _, profile := range profiles {
 		profileKey := profile.Str()
 		maxRetries := d.effectiveMaxRetries()
+		utlserrors.LogDebug(ctx, "resilient: attempting profile:", profileKey, "maxRetries:", maxRetries)
 
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			result.TotalAttempts++
@@ -241,11 +247,13 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 
 			// Check context cancellation before attempting
 			if err := ctx.Err(); err != nil {
+				utlserrors.LogDebug(ctx, "resilient: context cancelled before attempt:", err)
 				result.LastError = err
 				result.Duration = time.Since(startTime)
 				return result
 			}
 
+			utlserrors.LogDebug(ctx, "resilient: dial attempt", attempt+1, "of", maxRetries+1, "with profile:", profileKey)
 			attemptStart := time.Now()
 			conn, err := d.attemptDial(ctx, network, addr, profile)
 			attemptDuration := time.Since(attemptStart)
@@ -256,6 +264,7 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 				result.UsedProfile = profile
 				result.Duration = time.Since(startTime)
 
+				utlserrors.LogDebug(ctx, "resilient: connected successfully with profile:", profileKey, "attempt:", attempt+1, "duration:", attemptDuration)
 				d.logf("connected with profile %s on attempt %d", profileKey, attempt+1)
 
 				if d.OnProfileSuccess != nil {
@@ -276,6 +285,7 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 			})
 			result.LastError = err
 
+			utlserrors.LogDebug(ctx, "resilient: attempt", attempt+1, "failed:", err, "transient:", isTransient)
 			d.logf("attempt %d with profile %s failed: %v (transient=%v)",
 				attempt+1, profileKey, err, isTransient)
 
@@ -283,16 +293,19 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 			if !isTransient {
 				// Permanent error - check if it's profile-specific
 				if IsProfileSpecificError(err) && fallback {
+					utlserrors.LogDebug(ctx, "resilient: profile-specific error, falling back to next profile")
 					d.logf("profile-specific error, trying next profile")
 					break // Try next profile
 				}
 				// Other permanent errors (like cert validation) should fail immediately
 				if IsPermanentError(err) {
+					utlserrors.LogDebug(ctx, "resilient: permanent error, aborting:", err)
 					result.Duration = time.Since(startTime)
 					return result
 				}
 				// Unknown error type, try fallback if available
 				if fallback {
+					utlserrors.LogDebug(ctx, "resilient: unknown error type, trying fallback")
 					break
 				}
 			}
@@ -300,9 +313,11 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 			// Should we retry?
 			if attempt < maxRetries {
 				backoff := d.calculateBackoff(attempt)
+				utlserrors.LogDebug(ctx, "resilient: backing off for:", backoff)
 
 				// Check if OnRetry callback wants to abort
 				if d.OnRetry != nil && !d.OnRetry(profile, attempt+1, err, backoff) {
+					utlserrors.LogDebug(ctx, "resilient: retry aborted by callback")
 					d.logf("retry aborted by callback")
 					result.Duration = time.Since(startTime)
 					return result
@@ -313,6 +328,7 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 				// Wait with context cancellation support
 				select {
 				case <-ctx.Done():
+					utlserrors.LogDebug(ctx, "resilient: context cancelled during backoff:", ctx.Err())
 					result.LastError = ctx.Err()
 					result.Duration = time.Since(startTime)
 					return result
@@ -323,12 +339,15 @@ func (d *ResilientDialer) dial(ctx context.Context, network, addr string, fallba
 		}
 	}
 
+	utlserrors.LogDebug(ctx, "resilient: all attempts exhausted, total attempts:", result.TotalAttempts, "duration:", time.Since(startTime))
 	result.Duration = time.Since(startTime)
 	return result
 }
 
 // attemptDial makes a single connection attempt with the given profile.
 func (d *ResilientDialer) attemptDial(ctx context.Context, network, addr string, profile ClientHelloID) (*UConn, error) {
+	utlserrors.LogDebug(ctx, "resilient: attemptDial to:", addr, "profile:", profile.Str())
+
 	// Create context with dial timeout
 	dialCtx := ctx
 	if d.DialTimeout > 0 {
@@ -344,9 +363,11 @@ func (d *ResilientDialer) attemptDial(ctx context.Context, network, addr string,
 	}
 
 	// Dial TCP connection
+	utlserrors.LogDebug(ctx, "resilient: dialing TCP connection to:", addr)
 	tcpConn, err := dialer.DialContext(dialCtx, network, addr)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dial failed: %w", err)
+		utlserrors.LogDebug(ctx, "resilient: TCP dial failed:", err)
+		return nil, utlserrors.New("tcp dial failed").Base(err).AtError()
 	}
 
 	// Prepare TLS config
@@ -356,6 +377,9 @@ func (d *ResilientDialer) attemptDial(ctx context.Context, network, addr string,
 	}
 	// Clone to avoid modifying original
 	config = config.Clone()
+	if config == nil {
+		config = &Config{}
+	}
 
 	// Extract server name from address if not set
 	if config.ServerName == "" {
@@ -368,18 +392,23 @@ func (d *ResilientDialer) attemptDial(ctx context.Context, network, addr string,
 	}
 
 	// Create UConn
+	utlserrors.LogDebug(ctx, "resilient: creating UClient with profile:", profile.Str())
 	uconn, err := UClient(tcpConn, config, profile)
 	if err != nil {
 		tcpConn.Close()
-		return nil, fmt.Errorf("UClient creation failed: %w", err)
+		utlserrors.LogDebug(ctx, "resilient: UClient creation failed:", err)
+		return nil, utlserrors.New("UClient creation failed").Base(err).AtError()
 	}
 
 	// Perform handshake
+	utlserrors.LogDebug(ctx, "resilient: performing TLS handshake")
 	if err := uconn.HandshakeContext(dialCtx); err != nil {
 		uconn.Close()
-		return nil, fmt.Errorf("handshake failed: %w", err)
+		utlserrors.LogDebug(ctx, "resilient: TLS handshake failed:", err)
+		return nil, utlserrors.New("handshake failed").Base(err).AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "resilient: connection established successfully")
 	return uconn, nil
 }
 

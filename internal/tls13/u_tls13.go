@@ -1,13 +1,14 @@
 package tls13
 
 import (
-	"errors"
 	"hash"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ErrSecretLengthMismatch is returned when a pre-computed secret has an
 // incorrect length for the specified hash function.
-var ErrSecretLengthMismatch = errors.New("tls13: secret length does not match hash output size")
+var ErrSecretLengthMismatch = utlserrors.New("tls13: secret length does not match hash output size").AtError()
 
 // NewEarlySecretFromSecret creates an EarlySecret from a pre-computed secret.
 // This is used for session resumption where the secret was previously derived.

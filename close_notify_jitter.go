@@ -5,9 +5,12 @@
 package tls
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // CloseNotifyConfig controls timing jitter for close_notify alerts to resist
@@ -127,10 +130,14 @@ func DisabledCloseNotifyConfig() *CloseNotifyConfig {
 // Uses cryptographically secure randomness for the decision.
 // Thread-safe.
 func (c *CloseNotifyConfig) ShouldSkip() bool {
+	ctx := context.Background()
+
 	if c == nil || !c.Enabled || c.SkipProbability <= 0 {
+		utlserrors.LogDebug(ctx, "jitter: close_notify skip disabled or zero probability")
 		return false
 	}
 	if c.SkipProbability >= 1.0 {
+		utlserrors.LogDebug(ctx, "jitter: close_notify will be skipped (100% probability)")
 		return true
 	}
 
@@ -138,13 +145,20 @@ func (c *CloseNotifyConfig) ShouldSkip() bool {
 	var randBytes [8]byte
 	if _, err := rand.Read(randBytes[:]); err != nil {
 		// On error, don't skip (safer default)
+		utlserrors.LogDebug(ctx, "jitter: random generation failed, not skipping close_notify")
 		return false
 	}
 
 	// Convert to float64 in range [0, 1)
 	randVal := float64(binary.LittleEndian.Uint64(randBytes[:])) / float64(^uint64(0))
 
-	return randVal < c.SkipProbability
+	skip := randVal < c.SkipProbability
+	if skip {
+		utlserrors.LogDebug(ctx, "jitter: close_notify will be skipped (random decision)")
+	} else {
+		utlserrors.LogDebug(ctx, "jitter: close_notify will be sent (random decision)")
+	}
+	return skip
 }
 
 // GetDelay returns the delay duration to apply before sending close_notify.
@@ -152,7 +166,10 @@ func (c *CloseNotifyConfig) ShouldSkip() bool {
 // Uses cryptographically secure randomness for delay calculation.
 // Thread-safe.
 func (c *CloseNotifyConfig) GetDelay() time.Duration {
+	ctx := context.Background()
+
 	if c == nil || !c.Enabled {
+		utlserrors.LogDebug(ctx, "jitter: delay disabled, returning 0")
 		return 0
 	}
 
@@ -171,7 +188,9 @@ func (c *CloseNotifyConfig) GetDelay() time.Duration {
 
 	// If no range, return minimum delay
 	if minMs == maxMs {
-		return time.Duration(minMs) * time.Millisecond
+		delay := time.Duration(minMs) * time.Millisecond
+		utlserrors.LogDebug(ctx, "jitter: fixed delay:", delay)
+		return delay
 	}
 
 	// Generate uniform random delay in [minMs, maxMs]
@@ -185,14 +204,18 @@ func (c *CloseNotifyConfig) GetDelay() time.Duration {
 		var randBytes [8]byte
 		if _, err := rand.Read(randBytes[:]); err != nil {
 			// On error, return minimum delay (safe fallback)
-			return time.Duration(minMs) * time.Millisecond
+			delay := time.Duration(minMs) * time.Millisecond
+			utlserrors.LogDebug(ctx, "jitter: random generation failed, using min delay:", delay)
+			return delay
 		}
 		randVal = binary.LittleEndian.Uint64(randBytes[:])
 
 		// Accept only if below rejection threshold
 		if randVal < max {
 			delayMs := minMs + int(randVal%rangeSize)
-			return time.Duration(delayMs) * time.Millisecond
+			delay := time.Duration(delayMs) * time.Millisecond
+			utlserrors.LogDebug(ctx, "jitter: applying delay:", delay)
+			return delay
 		}
 		// Otherwise loop and try again (rejection sampling)
 	}

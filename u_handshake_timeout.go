@@ -280,7 +280,6 @@ func (c *handshakeTimeoutController) setProgressCallback(cb HandshakeProgressCal
 // Returns a context that will be canceled when the phase times out.
 func (c *handshakeTimeoutController) enterPhase(phase HandshakePhase) (context.Context, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	// Cancel previous phase timer if any
 	if c.phaseCancel != nil {
@@ -291,16 +290,29 @@ func (c *handshakeTimeoutController) enterPhase(phase HandshakePhase) (context.C
 	// Check if base context is already canceled
 	select {
 	case <-c.baseCtx.Done():
+		c.mu.Unlock()
 		return nil, c.baseCtx.Err()
 	default:
 	}
 
-	// Record phase transition
+	// Capture callback and handshake start time before releasing lock.
+	// This prevents deadlock if the callback calls methods that acquire c.mu.
+	callback := c.progressCallback
+	handshakeStart := c.handshakeStart
+
+	// Release lock before calling user-provided callback to prevent deadlock
+	c.mu.Unlock()
+
+	// Record phase transition time and call progress callback outside of lock
 	now := time.Now()
-	if c.progressCallback != nil {
-		elapsed := now.Sub(c.handshakeStart)
-		c.progressCallback(phase, elapsed)
+	if callback != nil {
+		elapsed := now.Sub(handshakeStart)
+		callback(phase, elapsed)
 	}
+
+	// Re-acquire lock for state updates
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	c.currentPhase = phase
 	c.phaseStart = now
@@ -350,6 +362,15 @@ func (c *handshakeTimeoutController) checkPhaseTimeout(err error) error {
 	if alertTimeout > 0 && conn != nil {
 		alertSent = c.trySendAlert(conn, alertTimeout)
 	}
+
+	// Call observability hook for timeout error
+	remoteAddr := ""
+	if conn != nil && conn.conn != nil {
+		if addr := conn.conn.RemoteAddr(); addr != nil {
+			remoteAddr = addr.String()
+		}
+	}
+	callOnTimeoutError(remoteAddr)
 
 	return &HandshakeTimeoutError{
 		Phase:             phase,

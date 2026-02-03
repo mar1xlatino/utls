@@ -550,8 +550,12 @@ func TestHashForServerKeyExchange(t *testing.T) {
 	serverRandom := make([]byte, 32)
 	params := []byte("test params")
 
-	rand.Read(clientRandom)
-	rand.Read(serverRandom)
+	if _, err := rand.Read(clientRandom); err != nil {
+		t.Fatalf("rand.Read failed for clientRandom: %v", err)
+	}
+	if _, err := rand.Read(serverRandom); err != nil {
+		t.Fatalf("rand.Read failed for serverRandom: %v", err)
+	}
 
 	tests := []struct {
 		name     string
@@ -908,7 +912,9 @@ func BenchmarkRSAKeyAgreement(b *testing.B) {
 // BenchmarkHashFunctions benchmarks hash helper functions.
 func BenchmarkHashFunctions(b *testing.B) {
 	data := make([]byte, 256)
-	rand.Read(data)
+	if _, err := rand.Read(data); err != nil {
+		b.Fatalf("rand.Read failed: %v", err)
+	}
 	slices := [][]byte{data[:64], data[64:128], data[128:]}
 
 	b.Run("SHA1Hash", func(b *testing.B) {

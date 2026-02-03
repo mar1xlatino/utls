@@ -11,10 +11,9 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
-	"errors"
-	"fmt"
 	"hash"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/tls12"
 )
 
@@ -256,14 +255,14 @@ func (h *finishedHash) discardHandshakeBuffer() {
 // ConnectionState.ekm when renegotiation is enabled and thus
 // we wish to fail all key-material export requests.
 func noEKMBecauseRenegotiation(label string, context []byte, length int) ([]byte, error) {
-	return nil, errors.New("crypto/tls: ExportKeyingMaterial is unavailable when renegotiation is enabled")
+	return nil, utlserrors.New("crypto/tls: ExportKeyingMaterial is unavailable when renegotiation is enabled").AtError()
 }
 
 // noEKMBecauseNoEMS is used as a value of ConnectionState.ekm when Extended
 // Master Secret is not negotiated and thus we wish to fail all key-material
 // export requests.
 func noEKMBecauseNoEMS(label string, context []byte, length int) ([]byte, error) {
-	return nil, errors.New("crypto/tls: ExportKeyingMaterial is unavailable when neither TLS 1.3 nor Extended Master Secret are negotiated; override with GODEBUG=tlsunsafeekm=1")
+	return nil, utlserrors.New("crypto/tls: ExportKeyingMaterial is unavailable when neither TLS 1.3 nor Extended Master Secret are negotiated; override with GODEBUG=tlsunsafeekm=1").AtError()
 }
 
 // ekmFromMasterSecret generates exported keying material as defined in RFC 5705.
@@ -272,7 +271,7 @@ func ekmFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clien
 		switch label {
 		case "client finished", "server finished", "master secret", "key expansion":
 			// These values are reserved and may not be used.
-			return nil, fmt.Errorf("crypto/tls: reserved ExportKeyingMaterial label: %s", label)
+			return nil, utlserrors.New("crypto/tls: reserved ExportKeyingMaterial label: ", label).AtError()
 		}
 
 		seedLen := len(serverRandom) + len(clientRandom)
@@ -286,7 +285,7 @@ func ekmFromMasterSecret(version uint16, suite *cipherSuite, masterSecret, clien
 
 		if context != nil {
 			if len(context) >= 1<<16 {
-				return nil, fmt.Errorf("crypto/tls: ExportKeyingMaterial context too long")
+				return nil, utlserrors.New("crypto/tls: ExportKeyingMaterial context too long").AtError()
 			}
 			seed = append(seed, byte(len(context)>>8), byte(len(context)))
 			seed = append(seed, context...)

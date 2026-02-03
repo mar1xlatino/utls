@@ -116,7 +116,11 @@ func connectWithProfile(ctx context.Context, server testServer, profile ClientHe
 		InsecureSkipVerify: false,
 	}
 
-	tlsConn := UClient(tcpConn, config, profile)
+	tlsConn, err := UClient(tcpConn, config, profile)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("UClient creation failed: %w", err)
+	}
 
 	// Set deadline for handshake
 	deadline, ok := ctx.Deadline()
@@ -298,7 +302,11 @@ func TestChrome142Profile(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloChrome_142)
+			tlsConn, err := UClient(tcpConn, config, HelloChrome_142)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -356,7 +364,11 @@ func TestFirefox145Profile(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloFirefox_145)
+			tlsConn, err := UClient(tcpConn, config, HelloFirefox_145)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -404,7 +416,11 @@ func TestSafari18Profile(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloSafari_18)
+			tlsConn, err := UClient(tcpConn, config, HelloSafari_18)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -452,7 +468,11 @@ func TestEdge142Profile(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloEdge_142)
+			tlsConn, err := UClient(tcpConn, config, HelloEdge_142)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -504,7 +524,11 @@ func TestCertificateValidation(t *testing.T) {
 				InsecureSkipVerify: false,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloChrome_Auto)
+			tlsConn, err := UClient(tcpConn, config, HelloChrome_Auto)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 
 			if server.expectValid {
@@ -547,7 +571,11 @@ func TestInvalidCertificateRejection(t *testing.T) {
 		InsecureSkipVerify: false,
 	}
 
-	tlsConn := UClient(tcpConn, config, HelloChrome_Auto)
+	tlsConn, err := UClient(tcpConn, config, HelloChrome_Auto)
+	if err != nil {
+		tcpConn.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 	err = tlsConn.Handshake()
 
 	if err == nil {
@@ -632,7 +660,13 @@ func TestConcurrentConnections(t *testing.T) {
 						ServerName: host,
 					}
 
-					tlsConn := UClient(tcpConn, config, profile)
+					tlsConn, err := UClient(tcpConn, config, profile)
+					if err != nil {
+						tcpConn.Close()
+						atomic.AddInt64(&failureCount, 1)
+						errChan <- fmt.Errorf("UClient to %s with %s: %w", addr, profile.Str(), err)
+						return
+					}
 					err = tlsConn.Handshake()
 					if err != nil {
 						tcpConn.Close()
@@ -657,9 +691,9 @@ func TestConcurrentConnections(t *testing.T) {
 		errs = append(errs, err)
 	}
 
-	t.Logf("Concurrent connections: %d successful, %d failed", successCount, failureCount)
+	t.Logf("Concurrent connections: %d successful, %d failed", atomic.LoadInt64(&successCount), atomic.LoadInt64(&failureCount))
 
-	if failureCount > 0 {
+	if atomic.LoadInt64(&failureCount) > 0 {
 		// Log first few errors
 		maxErrors := 5
 		for i, err := range errs {
@@ -673,7 +707,7 @@ func TestConcurrentConnections(t *testing.T) {
 
 	// Allow some failures due to rate limiting, but not too many
 	totalAttempts := int64(numConnections * len(servers) * len(profiles))
-	successRate := float64(successCount) / float64(totalAttempts)
+	successRate := float64(atomic.LoadInt64(&successCount)) / float64(totalAttempts)
 	if successRate < 0.9 {
 		t.Errorf("Success rate too low: %.1f%% (expected >90%%)", successRate*100)
 	}
@@ -712,7 +746,11 @@ func TestTLS13Negotiation(t *testing.T) {
 			}
 
 			// Use Chrome 142 which should always prefer TLS 1.3
-			tlsConn := UClient(tcpConn, config, HelloChrome_142)
+			tlsConn, err := UClient(tcpConn, config, HelloChrome_142)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -770,7 +808,11 @@ func TestH2ALPNNegotiation(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, HelloChrome_Auto)
+			tlsConn, err := UClient(tcpConn, config, HelloChrome_Auto)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed: %v", err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -836,7 +878,11 @@ func TestAllProfilesConnectivity(t *testing.T) {
 				ServerName: host,
 			}
 
-			tlsConn := UClient(tcpConn, config, profile)
+			tlsConn, err := UClient(tcpConn, config, profile)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed for %s: %v", profile.Str(), err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -889,7 +935,11 @@ func TestPSKProfilesWithOmitEmptyPsk(t *testing.T) {
 				OmitEmptyPsk: true, // Required for PSK profiles without prior session
 			}
 
-			tlsConn := UClient(tcpConn, config, profile)
+			tlsConn, err := UClient(tcpConn, config, profile)
+			if err != nil {
+				tcpConn.Close()
+				t.Fatalf("UClient failed for %s: %v", profile.Str(), err)
+			}
 			err = tlsConn.Handshake()
 			if err != nil {
 				tcpConn.Close()
@@ -925,7 +975,11 @@ func TestSNIExtension(t *testing.T) {
 		ServerName: "cloudflare.com",
 	}
 
-	tlsConn := UClient(tcpConn, config, HelloChrome_Auto)
+	tlsConn, err := UClient(tcpConn, config, HelloChrome_Auto)
+	if err != nil {
+		tcpConn.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 	err = tlsConn.Handshake()
 	if err != nil {
 		tcpConn.Close()
@@ -979,7 +1033,13 @@ func TestRandomizedProfiles(t *testing.T) {
 					ServerName: "cloudflare.com",
 				}
 
-				tlsConn := UClient(tcpConn, config, profile)
+				tlsConn, err := UClient(tcpConn, config, profile)
+				if err != nil {
+					tcpConn.Close()
+					cancel()
+					lastErr = fmt.Errorf("UClient failed (attempt %d/%d): %w", attempt, maxAttempts, err)
+					continue
+				}
 				err = tlsConn.Handshake()
 				if err != nil {
 					tcpConn.Close()
@@ -1030,7 +1090,11 @@ func TestGolangProfile(t *testing.T) {
 		ServerName: "cloudflare.com",
 	}
 
-	tlsConn := UClient(tcpConn, config, HelloGolang)
+	tlsConn, err := UClient(tcpConn, config, HelloGolang)
+	if err != nil {
+		tcpConn.Close()
+		t.Fatalf("UClient failed: %v", err)
+	}
 	err = tlsConn.Handshake()
 	if err != nil {
 		tcpConn.Close()

@@ -917,6 +917,75 @@ func TestResumptionBinderKeyRFC8448(t *testing.T) {
 	}
 }
 
+// TestExternalBinderKeyRFC8446 tests the external binder key derivation
+// per RFC 8446 Section 7.1 which requires "ext binder" label for external PSKs
+func TestExternalBinderKeyRFC8446(t *testing.T) {
+	t.Parallel()
+
+	psk := make([]byte, 32) // External PSK
+	early, err := NewEarlySecret(sha256.New, psk)
+	if err != nil {
+		t.Fatalf("NewEarlySecret failed: %v", err)
+	}
+
+	binderKey, err := early.ExternalBinderKey()
+	if err != nil {
+		t.Fatalf("ExternalBinderKey failed: %v", err)
+	}
+
+	// Verify the binder key length
+	if len(binderKey) != 32 {
+		t.Errorf("external_binder_key length = %d, want 32", len(binderKey))
+	}
+
+	// Compute expected value using ExpandLabel directly with "ext binder" label
+	emptyHash := sha256.New()
+	emptyContext := emptyHash.Sum(nil)
+
+	expectedBinderKey, err := ExpandLabel(sha256.New, early.Secret(), "ext binder", emptyContext, 32)
+	if err != nil {
+		t.Fatalf("ExpandLabel for expected failed: %v", err)
+	}
+
+	if !bytes.Equal(binderKey, expectedBinderKey) {
+		t.Errorf("external_binder_key mismatch with direct ExpandLabel:\n  got:  %x\n  want: %x",
+			binderKey, expectedBinderKey)
+	}
+}
+
+// TestBinderKeyDifferentiation verifies that resumption and external binder keys are distinct
+// per RFC 8446 Section 7.1 which specifies different labels for each PSK type
+func TestBinderKeyDifferentiation(t *testing.T) {
+	t.Parallel()
+
+	psk := make([]byte, 32)
+	early, err := NewEarlySecret(sha256.New, psk)
+	if err != nil {
+		t.Fatalf("NewEarlySecret failed: %v", err)
+	}
+
+	resumptionKey, err := early.ResumptionBinderKey()
+	if err != nil {
+		t.Fatalf("ResumptionBinderKey failed: %v", err)
+	}
+
+	externalKey, err := early.ExternalBinderKey()
+	if err != nil {
+		t.Fatalf("ExternalBinderKey failed: %v", err)
+	}
+
+	// RFC 8446 Section 7.1: "res binder" vs "ext binder" labels MUST produce different keys
+	if bytes.Equal(resumptionKey, externalKey) {
+		t.Error("resumption_binder_key equals external_binder_key (CRITICAL: labels not differentiated)")
+	}
+
+	// Both keys must have the same length (hash output size)
+	if len(resumptionKey) != len(externalKey) {
+		t.Errorf("binder key lengths differ: resumption=%d, external=%d",
+			len(resumptionKey), len(externalKey))
+	}
+}
+
 // TestTrafficSecretsConsistencyRFC8448 verifies that client and server traffic secrets are differentiated
 func TestTrafficSecretsConsistencyRFC8448(t *testing.T) {
 	t.Parallel()

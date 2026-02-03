@@ -5,8 +5,11 @@
 package tls
 
 import (
+	"context"
 	"slices"
 	_ "unsafe" // for linkname
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // Defaults are collected in this file to allow distributions to more easily patch
@@ -23,7 +26,9 @@ func defaultCurvePreferences() []CurveID {
 	// }
 	// [uTLS section ends]
 
-	return []CurveID{X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521}
+	curves := []CurveID{X25519MLKEM768, X25519, CurveP256, CurveP384, CurveP521}
+	utlserrors.LogDebug(context.Background(), "defaults: defaultCurvePreferences=", curves)
+	return curves
 }
 
 // defaultSupportedSignatureAlgorithms contains the signature and hash algorithms that
@@ -57,7 +62,7 @@ var defaultSupportedSignatureAlgorithms = []SignatureScheme{
 
 func defaultCipherSuites() []uint16 {
 	suites := slices.Clone(cipherSuitesPreferenceOrder)
-	return slices.DeleteFunc(suites, func(c uint16) bool {
+	suites = slices.DeleteFunc(suites, func(c uint16) bool {
 		return disabledCipherSuites[c] ||
 			// [uTLS section begins]
 			// tlsrsakex.Value() != "1" && rsaKexCiphers[c] ||
@@ -66,6 +71,8 @@ func defaultCipherSuites() []uint16 {
 			tdesCiphers[c]
 		// [uTLS section ends]
 	})
+	utlserrors.LogDebug(context.Background(), "defaults: defaultCipherSuites count=", len(suites))
+	return suites
 }
 
 // defaultCipherSuitesTLS13 is also the preference order, since there are no

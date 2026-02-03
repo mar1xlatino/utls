@@ -20,11 +20,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
-	"fmt"
 	"net"
 	"os"
 	"strings"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // Server returns a new TLS server side connection
@@ -37,6 +37,9 @@ func Server(conn net.Conn, config *Config) *Conn {
 		config: config,
 	}
 	c.handshakeFn = c.serverHandshake
+	if utlserrors.DebugLoggingEnabled && conn != nil {
+		utlserrors.LogDebug(context.Background(), "tls.Server: accepting connection from", conn.RemoteAddr())
+	}
 	return c
 }
 
@@ -51,6 +54,9 @@ func Client(conn net.Conn, config *Config) *Conn {
 		isClient: true,
 	}
 	c.handshakeFn = c.clientHandshake
+	if utlserrors.DebugLoggingEnabled && conn != nil {
+		utlserrors.LogDebug(context.Background(), "tls.Client: creating client connection to", conn.RemoteAddr())
+	}
 	return c
 }
 
@@ -86,14 +92,21 @@ func NewListener(inner net.Listener, config *Config) net.Listener {
 // The configuration config must be non-nil and must include
 // at least one certificate or else set GetCertificate.
 func Listen(network, laddr string, config *Config) (net.Listener, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls.Listen: starting listener on", network, laddr)
+	}
 	// If this condition changes, consider updating http.Server.ServeTLS too.
 	if config == nil || len(config.Certificates) == 0 &&
 		config.GetCertificate == nil && config.GetConfigForClient == nil {
-		return nil, errors.New("tls: neither Certificates, GetCertificate, nor GetConfigForClient set in Config")
+		return nil, utlserrors.New("tls: neither Certificates, GetCertificate, nor GetConfigForClient set in Config").AtError()
 	}
 	l, err := net.Listen(network, laddr)
 	if err != nil {
+		// Return the original error to preserve error semantics for callers
 		return nil, err
+	}
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls.Listen: listener started on", l.Addr())
 	}
 	return NewListener(l, config), nil
 }
@@ -113,6 +126,10 @@ func DialWithDialer(dialer *net.Dialer, network, addr string, config *Config) (*
 }
 
 func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, config *Config) (*Conn, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "tls.Dial: connecting to", addr, "via", network)
+	}
+
 	if netDialer.Timeout != 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
@@ -127,7 +144,15 @@ func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, conf
 
 	rawConn, err := netDialer.DialContext(ctx, network, addr)
 	if err != nil {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "tls.Dial: connection failed to", addr)
+		}
+		// Return the original error to preserve error semantics for callers
 		return nil, err
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "tls.Dial: TCP connection established to", rawConn.RemoteAddr())
 	}
 
 	colonPos := strings.LastIndex(addr, ":")
@@ -145,16 +170,28 @@ func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, conf
 		// Make a copy to avoid polluting argument or default.
 		c := config.Clone()
 		if c == nil {
-			return nil, errors.New("tls: failed to clone config")
+			return nil, utlserrors.New("tls: failed to clone config").AtError()
 		}
 		c.ServerName = hostname
 		config = c
 	}
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "tls.Dial: starting handshake with", hostname)
+	}
+
 	conn := Client(rawConn, config)
 	if err := conn.HandshakeContext(ctx); err != nil {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "tls.Dial: handshake failed with", hostname)
+		}
 		rawConn.Close()
+		// Return the original error to preserve error semantics for callers
 		return nil, err
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "tls.Dial: handshake complete with", hostname, "version:", conn.vers)
 	}
 	return conn, nil
 }
@@ -268,12 +305,12 @@ func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 
 	if len(cert.Certificate) == 0 {
 		if len(skippedBlockTypes) == 0 {
-			return fail(errors.New("tls: failed to find any PEM data in certificate input"))
+			return fail(utlserrors.New("tls: failed to find any PEM data in certificate input").AtError())
 		}
 		if len(skippedBlockTypes) == 1 && strings.HasSuffix(skippedBlockTypes[0], "PRIVATE KEY") {
-			return fail(errors.New("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched"))
+			return fail(utlserrors.New("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched").AtError())
 		}
-		return fail(fmt.Errorf("tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: %v", skippedBlockTypes))
+		return fail(utlserrors.New("tls: failed to find CERTIFICATE PEM block in certificate input after skipping PEM blocks of the following types:", skippedBlockTypes).AtError())
 	}
 
 	skippedBlockTypes = skippedBlockTypes[:0]
@@ -282,12 +319,12 @@ func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 		keyDERBlock, keyPEMBlock = pem.Decode(keyPEMBlock)
 		if keyDERBlock == nil {
 			if len(skippedBlockTypes) == 0 {
-				return fail(errors.New("tls: failed to find any PEM data in key input"))
+				return fail(utlserrors.New("tls: failed to find any PEM data in key input").AtError())
 			}
 			if len(skippedBlockTypes) == 1 && skippedBlockTypes[0] == "CERTIFICATE" {
-				return fail(errors.New("tls: found a certificate rather than a key in the PEM for the private key"))
+				return fail(utlserrors.New("tls: found a certificate rather than a key in the PEM for the private key").AtError())
 			}
-			return fail(fmt.Errorf("tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input after skipping PEM blocks of the following types: %v", skippedBlockTypes))
+			return fail(utlserrors.New("tls: failed to find PEM block with type ending in PRIVATE KEY in key input after skipping PEM blocks of the following types:", skippedBlockTypes).AtError())
 		}
 		if keyDERBlock.Type == "PRIVATE KEY" || strings.HasSuffix(keyDERBlock.Type, " PRIVATE KEY") {
 			break
@@ -319,29 +356,29 @@ func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 	case *rsa.PublicKey:
 		priv, ok := cert.PrivateKey.(*rsa.PrivateKey)
 		if !ok {
-			return fail(errors.New("tls: private key type does not match public key type"))
+			return fail(utlserrors.New("tls: private key type does not match public key type").AtError())
 		}
 		if pub.N.Cmp(priv.N) != 0 {
-			return fail(errors.New("tls: private key does not match public key"))
+			return fail(utlserrors.New("tls: private key does not match public key").AtError())
 		}
 	case *ecdsa.PublicKey:
 		priv, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
 		if !ok {
-			return fail(errors.New("tls: private key type does not match public key type"))
+			return fail(utlserrors.New("tls: private key type does not match public key type").AtError())
 		}
 		if pub.X.Cmp(priv.X) != 0 || pub.Y.Cmp(priv.Y) != 0 {
-			return fail(errors.New("tls: private key does not match public key"))
+			return fail(utlserrors.New("tls: private key does not match public key").AtError())
 		}
 	case ed25519.PublicKey:
 		priv, ok := cert.PrivateKey.(ed25519.PrivateKey)
 		if !ok {
-			return fail(errors.New("tls: private key type does not match public key type"))
+			return fail(utlserrors.New("tls: private key type does not match public key type").AtError())
 		}
 		if !bytes.Equal(priv.Public().(ed25519.PublicKey), pub) {
-			return fail(errors.New("tls: private key does not match public key"))
+			return fail(utlserrors.New("tls: private key does not match public key").AtError())
 		}
 	default:
-		return fail(errors.New("tls: unknown public key algorithm"))
+		return fail(utlserrors.New("tls: unknown public key algorithm").AtError())
 	}
 
 	return cert, nil
@@ -359,12 +396,12 @@ func parsePrivateKey(der []byte) (crypto.PrivateKey, error) {
 		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
 			return key, nil
 		default:
-			return nil, errors.New("tls: found unknown private key type in PKCS#8 wrapping")
+			return nil, utlserrors.New("tls: found unknown private key type in PKCS#8 wrapping").AtError()
 		}
 	}
 	if key, err := x509.ParseECPrivateKey(der); err == nil {
 		return key, nil
 	}
 
-	return nil, errors.New("tls: failed to parse private key")
+	return nil, utlserrors.New("tls: failed to parse private key").AtError()
 }

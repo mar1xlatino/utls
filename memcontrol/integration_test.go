@@ -959,7 +959,9 @@ func TestConcurrentFullSystem(t *testing.T) {
 
 	// Periodic memory pressure trigger
 	done := make(chan struct{})
+	monitorDone := make(chan struct{})
 	go func() {
+		defer close(monitorDone)
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -982,6 +984,7 @@ func TestConcurrentFullSystem(t *testing.T) {
 	// Wait for all workers
 	wg.Wait()
 	close(done)
+	<-monitorDone // Wait for monitor goroutine to exit
 
 	// Report results
 	t.Logf("Concurrent test complete:")

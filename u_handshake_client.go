@@ -9,15 +9,65 @@ import (
 	"compress/zlib"
 	"context"
 	"errors"
-	"fmt"
 	"io"
+	"net"
+	"strings"
+	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/fips140tls"
 	"github.com/refraction-networking/utls/internal/hpke"
 	"github.com/refraction-networking/utls/internal/tls13"
 )
+
+// uconnClassifyAndCallErrorHook examines the error type and calls the appropriate
+// error-specific observability hook. This provides fine-grained error tracking
+// for timeout, network, and cryptographic errors during UConn TLS handshakes.
+func uconnClassifyAndCallErrorHook(remoteAddr string, err error) {
+	if err == nil {
+		return
+	}
+
+	// Check for context-related errors (timeout/cancellation)
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		callOnTimeoutError(remoteAddr)
+		return
+	}
+
+	// Check if error wraps a context error
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		if unwrapped == context.DeadlineExceeded || unwrapped == context.Canceled {
+			callOnTimeoutError(remoteAddr)
+			return
+		}
+	}
+
+	// Check for network errors (implements net.Error interface)
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			callOnTimeoutError(remoteAddr)
+		} else {
+			callOnNetworkError(remoteAddr, err)
+		}
+		return
+	}
+
+	// All TLS/crypto-related errors (errors starting with "tls:" or alert errors)
+	errStr := err.Error()
+	if strings.HasPrefix(errStr, "tls:") || strings.Contains(errStr, "alert") ||
+		strings.Contains(errStr, "certificate") || strings.Contains(errStr, "cipher") ||
+		strings.Contains(errStr, "handshake") || strings.Contains(errStr, "decrypt") ||
+		strings.Contains(errStr, "signature") || strings.Contains(errStr, "verify") {
+		callOnCryptoError(remoteAddr, err)
+		return
+	}
+
+	// For any other error, treat as network error (conservative default)
+	callOnNetworkError(remoteAddr, err)
+}
 
 // This function is called by (*clientHandshakeStateTLS13).readServerCertificate()
 // to retrieve the certificate out of a message read by (*Conn).readHandshake()
@@ -34,7 +84,7 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerCertificate(msg any) (process
 					}
 					msg, err = hs.decompressCert(*compressedCertMsg)
 					if err != nil {
-						return nil, fmt.Errorf("tls: failed to decompress certificate message: %w", err)
+						return nil, utlserrors.New("tls: failed to decompress certificate message").Base(err).AtError()
 					} else {
 						return msg, nil
 					}
@@ -64,7 +114,7 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 	}
 	if !supportedAlg {
 		c.sendAlert(alertBadCertificate)
-		return nil, fmt.Errorf("unadvertised algorithm (%d)", m.algorithm)
+		return nil, utlserrors.New("tls: server used unadvertised compression algorithm: ", m.algorithm).AtError()
 	}
 
 	switch CertCompressionAlgo(m.algorithm) {
@@ -75,7 +125,7 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		rc, err := zlib.NewReader(compressed)
 		if err != nil {
 			c.sendAlert(alertBadCertificate)
-			return nil, fmt.Errorf("failed to open zlib reader: %w", err)
+			return nil, utlserrors.New("tls: failed to open zlib reader").Base(err).AtError()
 		}
 		defer rc.Close()
 		decompressed = rc
@@ -84,14 +134,14 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 		rc, err := zstd.NewReader(compressed)
 		if err != nil {
 			c.sendAlert(alertBadCertificate)
-			return nil, fmt.Errorf("failed to open zstd reader: %w", err)
+			return nil, utlserrors.New("tls: failed to open zstd reader").Base(err).AtError()
 		}
 		defer rc.Close()
 		decompressed = rc
 
 	default:
 		c.sendAlert(alertBadCertificate)
-		return nil, fmt.Errorf("unsupported algorithm (%d)", m.algorithm)
+		return nil, utlserrors.New("tls: unsupported compression algorithm: ", m.algorithm).AtError()
 	}
 
 	// RFC 8879: uncompressed_length is uint24, max 16MB. We use a reasonable limit to prevent DoS.
@@ -99,12 +149,11 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 	const maxDecompressedCertSize = 1 << 24 // 16MB per RFC 8879
 	if m.uncompressedLength > maxDecompressedCertSize {
 		c.sendAlert(alertBadCertificate)
-		return nil, fmt.Errorf("compressed certificate uncompressed length %d exceeds maximum %d",
-			m.uncompressedLength, maxDecompressedCertSize)
+		return nil, utlserrors.New("tls: compressed certificate uncompressed length ", m.uncompressedLength, " exceeds maximum ", maxDecompressedCertSize).AtError()
 	}
 	if m.uncompressedLength == 0 {
 		c.sendAlert(alertBadCertificate)
-		return nil, fmt.Errorf("compressed certificate has zero uncompressed length")
+		return nil, utlserrors.New("tls: compressed certificate has zero uncompressed length").AtError()
 	}
 
 	rawMsg := make([]byte, m.uncompressedLength+4) // +4 for message type and uint24 length field
@@ -122,7 +171,7 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 			// If, after decompression, the specified length does not match the actual length,
 			// the party receiving the invalid message MUST abort the connection with the
 			// "bad_certificate" alert. https://datatracker.ietf.org/doc/html/rfc8879#section-4
-			return nil, fmt.Errorf("decompressed len (%d) does not match specified len (%d)", n, m.uncompressedLength)
+			return nil, utlserrors.New("tls: decompressed len ", n, " does not match specified len ", m.uncompressedLength).AtError()
 		}
 		return nil, err
 	}
@@ -134,7 +183,7 @@ func (hs *clientHandshakeStateTLS13) decompressCert(m utlsCompressedCertificateM
 	extraByte := make([]byte, 1)
 	if extraN, _ := decompressed.Read(extraByte); extraN > 0 {
 		c.sendAlert(alertBadCertificate)
-		return nil, errors.New("tls: decompressed certificate data exceeds declared uncompressed_length")
+		return nil, utlserrors.New("tls: decompressed certificate data exceeds declared uncompressed_length").AtError()
 	}
 
 	certMsg := new(certificateMsgTLS13)
@@ -173,10 +222,10 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 
 	if hs.c.utls.applicationSettingsCodepoint != 0 {
 		if hs.uconn.vers < VersionTLS13 {
-			return errors.New("tls: server sent application settings at invalid version")
+			return utlserrors.New("tls: server sent application settings at invalid version").AtError()
 		}
 		if len(hs.uconn.clientProtocol) == 0 {
-			return errors.New("tls: server sent application settings without ALPN")
+			return utlserrors.New("tls: server sent application settings without ALPN").AtError()
 		}
 
 		// Check if the ALPN selected by the server exists in the client's list.
@@ -194,7 +243,7 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 	// an "illegal_parameter" alert.
 	if encryptedExtensions.utls.hasMaxFragmentLength && encryptedExtensions.utls.recordSizeLimit > 0 {
 		hs.c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: server sent both max_fragment_length and record_size_limit extensions")
+		return utlserrors.New("tls: server sent both max_fragment_length and record_size_limit extensions").AtError()
 	}
 
 	// RFC 8449: Process record_size_limit from server's EncryptedExtensions.
@@ -211,7 +260,7 @@ func (hs *clientHandshakeStateTLS13) utlsReadServerParameters(encryptedExtension
 		serverLimit := encryptedExtensions.utls.recordSizeLimit
 		if serverLimit > maxLimit {
 			hs.c.sendAlert(alertIllegalParameter)
-			return fmt.Errorf("tls: server record_size_limit %d exceeds maximum %d for negotiated version", serverLimit, maxLimit)
+			return utlserrors.New("tls: server record_size_limit ", serverLimit, " exceeds maximum ", maxLimit, " for negotiated version").AtError()
 		}
 
 		// Verify we actually advertised record_size_limit extension
@@ -248,25 +297,25 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 	// must be true to skip verification entirely. InsecureServerNameToVerify is also
 	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
 	if len(config.ServerName) == 0 && !config.InsecureSkipVerify && len(config.InsecureServerNameToVerify) == 0 {
-		return nil, nil, nil, errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
+		return nil, nil, nil, utlserrors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true").AtError()
 	}
 	// [UTLS SECTION END]
 
 	nextProtosLength := 0
 	for _, proto := range config.NextProtos {
 		if l := len(proto); l == 0 || l > 255 {
-			return nil, nil, nil, errors.New("tls: invalid NextProtos value")
+			return nil, nil, nil, utlserrors.New("tls: invalid NextProtos value").AtError()
 		} else {
 			nextProtosLength += 1 + l
 		}
 	}
 	if nextProtosLength > 0xffff {
-		return nil, nil, nil, errors.New("tls: NextProtos values too large")
+		return nil, nil, nil, utlserrors.New("tls: NextProtos values too large").AtError()
 	}
 
 	supportedVersions := config.supportedVersions(roleClient)
 	if len(supportedVersions) == 0 {
-		return nil, nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
+		return nil, nil, nil, utlserrors.New("tls: no supported versions satisfy MinVersion and MaxVersion").AtError()
 	}
 	maxVersion := config.maxSupportedVersion(roleClient)
 
@@ -318,7 +367,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 
 	_, err := io.ReadFull(config.rand(), hello.random)
 	if err != nil {
-		return nil, nil, nil, errors.New("tls: short read from Rand: " + err.Error())
+		return nil, nil, nil, utlserrors.New("tls: short read from Rand").Base(err).AtError()
 	}
 
 	// A random session ID is used to detect when the server accepted a ticket
@@ -329,7 +378,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 	if c.quic == nil {
 		hello.sessionId = make([]byte, 32)
 		if _, err := io.ReadFull(config.rand(), hello.sessionId); err != nil {
-			return nil, nil, nil, errors.New("tls: short read from Rand: " + err.Error())
+			return nil, nil, nil, utlserrors.New("tls: short read from Rand for session ID").Base(err).AtError()
 		}
 	}
 
@@ -355,7 +404,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 		}
 
 		if len(hello.supportedCurves) == 0 {
-			return nil, nil, nil, errors.New("tls: no supported elliptic curves for ECDHE")
+			return nil, nil, nil, utlserrors.New("tls: no supported elliptic curves for ECDHE").AtError()
 		}
 		// curveID := hello.supportedCurves[0]
 		// keyShareKeys = &keySharePrivateKeys{curveID: curveID}
@@ -412,10 +461,10 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 	var ech *echClientContext
 	if c.config.EncryptedClientHelloConfigList != nil {
 		if c.config.MinVersion != 0 && c.config.MinVersion < VersionTLS13 {
-			return nil, nil, nil, errors.New("tls: MinVersion must be >= VersionTLS13 if EncryptedClientHelloConfigList is populated")
+			return nil, nil, nil, utlserrors.New("tls: MinVersion must be >= VersionTLS13 if EncryptedClientHelloConfigList is populated").AtError()
 		}
 		if c.config.MaxVersion != 0 && c.config.MaxVersion <= VersionTLS12 {
-			return nil, nil, nil, errors.New("tls: MaxVersion must be >= VersionTLS13 if EncryptedClientHelloConfigList is populated")
+			return nil, nil, nil, utlserrors.New("tls: MaxVersion must be >= VersionTLS13 if EncryptedClientHelloConfigList is populated").AtError()
 		}
 		echConfigs, err := parseECHConfigList(c.config.EncryptedClientHelloConfigList)
 		if err != nil {
@@ -423,7 +472,7 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 		}
 		echConfig := pickECHConfig(echConfigs)
 		if echConfig == nil {
-			return nil, nil, nil, errors.New("tls: EncryptedClientHelloConfigList contains no valid configs")
+			return nil, nil, nil, utlserrors.New("tls: EncryptedClientHelloConfigList contains no valid configs").AtError()
 		}
 		ech = &echClientContext{config: echConfig}
 		hello.encryptedClientHello = []byte{1} // indicate inner hello
@@ -457,6 +506,37 @@ func (c *Conn) makeClientHelloForApplyPreset() (*clientHelloMsg, *keySharePrivat
 // clientHandshakeWithOneState checks that exactly one expected state is set (1.2 or 1.3)
 // and performs client TLS handshake with that state
 func (c *UConn) clientHandshake(ctx context.Context) (err error) {
+	// Wire up observability hooks for handshake lifecycle monitoring.
+	// Get remote address early - it may not be available if connection fails.
+	var remoteAddr string
+	if c.conn != nil {
+		if addr := c.conn.RemoteAddr(); addr != nil {
+			remoteAddr = addr.String()
+		}
+	}
+	if remoteAddr == "" {
+		remoteAddr = "unknown"
+	}
+
+	// Signal handshake start and track timing for duration measurement.
+	callOnHandshakeStart(remoteAddr)
+	startTime := time.Now()
+
+	// Defer hook calls for success/failure based on outcome.
+	defer func() {
+		if err != nil {
+			callOnHandshakeFailure(remoteAddr, err.Error())
+			// Classify error and call appropriate error-specific hooks
+			uconnClassifyAndCallErrorHook(remoteAddr, err)
+		} else {
+			callOnHandshakeSuccess(remoteAddr, time.Since(startTime))
+		}
+	}()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "UConn clientHandshake: starting uTLS handshake for ", c.config.ServerName)
+	}
+
 	// [uTLS section begins]
 	hello := c.HandshakeState.Hello.getPrivatePtr()
 	ech := c.echCtx.Load()
@@ -484,20 +564,20 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// must be true to skip verification entirely. InsecureServerNameToVerify is also
 	// accepted as an alternative for advanced use cases (e.g., fingerprint spoofing).
 	if len(c.config.ServerName) == 0 && !c.config.InsecureSkipVerify && len(c.config.InsecureServerNameToVerify) == 0 {
-		return errors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true")
+		return utlserrors.New("tls: either Config.ServerName must be set or Config.InsecureSkipVerify must be true").AtError()
 	}
 
 	nextProtosLength := 0
 	for _, proto := range c.config.NextProtos {
 		if l := len(proto); l == 0 || l > 255 {
-			return errors.New("tls: invalid NextProtos value")
+			return utlserrors.New("tls: invalid NextProtos value").AtError()
 		} else {
 			nextProtosLength += 1 + l
 		}
 	}
 
 	if nextProtosLength > 0xffff {
-		return errors.New("tls: NextProtos values too large")
+		return utlserrors.New("tls: NextProtos values too large").AtError()
 	}
 
 	if c.handshakes > 0 {
@@ -521,7 +601,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		if c.HandshakeState.State13.EarlySecret != nil && session != nil {
 			cipherSuite := cipherSuiteTLS13ByID(session.cipherSuite)
 			if cipherSuite == nil {
-				return errors.New("tls: unknown cipher suite for session resumption")
+				return utlserrors.New("tls: unknown cipher suite for session resumption").AtError()
 			}
 			var esErr error
 			earlySecret, esErr = tls13.NewEarlySecretFromSecret(cipherSuite.hash.New, c.HandshakeState.State13.EarlySecret)
@@ -563,7 +643,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		hello.random = make([]byte, 32)
 		_, err = io.ReadFull(c.config.rand(), hello.random)
 		if err != nil {
-			return errors.New("tls: short read from Rand: " + err.Error())
+			return utlserrors.New("tls: short read from Rand for ECH outer hello").Base(err).AtError()
 		}
 
 		// NOTE: we don't do PSK GREASE, in line with boringssl, it's meant to
@@ -704,7 +784,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
 		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
 		c.sendAlert(alertIllegalParameter)
-		return errors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
+		return utlserrors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox").AtError()
 	}
 
 	// uTLS: do not create new handshakeState, use existing one
@@ -717,7 +797,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		if c.HandshakeState.State13.EarlySecret != nil && session.cipherSuite != 0 {
 			suite := cipherSuiteTLS13ByID(session.cipherSuite)
 			if suite == nil {
-				return errors.New("tls: unknown cipher suite for early secret session resumption")
+				return utlserrors.New("tls: unknown cipher suite for early secret session resumption").AtError()
 			}
 			var esErr error
 			hs13.earlySecret, esErr = tls13.NewEarlySecretFromSecret(suite.hash.New, c.HandshakeState.State13.EarlySecret)
@@ -728,7 +808,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		if c.HandshakeState.MasterSecret != nil && session.cipherSuite != 0 {
 			suite := cipherSuiteTLS13ByID(session.cipherSuite)
 			if suite == nil {
-				return errors.New("tls: unknown cipher suite for master secret session resumption")
+				return utlserrors.New("tls: unknown cipher suite for master secret session resumption").AtError()
 			}
 			var msErr error
 			hs13.masterSecret, msErr = tls13.NewMasterSecretFromSecret(suite.hash.New, c.HandshakeState.MasterSecret)

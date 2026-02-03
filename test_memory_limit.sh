@@ -14,6 +14,7 @@ FUZZ_TIME="${FUZZ_TIME:-10s}"
 PER_TEST="${PER_TEST:-0}"  # 0=per-package (fast), 1=per-test (slow but granular)
 DRILL_DOWN="${DRILL_DOWN:-1}"  # 1=re-run failed packages per-test for details
 SAVE_LOGS="${SAVE_LOGS:-1}"  # 1=save verbose output for each test to files
+DEBUG="${DEBUG:-1}"  # 1=build with -tags=debug for verbose debug logging
 PACKAGE_FILTER="${1:-./...}"
 
 # Colors
@@ -53,6 +54,7 @@ echo -e "${CYAN}═════════════════════�
 echo -e "  Memory Limit: ${YELLOW}${MEM_LIMIT}${NC}"
 echo -e "  Timeout:      ${TIMEOUT}"
 echo -e "  Race:         $([ "$RACE" = "1" ] && echo "${GREEN}enabled${NC}" || echo "disabled")"
+echo -e "  Debug:        $([ "$DEBUG" = "1" ] && echo "${GREEN}enabled (-tags=debug)${NC}" || echo "disabled")"
 echo -e "  Fuzz:         $([ "$FUZZ" = "1" ] && echo "${GREEN}enabled (${FUZZ_TIME})${NC}" || echo "disabled")"
 echo -e "  Mode:         $([ "$PER_TEST" = "1" ] && echo "per-test (slow)" || echo "${GREEN}per-package (fast)${NC}")"
 echo -e "  Drill-down:   $([ "$DRILL_DOWN" = "1" ] && echo "${GREEN}enabled${NC}" || echo "disabled")"
@@ -73,6 +75,14 @@ if [ "$RACE" = "1" ]; then
     echo ""
 fi
 
+# Build debug tags flag
+DEBUG_FLAG=""
+if [ "$DEBUG" = "1" ]; then
+    DEBUG_FLAG="-tags=debug"
+    echo -e "${GREEN}DEBUG: Building with -tags=debug for verbose logging${NC}"
+    echo ""
+fi
+
 if [ "$FUZZ" = "1" ]; then
     echo -e "${YELLOW}NOTE: Fuzz tests run with -fuzztime=${FUZZ_TIME}${NC}"
     echo ""
@@ -80,7 +90,7 @@ fi
 
 # Get all packages with tests (internal or external test files)
 echo -e "${CYAN}Discovering packages...${NC}"
-PACKAGES=$(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' $PACKAGE_FILTER 2>/dev/null | sort)
+PACKAGES=$(go list $DEBUG_FLAG -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' $PACKAGE_FILTER 2>/dev/null | sort)
 PKG_COUNT=$(echo "$PACKAGES" | wc -l)
 echo -e "Found ${GREEN}${PKG_COUNT}${NC} packages with tests"
 echo ""
@@ -95,11 +105,11 @@ for PKG in $PACKAGES; do
     PKG_START=$(date +%s)
 
     # Get test count for display
-    TEST_COUNT=$(go test -list 'Test.*' "$PKG" 2>/dev/null | grep -cE '^Test')
+    TEST_COUNT=$(go test $DEBUG_FLAG -list 'Test.*' "$PKG" 2>/dev/null | grep -cE '^Test')
     TEST_COUNT=${TEST_COUNT:-0}
     FUZZ_COUNT=0
     if [ "$FUZZ" = "1" ]; then
-        FUZZ_COUNT=$(go test -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -cE '^Fuzz')
+        FUZZ_COUNT=$(go test $DEBUG_FLAG -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -cE '^Fuzz')
         FUZZ_COUNT=${FUZZ_COUNT:-0}
     fi
 
@@ -117,7 +127,7 @@ for PKG in $PACKAGES; do
     if [ "$PER_TEST" = "1" ]; then
         # === PER-TEST MODE (slow but granular) ===
         echo ""  # newline before dots
-        TESTS=$(go test -list 'Test.*' "$PKG" 2>/dev/null | grep -E '^Test' | sort)
+        TESTS=$(go test $DEBUG_FLAG -list 'Test.*' "$PKG" 2>/dev/null | grep -E '^Test' | sort)
 
         # Create package subdirectory for logs
         PKG_LOG_DIR=""
@@ -138,7 +148,7 @@ for PKG in $PACKAGES; do
             fi
 
             OUTPUT=$(systemd-run --user --scope -p MemoryMax="$MEM_LIMIT" --quiet \
-                go test $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -run "^${TEST}$" "$PKG" 2>&1)
+                go test $DEBUG_FLAG $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -run "^${TEST}$" "$PKG" 2>&1)
             EXIT_CODE=$?
             TEST_END=$(date +%s%3N)
             TEST_MS=$((TEST_END - TEST_START))
@@ -186,7 +196,7 @@ for PKG in $PACKAGES; do
 
         # Fuzz tests per-test
         if [ "$FUZZ" = "1" ]; then
-            FUZZ_TESTS=$(go test -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -E '^Fuzz' | sort)
+            FUZZ_TESTS=$(go test $DEBUG_FLAG -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -E '^Fuzz' | sort)
             for FTEST in $FUZZ_TESTS; do
                 [ -z "$FTEST" ] && continue
                 echo -n "  ${FTEST}: "
@@ -198,7 +208,7 @@ for PKG in $PACKAGES; do
                 fi
 
                 OUTPUT=$(systemd-run --user --scope -p MemoryMax="$MEM_LIMIT" --quiet \
-                    go test $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -fuzz "^${FTEST}$" -fuzztime "$FUZZ_TIME" "$PKG" 2>&1)
+                    go test $DEBUG_FLAG $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -fuzz "^${FTEST}$" -fuzztime "$FUZZ_TIME" "$PKG" 2>&1)
                 EXIT_CODE=$?
                 TEST_END=$(date +%s%3N)
                 TEST_MS=$((TEST_END - TEST_START))
@@ -262,7 +272,7 @@ for PKG in $PACKAGES; do
 
         PKG_TEST_START=$(date +%s%3N)
         OUTPUT=$(systemd-run --user --scope -p MemoryMax="$MEM_LIMIT" --quiet \
-            go test $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" "$PKG" 2>&1)
+            go test $DEBUG_FLAG $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" "$PKG" 2>&1)
         EXIT_CODE=$?
         PKG_TEST_END=$(date +%s%3N)
         PKG_TEST_MS=$((PKG_TEST_END - PKG_TEST_START))
@@ -321,7 +331,7 @@ for PKG in $PACKAGES; do
 
         # Fuzz tests per-package
         if [ "$FUZZ" = "1" ] && [ "$FUZZ_COUNT" -gt 0 ]; then
-            FUZZ_TESTS=$(go test -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -E '^Fuzz' | sort)
+            FUZZ_TESTS=$(go test $DEBUG_FLAG -list 'Fuzz.*' "$PKG" 2>/dev/null | grep -E '^Fuzz' | sort)
             for FTEST in $FUZZ_TESTS; do
                 [ -z "$FTEST" ] && continue
                 FUZZ_START=$(date +%s%3N)
@@ -332,7 +342,7 @@ for PKG in $PACKAGES; do
                 fi
 
                 OUTPUT=$(systemd-run --user --scope -p MemoryMax="$MEM_LIMIT" --quiet \
-                    go test $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -fuzz "^${FTEST}$" -fuzztime "$FUZZ_TIME" "$PKG" 2>&1)
+                    go test $DEBUG_FLAG $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -fuzz "^${FTEST}$" -fuzztime "$FUZZ_TIME" "$PKG" 2>&1)
                 EXIT_CODE=$?
                 FUZZ_END=$(date +%s%3N)
                 FUZZ_MS=$((FUZZ_END - FUZZ_START))
@@ -441,7 +451,7 @@ if [ "$DRILL_DOWN" = "1" ] && [ "$PER_TEST" = "0" ]; then
 
         for PKG in $PROBLEM_PKGS; do
             PKG_SHORT=$(echo "$PKG" | sed 's|github.com/xtls/xray-core/||')
-            TESTS=$(go test -list 'Test.*' "$PKG" 2>/dev/null | grep -E '^Test' | sort)
+            TESTS=$(go test $DEBUG_FLAG -list 'Test.*' "$PKG" 2>/dev/null | grep -E '^Test' | sort)
             TEST_COUNT=$(echo "$TESTS" | grep -c . || echo 0)
 
             echo -e "${CYAN}Package: ${PKG_SHORT}${NC} (${TEST_COUNT} tests)"
@@ -464,7 +474,7 @@ if [ "$DRILL_DOWN" = "1" ] && [ "$PER_TEST" = "0" ]; then
                 fi
 
                 OUTPUT=$(systemd-run --user --scope -p MemoryMax="$MEM_LIMIT" --quiet \
-                    go test $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -run "^${TEST}$" "$PKG" 2>&1)
+                    go test $DEBUG_FLAG $RACE_FLAG $VERBOSE_FLAG -timeout "$TIMEOUT" -run "^${TEST}$" "$PKG" 2>&1)
                 EXIT_CODE=$?
                 TEST_END=$(date +%s%3N)
                 TEST_MS=$((TEST_END - TEST_START))

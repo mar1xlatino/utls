@@ -5,19 +5,21 @@
 package tls
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/cryptobyte"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // TransportProtocol represents the transport layer protocol for JA4 fingerprinting.
@@ -65,7 +67,7 @@ type clientHelloData struct {
 // Raw bytes must include handshake header (type + length).
 func parseClientHelloData(raw []byte) (*clientHelloData, error) {
 	if len(raw) < 5 {
-		return nil, errors.New("tls: ClientHello too short")
+		return nil, utlserrors.New("tls: ClientHello too short, len=", len(raw)).AtError()
 	}
 
 	data := &clientHelloData{}
@@ -73,34 +75,34 @@ func parseClientHelloData(raw []byte) (*clientHelloData, error) {
 
 	// Skip handshake type (1) and length (3)
 	if !s.Skip(4) {
-		return nil, errors.New("tls: failed to skip handshake header")
+		return nil, utlserrors.New("tls: failed to skip handshake header").AtError()
 	}
 
 	// Version (2 bytes)
 	if !s.ReadUint16(&data.version) {
-		return nil, errors.New("tls: failed to read version")
+		return nil, utlserrors.New("tls: failed to read version").AtError()
 	}
 
 	// Random (32 bytes)
 	if !s.Skip(32) {
-		return nil, errors.New("tls: failed to skip random")
+		return nil, utlserrors.New("tls: failed to skip random").AtError()
 	}
 
 	// Session ID (variable)
 	var sessionID cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&sessionID) {
-		return nil, errors.New("tls: failed to read session ID")
+		return nil, utlserrors.New("tls: failed to read session ID").AtError()
 	}
 
 	// Cipher suites
 	var cipherBytes cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&cipherBytes) {
-		return nil, errors.New("tls: failed to read cipher suites")
+		return nil, utlserrors.New("tls: failed to read cipher suites").AtError()
 	}
 	for !cipherBytes.Empty() {
 		var cipher uint16
 		if !cipherBytes.ReadUint16(&cipher) {
-			return nil, errors.New("tls: failed to parse cipher suite")
+			return nil, utlserrors.New("tls: failed to parse cipher suite").AtError()
 		}
 		if !isGREASEUint16(cipher) {
 			data.cipherSuites = append(data.cipherSuites, cipher)
@@ -110,7 +112,7 @@ func parseClientHelloData(raw []byte) (*clientHelloData, error) {
 	// Compression methods
 	var compression cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&compression) {
-		return nil, errors.New("tls: failed to read compression methods")
+		return nil, utlserrors.New("tls: failed to read compression methods").AtError()
 	}
 
 	// Extensions (optional)
@@ -120,14 +122,14 @@ func parseClientHelloData(raw []byte) (*clientHelloData, error) {
 
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: failed to read extensions")
+		return nil, utlserrors.New("tls: failed to read extensions").AtError()
 	}
 
 	for !extensions.Empty() {
 		var extType uint16
 		var extData cryptobyte.String
 		if !extensions.ReadUint16(&extType) || !extensions.ReadUint16LengthPrefixed(&extData) {
-			return nil, errors.New("tls: failed to parse extension")
+			return nil, utlserrors.New("tls: failed to parse extension").AtError()
 		}
 
 		if isGREASEUint16(extType) {
@@ -219,6 +221,12 @@ func CalculateFingerprintsForQUIC(raw []byte) (*TLSFingerprint, error) {
 // Use TransportQUIC ("q") for QUIC connections.
 // Use TransportDTLS ("d") for DTLS connections.
 func CalculateFingerprintsWithTransport(raw []byte, transport TransportProtocol) (*TLSFingerprint, error) {
+	ctx := context.Background()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "calculating fingerprints, transport=", string(transport), ", rawLen=", len(raw))
+	}
+
 	data, err := parseClientHelloData(raw)
 	if err != nil {
 		return nil, err
@@ -228,6 +236,13 @@ func CalculateFingerprintsWithTransport(raw []byte, transport TransportProtocol)
 	data.transport = transport
 	if data.transport == "" {
 		data.transport = TransportTCP // Default to TCP
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "parsed ClientHello: version=0x", fmt.Sprintf("%04x", data.version),
+			", cipherSuites=", len(data.cipherSuites),
+			", extensions=", len(data.extensions),
+			", curves=", len(data.curves))
 	}
 
 	fp := &TLSFingerprint{}
@@ -248,6 +263,11 @@ func CalculateFingerprintsWithTransport(raw []byte, transport TransportProtocol)
 	fp.JA4r = buildJA4(ja4a, data, true, false)
 	fp.JA4o = buildJA4(ja4a, data, false, true)
 	fp.JA4ro = buildJA4(ja4a, data, false, false)
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "calculated JA3:", fp.JA3)
+		utlserrors.LogDebug(ctx, "calculated JA4:", fp.JA4)
+	}
 
 	return fp, nil
 }
@@ -483,10 +503,10 @@ func isAlphanumeric(b byte) bool {
 // Must be called after BuildHandshakeState().
 func (uconn *UConn) Fingerprint() (*TLSFingerprint, error) {
 	if uconn.HandshakeState.Hello == nil {
-		return nil, errors.New("tls: ClientHello not built; call BuildHandshakeState() first")
+		return nil, utlserrors.New("tls: ClientHello not built; call BuildHandshakeState() first").AtError()
 	}
 	if len(uconn.HandshakeState.Hello.Raw) == 0 {
-		return nil, errors.New("tls: ClientHello.Raw is empty")
+		return nil, utlserrors.New("tls: ClientHello.Raw is empty").AtError()
 	}
 	return CalculateFingerprints(uconn.HandshakeState.Hello.Raw)
 }
@@ -546,12 +566,12 @@ type serverHelloData struct {
 // Raw bytes must include handshake header (type + length).
 func parseServerHelloForJA4S(raw []byte) (*serverHelloData, error) {
 	if len(raw) < 5 {
-		return nil, errors.New("tls: ServerHello too short")
+		return nil, utlserrors.New("tls: ServerHello too short, len=", len(raw)).AtError()
 	}
 
 	// Validate handshake type is ServerHello (0x02)
 	if raw[0] != 0x02 {
-		return nil, fmt.Errorf("tls: expected ServerHello (0x02), got 0x%02x", raw[0])
+		return nil, utlserrors.New("tls: expected ServerHello (0x02), got 0x", fmt.Sprintf("%02x", raw[0])).AtError()
 	}
 
 	data := &serverHelloData{}
@@ -559,34 +579,34 @@ func parseServerHelloForJA4S(raw []byte) (*serverHelloData, error) {
 
 	// Skip handshake type (1) and length (3)
 	if !s.Skip(4) {
-		return nil, errors.New("tls: failed to skip handshake header")
+		return nil, utlserrors.New("tls: failed to skip handshake header").AtError()
 	}
 
 	// Version (2 bytes) - legacy for TLS 1.3
 	if !s.ReadUint16(&data.version) {
-		return nil, errors.New("tls: failed to read version")
+		return nil, utlserrors.New("tls: failed to read version").AtError()
 	}
 
 	// Random (32 bytes)
 	if !s.Skip(32) {
-		return nil, errors.New("tls: failed to skip random")
+		return nil, utlserrors.New("tls: failed to skip random").AtError()
 	}
 
 	// Session ID (variable)
 	var sessionID cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&sessionID) {
-		return nil, errors.New("tls: failed to read session ID")
+		return nil, utlserrors.New("tls: failed to read session ID").AtError()
 	}
 
 	// Cipher suite (2 bytes)
 	if !s.ReadUint16(&data.cipherSuite) {
-		return nil, errors.New("tls: failed to read cipher suite")
+		return nil, utlserrors.New("tls: failed to read cipher suite").AtError()
 	}
 
 	// Compression method (1 byte)
 	var compression uint8
 	if !s.ReadUint8(&compression) {
-		return nil, errors.New("tls: failed to read compression")
+		return nil, utlserrors.New("tls: failed to read compression").AtError()
 	}
 	data.compressionNone = compression == 0
 
@@ -597,14 +617,14 @@ func parseServerHelloForJA4S(raw []byte) (*serverHelloData, error) {
 
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: failed to read extensions")
+		return nil, utlserrors.New("tls: failed to read extensions").AtError()
 	}
 
 	for !extensions.Empty() {
 		var extType uint16
 		var extData cryptobyte.String
 		if !extensions.ReadUint16(&extType) || !extensions.ReadUint16LengthPrefixed(&extData) {
-			return nil, errors.New("tls: failed to parse extension")
+			return nil, utlserrors.New("tls: failed to parse extension").AtError()
 		}
 
 		if isGREASEUint16(extType) {
@@ -637,7 +657,7 @@ func parseServerHelloForJA4S(raw []byte) (*serverHelloData, error) {
 
 	// Verify no trailing data after extensions
 	if !s.Empty() {
-		return nil, errors.New("tls: ServerHello has trailing data after extensions")
+		return nil, utlserrors.New("tls: ServerHello has trailing data after extensions").AtError()
 	}
 
 	return data, nil
@@ -656,9 +676,21 @@ func CalculateJA4SForQUIC(raw []byte) (*ServerHelloFingerprint, error) {
 
 // CalculateJA4SWithTransport computes JA4S fingerprint with explicit transport.
 func CalculateJA4SWithTransport(raw []byte, transport TransportProtocol) (*ServerHelloFingerprint, error) {
+	ctx := context.Background()
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "calculating JA4S, transport=", string(transport), ", rawLen=", len(raw))
+	}
+
 	data, err := parseServerHelloForJA4S(raw)
 	if err != nil {
 		return nil, err
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "parsed ServerHello: version=0x", fmt.Sprintf("%04x", data.version),
+			", cipherSuite=0x", fmt.Sprintf("%04x", data.cipherSuite),
+			", extensions=", len(data.extensions))
 	}
 
 	fp := &ServerHelloFingerprint{}
@@ -744,6 +776,10 @@ func CalculateJA4SWithTransport(raw []byte, transport TransportProtocol) (*Serve
 
 	fp.JA4S = fmt.Sprintf("%s_%s_%s", ja4sA, ja4sB, ja4sC)
 	fp.JA4Sr = fmt.Sprintf("%s_%s_%s", ja4sA, ja4sB, extHex)
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "calculated JA4S:", fp.JA4S)
+	}
 
 	return fp, nil
 }
@@ -971,13 +1007,13 @@ func (uconn *UConn) ServerJA4S() (string, error) {
 func (uconn *UConn) ServerJA4SFull() (*ServerHelloFingerprint, error) {
 	state := uconn.ConnectionState()
 	if !state.HandshakeComplete {
-		return nil, errors.New("tls: handshake not complete")
+		return nil, utlserrors.New("tls: handshake not complete").AtError()
 	}
 
 	// Use thread-safe getter which returns a copy
 	rawServerHello := uconn.RawServerHello()
 	if len(rawServerHello) == 0 {
-		return nil, errors.New("tls: ServerHello raw bytes not captured")
+		return nil, utlserrors.New("tls: ServerHello raw bytes not captured").AtError()
 	}
 
 	return CalculateJA4S(rawServerHello)
@@ -998,11 +1034,11 @@ func (uconn *UConn) ClearRawServerHello() {
 func (uconn *UConn) CertificateJA4X() ([]*CertificateFingerprint, error) {
 	state := uconn.ConnectionState()
 	if !state.HandshakeComplete {
-		return nil, errors.New("tls: handshake not complete")
+		return nil, utlserrors.New("tls: handshake not complete").AtError()
 	}
 
 	if len(state.PeerCertificates) == 0 {
-		return nil, errors.New("tls: no peer certificates")
+		return nil, utlserrors.New("tls: no peer certificates").AtError()
 	}
 
 	var fps []*CertificateFingerprint
@@ -1019,6 +1055,12 @@ func (uconn *UConn) LeafCertificateJA4X() (*CertificateFingerprint, error) {
 	fps, err := uconn.CertificateJA4X()
 	if err != nil {
 		return nil, err
+	}
+	// Defensive check: ensure slice is not empty before accessing first element.
+	// CertificateJA4X returns error when PeerCertificates is empty, but this
+	// guard prevents potential nil panic if invariant is violated.
+	if len(fps) == 0 {
+		return nil, utlserrors.New("tls: no certificate fingerprints available").AtError()
 	}
 	return fps[0], nil
 }

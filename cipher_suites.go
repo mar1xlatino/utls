@@ -5,6 +5,7 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
@@ -19,10 +20,17 @@ import (
 	"sync"
 	_ "unsafe" // for linkname
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/boring"
 	"golang.org/x/sys/cpu"
 
 	"golang.org/x/crypto/chacha20poly1305"
+)
+
+// Ensure imports are retained for debug builds where they are used conditionally.
+var (
+	_ = utlserrors.DebugLoggingEnabled
+	_ context.Context
 )
 
 // CipherSuite is a TLS cipher suite. Note that most functions in this package
@@ -176,6 +184,9 @@ var cipherSuites = []*cipherSuite{ // TODO: replace with a map, since the order 
 // selectCipherSuite returns the first TLS 1.0–1.2 cipher suite from ids which
 // is also in supportedIDs and passes the ok filter.
 func selectCipherSuite(ids, supportedIDs []uint16, ok func(*cipherSuite) bool) *cipherSuite {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "selecting cipher suite from", len(ids), "candidates")
+	}
 	for _, id := range ids {
 		candidate := cipherSuiteByID(id)
 		if candidate == nil || !ok(candidate) {
@@ -184,9 +195,15 @@ func selectCipherSuite(ids, supportedIDs []uint16, ok func(*cipherSuite) bool) *
 
 		for _, suppID := range supportedIDs {
 			if id == suppID {
+				if utlserrors.DebugLoggingEnabled {
+					utlserrors.LogDebug(context.Background(), "selected cipher suite:", fmt.Sprintf("0x%04x", id))
+				}
 				return candidate
 			}
 		}
+	}
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "no cipher suite selected")
 	}
 	return nil
 }
@@ -559,6 +576,7 @@ func (f *xorNonceAEAD) Open(out, nonce, ciphertext, additionalData []byte) ([]by
 }
 
 func aeadAESGCM(key, noncePrefix []byte) (aead, error) {
+	utlserrors.LogDebug(context.Background(), "initializing AES-GCM cipher, keyLen:", len(key))
 	if len(noncePrefix) != noncePrefixLength {
 		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(noncePrefix), noncePrefixLength)
 	}
@@ -596,6 +614,7 @@ func aeadAESGCM(key, noncePrefix []byte) (aead, error) {
 //
 //go:linkname aeadAESGCMTLS13
 func aeadAESGCMTLS13(key, nonceMask []byte) (aead, error) {
+	utlserrors.LogDebug(context.Background(), "initializing AES-GCM-TLS13 cipher, keyLen:", len(key))
 	if len(nonceMask) != aeadNonceLength {
 		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(nonceMask), aeadNonceLength)
 	}
@@ -623,6 +642,7 @@ func aeadAESGCMTLS13(key, nonceMask []byte) (aead, error) {
 }
 
 func aeadChaCha20Poly1305(key, nonceMask []byte) (aead, error) {
+	utlserrors.LogDebug(context.Background(), "initializing ChaCha20-Poly1305 cipher, keyLen:", len(key))
 	if len(nonceMask) != aeadNonceLength {
 		return nil, fmt.Errorf("tls: internal error: wrong nonce length: got %d, want %d", len(nonceMask), aeadNonceLength)
 	}
@@ -656,26 +676,24 @@ func (c *cthWrapper) Sum(b []byte) []byte         { return c.h.ConstantTimeSum(b
 // constantTimeHashAvailable tracks whether the runtime supports ConstantTimeSum.
 // This is checked once at init time for SHA1 and SHA256.
 var (
-	sha1ConstantTimeAvailable   bool
-	sha256ConstantTimeAvailable bool
-	constantTimeHashChecked     bool
+	sha1ConstantTimeAvailable     bool
+	sha256ConstantTimeAvailable   bool
+	constantTimeHashCheckOnce     sync.Once
 )
 
 // checkConstantTimeHashSupport performs one-time detection of ConstantTimeSum support.
 // Called lazily on first use to avoid init-time panics.
+// Uses sync.Once to ensure thread-safe initialization.
 func checkConstantTimeHashSupport() {
-	if constantTimeHashChecked {
-		return
-	}
-	constantTimeHashChecked = true
+	constantTimeHashCheckOnce.Do(func() {
+		// Check SHA1 support
+		testSHA1 := sha1.New()
+		_, sha1ConstantTimeAvailable = testSHA1.(constantTimeHash)
 
-	// Check SHA1 support
-	testSHA1 := sha1.New()
-	_, sha1ConstantTimeAvailable = testSHA1.(constantTimeHash)
-
-	// Check SHA256 support
-	testSHA256 := sha256.New()
-	_, sha256ConstantTimeAvailable = testSHA256.(constantTimeHash)
+		// Check SHA256 support
+		testSHA256 := sha256.New()
+		_, sha256ConstantTimeAvailable = testSHA256.(constantTimeHash)
+	})
 }
 
 // CBCConstantTimeAvailable returns whether constant-time CBC MAC is available.
@@ -761,6 +779,9 @@ func ecdheRSAKA(version uint16) keyAgreement {
 func mutualCipherSuite(have []uint16, want uint16) *cipherSuite {
 	for _, id := range have {
 		if id == want {
+			if utlserrors.DebugLoggingEnabled {
+				utlserrors.LogDebug(context.Background(), "mutual cipher suite found:", fmt.Sprintf("0x%04x", id))
+			}
 			return cipherSuiteByID(id)
 		}
 	}
@@ -779,6 +800,9 @@ func cipherSuiteByID(id uint16) *cipherSuite {
 func mutualCipherSuiteTLS13(have []uint16, want uint16) *cipherSuiteTLS13 {
 	for _, id := range have {
 		if id == want {
+			if utlserrors.DebugLoggingEnabled {
+				utlserrors.LogDebug(context.Background(), "mutual TLS 1.3 cipher suite found:", fmt.Sprintf("0x%04x", id))
+			}
 			return cipherSuiteTLS13ByID(id)
 		}
 	}

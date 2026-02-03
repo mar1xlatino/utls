@@ -5,15 +5,16 @@
 package tls
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/mlkem"
-	"errors"
 	"hash"
 	"io"
 	"math/big"
 	"time"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/tls13"
 )
 
@@ -134,7 +135,11 @@ type ffdhePrivateKey struct {
 func generateFFDHEKey(rand io.Reader, group CurveID) (*ffdhePrivateKey, error) {
 	params := getFFDHEGroupParams(group)
 	if params == nil {
-		return nil, errors.New("tls: unsupported FFDHE group")
+		return nil, utlserrors.New("tls: unsupported FFDHE group").AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: FFDHE key generation: using group:", group)
 	}
 
 	// Generate private exponent with the same bit length as the prime.
@@ -145,7 +150,7 @@ func generateFFDHEKey(rand io.Reader, group CurveID) (*ffdhePrivateKey, error) {
 	// Generate random bytes with the same byte length as the prime
 	privateBytes := make([]byte, params.size)
 	if _, err := io.ReadFull(rand, privateBytes); err != nil {
-		return nil, err
+		return nil, utlserrors.New("tls: failed to generate FFDHE private key").Base(err).AtError()
 	}
 
 	// Convert to big.Int and reduce modulo (p-2) to get range [0, p-3]
@@ -157,6 +162,10 @@ func generateFFDHEKey(rand io.Reader, group CurveID) (*ffdhePrivateKey, error) {
 	// Compute public value: g^private mod p
 	// All RFC 7919 groups use g=2
 	public := new(big.Int).Exp(ffdheGenerator, private, p)
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: FFDHE key generation: key pair generated")
+	}
 
 	return &ffdhePrivateKey{
 		group:   group,
@@ -193,7 +202,7 @@ func (k *ffdhePrivateKey) PublicKeyBytes() []byte {
 func (k *ffdhePrivateKey) SharedSecret(peerPublicBytes []byte) ([]byte, error) {
 	params := getFFDHEGroupParams(k.group)
 	if params == nil {
-		return nil, errors.New("tls: unsupported FFDHE group")
+		return nil, utlserrors.New("tls: unsupported FFDHE group").AtError()
 	}
 
 	// Parse peer's public key
@@ -204,15 +213,19 @@ func (k *ffdhePrivateKey) SharedSecret(peerPublicBytes []byte) ([]byte, error) {
 	// will have proper entropy.
 	p := params.p
 	if peerPublic.Cmp(big.NewInt(2)) < 0 {
-		return nil, errors.New("tls: invalid FFDHE public key (too small)")
+		return nil, utlserrors.New("tls: invalid FFDHE public key (too small)").AtError()
 	}
 	pMinus1 := new(big.Int).Sub(p, big.NewInt(1))
 	if peerPublic.Cmp(pMinus1) >= 0 {
-		return nil, errors.New("tls: invalid FFDHE public key (too large)")
+		return nil, utlserrors.New("tls: invalid FFDHE public key (too large)").AtError()
 	}
 
 	// Compute shared secret: peerPublic^private mod p
 	sharedSecret := new(big.Int).Exp(peerPublic, k.private, p)
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: FFDHE: computed shared secret")
+	}
 
 	// Return with consistent length (padded to group size)
 	secretBytes := sharedSecret.Bytes()
@@ -261,10 +274,19 @@ const (
 func generateECDHEKey(rand io.Reader, curveID CurveID) (*ecdh.PrivateKey, error) {
 	curve, ok := curveForCurveID(curveID)
 	if !ok {
-		return nil, errors.New("tls: internal error: unsupported curve")
+		return nil, utlserrors.New("tls: internal error: unsupported curve ", curveID).AtError()
 	}
 
-	return curve.GenerateKey(rand)
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "tls: generating ECDHE key for curve:", curveID)
+	}
+
+	key, err := curve.GenerateKey(rand)
+	if err != nil {
+		return nil, utlserrors.New("tls: failed to generate ECDHE key").Base(err).AtError()
+	}
+
+	return key, nil
 }
 
 func curveForCurveID(id CurveID) (ecdh.Curve, bool) {

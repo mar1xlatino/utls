@@ -5,11 +5,13 @@
 package tls
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"net"
 	"sync"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // FingerprintController orchestrates TLS fingerprint control for a connection.
@@ -95,13 +97,19 @@ func NewFingerprintControllerWithOptions(opts FingerprintControllerOptions) *Fin
 // ApplyProfile applies a fingerprint profile to a UConn by profile ID.
 // This must be called before BuildHandshakeState() or Handshake().
 func (fc *FingerprintController) ApplyProfile(uconn *UConn, profileID string) error {
+	ctx := context.Background()
+
 	if uconn == nil {
-		return errors.New("tls: cannot apply profile to nil UConn")
+		return utlserrors.New("tls: cannot apply profile to nil UConn").AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "applying fingerprint profile:", profileID)
 	}
 
 	profile, err := DefaultRegistry.Get(profileID)
 	if err != nil {
-		return fmt.Errorf("tls: unknown fingerprint profile %s: %w", profileID, err)
+		return utlserrors.New("tls: unknown fingerprint profile ", profileID).Base(err).AtError()
 	}
 
 	return fc.ApplyFingerprintProfile(uconn, profile)
@@ -109,11 +117,18 @@ func (fc *FingerprintController) ApplyProfile(uconn *UConn, profileID string) er
 
 // ApplyFingerprintProfile applies a FingerprintProfile to a UConn.
 func (fc *FingerprintController) ApplyFingerprintProfile(uconn *UConn, profile *FingerprintProfile) error {
+	ctx := context.Background()
+
 	if uconn == nil {
-		return errors.New("tls: cannot apply profile to nil UConn")
+		return utlserrors.New("tls: cannot apply profile to nil UConn").AtError()
 	}
 	if profile == nil {
-		return errors.New("tls: cannot apply nil profile")
+		return utlserrors.New("tls: cannot apply nil profile").AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "applying fingerprint profile: browser=", profile.Browser,
+			", version=", profile.Version, ", platform=", profile.Platform)
 	}
 
 	fc.mu.Lock()
@@ -124,7 +139,7 @@ func (fc *FingerprintController) ApplyFingerprintProfile(uconn *UConn, profile *
 
 	// Call hook: profile selected
 	if err := fc.hooks.CallProfileSelected(fc.profile); err != nil {
-		return fmt.Errorf("tls: profile selection hook failed: %w", err)
+		return utlserrors.New("tls: profile selection hook failed").Base(err).AtError()
 	}
 
 	// Get or create session state for consistent GREASE/extension order
@@ -138,24 +153,29 @@ func (fc *FingerprintController) ApplyFingerprintProfile(uconn *UConn, profile *
 	// Call hook: session state created/restored
 	if fc.sessionState.ConnectionCount() == 1 {
 		if err := fc.hooks.CallSessionStateCreated(fc.sessionState); err != nil {
-			return fmt.Errorf("tls: session state creation hook failed: %w", err)
+			return utlserrors.New("tls: session state creation hook failed").Base(err).AtError()
 		}
 	} else {
 		if err := fc.hooks.CallSessionStateRestored(fc.sessionState); err != nil {
-			return fmt.Errorf("tls: session state restoration hook failed: %w", err)
+			return utlserrors.New("tls: session state restoration hook failed").Base(err).AtError()
 		}
 	}
 
 	// Build ClientHelloSpec from profile
 	spec, err := fc.buildClientHelloSpec()
 	if err != nil {
-		return fmt.Errorf("tls: failed to build ClientHelloSpec: %w", err)
+		return utlserrors.New("tls: failed to build ClientHelloSpec").Base(err).AtError()
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "built ClientHelloSpec: cipherSuites=", len(spec.CipherSuites),
+			", extensions=", len(spec.Extensions))
 	}
 
 	// Apply the spec to UConn
 	// NOTE: ApplyPreset regenerates GREASE values, so we must apply frozen GREASE AFTER
 	if err := uconn.ApplyPreset(spec); err != nil {
-		return fmt.Errorf("tls: failed to apply preset: %w", err)
+		return utlserrors.New("tls: failed to apply preset").Base(err).AtError()
 	}
 
 	// Apply frozen GREASE values to UConn's greaseSeed AFTER ApplyPreset
@@ -204,12 +224,22 @@ func (fc *FingerprintController) getOrigin(uconn *UConn) string {
 // which does NOT include GREASE. We must prepend our frozen GREASE value if the profile
 // specifies GREASE should be in supported_versions.
 func (fc *FingerprintController) applyFrozenGREASE(uconn *UConn) {
+	ctx := context.Background()
+
 	if fc.sessionState == nil || fc.profile == nil || !fc.profile.ClientHello.GREASE.Enabled {
 		return
 	}
 
 	grease := fc.sessionState.FrozenGREASE
 	ch := &fc.profile.ClientHello
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "applying frozen GREASE values: cipherSuite=0x", fmt.Sprintf("%04x", grease.CipherSuite),
+			", supportedGroup=0x", fmt.Sprintf("%04x", grease.SupportedGroup),
+			", ext1=0x", fmt.Sprintf("%04x", grease.Extension1),
+			", ext2=0x", fmt.Sprintf("%04x", grease.Extension2),
+			", version=0x", fmt.Sprintf("%04x", grease.SupportedVersion))
+	}
 
 	// Set greaseSeed to our frozen values
 	// Note: greaseSeed stores values that GetBoringGREASEValue transforms
@@ -364,7 +394,7 @@ func (fc *FingerprintController) applyFrozenGREASE(uconn *UConn) {
 // buildClientHelloSpec builds a ClientHelloSpec from the profile.
 func (fc *FingerprintController) buildClientHelloSpec() (*ClientHelloSpec, error) {
 	if fc.profile == nil {
-		return nil, errors.New("tls: no profile set")
+		return nil, utlserrors.New("tls: no profile set").AtError()
 	}
 
 	ch := &fc.profile.ClientHello
@@ -438,8 +468,10 @@ func (fc *FingerprintController) buildExtensions() ([]TLSExtension, error) {
 // This is used when profile specifies extension ORDER but not explicit extension data.
 // Extension data is generated from profile fields (SupportedGroups, ALPNProtocols, etc.)
 func (fc *FingerprintController) buildExtensionsFromOrder() ([]TLSExtension, error) {
+	ctx := context.Background()
+
 	if fc.profile == nil {
-		return nil, errors.New("tls: profile not set")
+		return nil, utlserrors.New("tls: profile not set").AtError()
 	}
 	ch := &fc.profile.ClientHello
 	var extensions []TLSExtension
@@ -449,13 +481,19 @@ func (fc *FingerprintController) buildExtensionsFromOrder() ([]TLSExtension, err
 	var extOrder []uint16
 	if fc.sessionState != nil && len(fc.sessionState.FrozenExtensionOrder) > 0 {
 		extOrder = fc.sessionState.FrozenExtensionOrder
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "using frozen extension order, count=", len(extOrder))
+		}
 	} else {
 		extOrder = ch.ExtensionOrder
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "using profile extension order, count=", len(extOrder))
+		}
 	}
 
 	// Validate: empty extension order is likely a configuration error
 	if len(extOrder) == 0 {
-		return nil, errors.New("tls: ExtensionOrder is empty - profile must specify extension order or use Extensions field")
+		return nil, utlserrors.New("tls: ExtensionOrder is empty - profile must specify extension order or use Extensions field").AtError()
 	}
 
 	// Track seen extension types to detect duplicates (except GREASE which can appear multiple times)
@@ -466,18 +504,22 @@ func (fc *FingerprintController) buildExtensionsFromOrder() ([]TLSExtension, err
 		// Allow multiple GREASE extensions and GREASE markers, but not duplicates of other types
 		if !isGREASEUint16(extType) && !IsGreaseExtMarker(extType) {
 			if seenExtensions[extType] {
-				return nil, fmt.Errorf("tls: duplicate extension type %d (0x%04x) at position %d", extType, extType, i)
+				return nil, utlserrors.New("tls: duplicate extension type ", extType, " (0x", fmt.Sprintf("%04x", extType), ") at position ", i).AtError()
 			}
 			seenExtensions[extType] = true
 		}
 
 		tlsExt, err := fc.buildExtensionByType(extType)
 		if err != nil {
-			return nil, fmt.Errorf("tls: failed to build extension %d (0x%04x): %w", extType, extType, err)
+			return nil, utlserrors.New("tls: failed to build extension ", extType, " (0x", fmt.Sprintf("%04x", extType), ")").Base(err).AtError()
 		}
 		if tlsExt != nil {
 			extensions = append(extensions, tlsExt)
 		}
+	}
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "built extensions count=", len(extensions))
 	}
 
 	return extensions, nil
@@ -673,7 +715,7 @@ func (fc *FingerprintController) buildExtensionsFromProfile() ([]TLSExtension, e
 
 		tlsExt, err := fc.buildExtension(ext)
 		if err != nil {
-			return nil, fmt.Errorf("tls: failed to build extension %d: %w", extType, err)
+			return nil, utlserrors.New("tls: failed to build extension ", extType).Base(err).AtError()
 		}
 		if tlsExt != nil {
 			extensions = append(extensions, tlsExt)
@@ -980,18 +1022,18 @@ func (fc *FingerprintController) ValidateClientHello(hello *clientHelloMsg) (*Va
 	defer fc.mu.RUnlock()
 
 	if fc.validator == nil {
-		return nil, errors.New("tls: validator not initialized")
+		return nil, utlserrors.New("tls: validator not initialized").AtError()
 	}
 
 	// Calculate actual fingerprints
 	raw, err := hello.marshal()
 	if err != nil {
-		return nil, fmt.Errorf("tls: failed to marshal ClientHello: %w", err)
+		return nil, utlserrors.New("tls: failed to marshal ClientHello").Base(err).AtError()
 	}
 
 	fp, err := CalculateFingerprints(raw)
 	if err != nil {
-		return nil, fmt.Errorf("tls: failed to calculate fingerprints: %w", err)
+		return nil, utlserrors.New("tls: failed to calculate fingerprints").Base(err).AtError()
 	}
 
 	// Validate

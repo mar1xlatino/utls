@@ -1617,6 +1617,30 @@ var %s = &tls.FingerprintProfile{
 	}
 }
 
+// safeWriteFile writes data to a file after verifying the directory is not a symlink.
+// This prevents TOCTOU symlink attacks where an attacker could replace the directory
+// with a symlink between MkdirAll and WriteFile, causing arbitrary file writes.
+func safeWriteFile(dir, filename string, data []byte, perm os.FileMode) error {
+	// Use Lstat to get info about the directory itself, not what it points to
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("failed to stat directory %s: %w", dir, err)
+	}
+
+	// Check if it's a symlink
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("security: directory %s is a symlink, refusing to write", dir)
+	}
+
+	// Verify it's actually a directory
+	if !info.IsDir() {
+		return fmt.Errorf("security: path %s is not a directory", dir)
+	}
+
+	path := filepath.Join(dir, filename)
+	return os.WriteFile(path, data, perm)
+}
+
 // saveProfile saves the captured profile to files
 func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
 	// Protect file writes from concurrent goroutines writing to the same file.
@@ -1656,12 +1680,13 @@ func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
 	if len(jsonName) > maxFilenameLength {
 		jsonName = jsonName[:maxFilenameLength]
 	}
-	jsonPath := filepath.Join(profilesDir, jsonName+".json")
+	jsonFilename := jsonName + ".json"
+	jsonPath := filepath.Join(profilesDir, jsonFilename)
 	jsonData, jsonErr := json.MarshalIndent(profile, "", "  ")
 	if jsonErr != nil {
 		log.Printf("Failed to marshal profile to JSON for %s: %v", jsonPath, jsonErr)
 	} else {
-		if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
+		if err := safeWriteFile(profilesDir, jsonFilename, jsonData, 0644); err != nil {
 			log.Printf("Failed to save JSON %s: %v", jsonPath, err)
 		} else {
 			log.Printf("Saved JSON: %s", jsonPath)
@@ -1669,8 +1694,9 @@ func saveProfile(profile *CapturedProfile, info BrowserInfo, goCode string) {
 	}
 
 	// Save Go code with CamelCase filename
-	goPath := filepath.Join(profilesDir, filename+".go")
-	if err := os.WriteFile(goPath, []byte(goCode), 0644); err != nil {
+	goFilename := filename + ".go"
+	goPath := filepath.Join(profilesDir, goFilename)
+	if err := safeWriteFile(profilesDir, goFilename, []byte(goCode), 0644); err != nil {
 		log.Printf("Failed to save Go code %s: %v", goPath, err)
 	} else {
 		log.Printf("Saved Go code: %s", goPath)

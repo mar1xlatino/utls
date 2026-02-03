@@ -14,10 +14,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"errors"
 	"math/big"
 	"sync"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ServerProfile defines server response fingerprint characteristics for JA4S/JA4X control.
@@ -169,7 +170,7 @@ func NewServerProfileRegistry() *ServerProfileRegistry {
 // Register adds a server profile to the registry.
 func (r *ServerProfileRegistry) Register(profile *ServerProfile) error {
 	if profile == nil || profile.ID == "" {
-		return errors.New("invalid profile: nil or empty ID")
+		return utlserrors.New("invalid profile: nil or empty ID").AtError()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -313,7 +314,7 @@ func GenerateKey(keyType string) (crypto.PrivateKey, error) {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		return priv, err
 	default:
-		return nil, errors.New("unsupported key type: " + keyType)
+		return nil, utlserrors.New("unsupported key type: " + keyType).AtError()
 	}
 }
 
@@ -324,7 +325,7 @@ func GenerateKey(keyType string) (crypto.PrivateKey, error) {
 // issuer and signs the leaf certificate with it.
 func GenerateCertificate(config *CertificateConfig, hostname string) (*x509.Certificate, crypto.PrivateKey, error) {
 	if config == nil {
-		return nil, nil, errors.New("nil certificate config")
+		return nil, nil, utlserrors.New("nil certificate config").AtError()
 	}
 
 	// Generate key
@@ -394,7 +395,7 @@ func GenerateCertificate(config *CertificateConfig, hostname string) (*x509.Cert
 	case ed25519.PrivateKey:
 		pub = k.Public()
 	default:
-		return nil, nil, errors.New("unsupported private key type")
+		return nil, nil, utlserrors.New("unsupported private key type").AtError()
 	}
 
 	// Create self-signed certificate
@@ -539,7 +540,7 @@ func generateCACertificate(config *CertificateConfig) (*x509.Certificate, crypto
 	case ed25519.PrivateKey:
 		pub = k.Public()
 	default:
-		return nil, nil, errors.New("unsupported private key type")
+		return nil, nil, utlserrors.New("unsupported private key type").AtError()
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, priv)
@@ -610,7 +611,7 @@ func generateLeafCertificate(config *CertificateConfig, hostname string, caCert 
 	case ed25519.PrivateKey:
 		pub = k.Public()
 	default:
-		return nil, nil, errors.New("unsupported private key type")
+		return nil, nil, utlserrors.New("unsupported private key type").AtError()
 	}
 
 	// Sign with CA - this makes the issuer field correct

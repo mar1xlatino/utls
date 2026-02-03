@@ -6,24 +6,24 @@
 package quicvarint
 
 import (
-	"errors"
 	"io"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/quicvarint/protocol"
 )
 
 // ErrNonMinimalEncoding is returned when a varint is encoded using more bytes
 // than necessary, violating RFC 9000 Section 16 which requires minimal encoding.
-var ErrNonMinimalEncoding = errors.New("quic: varint uses non-minimal encoding")
+var ErrNonMinimalEncoding = utlserrors.New("quic: varint uses non-minimal encoding").AtError()
 
 // ErrValueTooLarge is returned when a value exceeds the maximum QUIC varint (2^62-1).
-var ErrValueTooLarge = errors.New("quic: value exceeds maximum varint (2^62-1)")
+var ErrValueTooLarge = utlserrors.New("quic: value exceeds maximum varint (2^62-1)").AtError()
 
 // ErrInvalidLength is returned when an invalid length is specified for AppendWithLen.
-var ErrInvalidLength = errors.New("quic: invalid varint length (must be 1, 2, 4, or 8)")
+var ErrInvalidLength = utlserrors.New("quic: invalid varint length (must be 1, 2, 4, or 8)").AtError()
 
 // ErrValueTooLargeForLength is returned when a value cannot fit in the specified length.
-var ErrValueTooLargeForLength = errors.New("quic: value too large for specified length")
+var ErrValueTooLargeForLength = utlserrors.New("quic: value too large for specified length").AtError()
 
 // taken from the QUIC draft
 const (

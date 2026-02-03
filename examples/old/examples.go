@@ -146,18 +146,15 @@ func HttpGetTicket(hostname string, addr string) (*http.Response, error) {
 		return nil, fmt.Errorf("uTlsConn.BuildHandshakeState() error: %+v", err)
 	}
 
-	masterSecret := make([]byte, 48)
-	copy(masterSecret, []byte("masterSecret is NOT sent over the wire")) // you may use it for real security
-
-	// Create a session ticket that wasn't actually issued by the server.
-	sessionState := tls.MakeClientSessionState(sessionTicket, uint16(tls.VersionTLS12),
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		masterSecret,
-		nil, nil)
-
-	err = uTlsConn.SetSessionState(sessionState)
+	// Create a session ticket extension with the ticket data.
+	// Note: The server will reject this fake ticket and do a full handshake.
+	sessionTicketExt := &tls.SessionTicketExtension{
+		Initialized: true,
+		Ticket:      sessionTicket,
+	}
+	err = uTlsConn.SetSessionTicketExtension(sessionTicketExt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("uTlsConn.SetSessionTicketExtension() error: %+v", err)
 	}
 
 	err = uTlsConn.Handshake()
@@ -183,16 +180,17 @@ func HttpGetTicketHelloID(hostname string, addr string, helloID tls.ClientHelloI
 	}
 	defer uTlsConn.Close()
 
-	masterSecret := make([]byte, 48)
-	copy(masterSecret, []byte("masterSecret is NOT sent over the wire")) // you may use it for real security
+	// Create a session ticket extension with the ticket data.
+	// Note: The server will reject this fake ticket and do a full handshake.
+	sessionTicketExt := &tls.SessionTicketExtension{
+		Initialized: true,
+		Ticket:      sessionTicket,
+	}
+	err = uTlsConn.SetSessionTicketExtension(sessionTicketExt)
+	if err != nil {
+		return nil, fmt.Errorf("uTlsConn.SetSessionTicketExtension() error: %+v", err)
+	}
 
-	// Create a session ticket that wasn't actually issued by the server.
-	sessionState := tls.MakeClientSessionState(sessionTicket, uint16(tls.VersionTLS12),
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		masterSecret,
-		nil, nil)
-
-	uTlsConn.SetSessionState(sessionState)
 	err = uTlsConn.Handshake()
 	if err != nil {
 		return nil, fmt.Errorf("uTlsConn.Handshake() error: %+v", err)
@@ -331,10 +329,10 @@ func forgeConn() {
 	hs := clientUtls.HandshakeState
 
 	// TODO: Redesign this part to use TLS 1.3
-	serverTls := tls.MakeConnWithCompleteHandshake(serverConn, hs.ServerHello.Vers, hs.ServerHello.CipherSuite,
+	serverTls, err := tls.MakeConnWithCompleteHandshake(serverConn, hs.ServerHello.Vers, hs.ServerHello.CipherSuite,
 		hs.MasterSecret, hs.Hello.Random, hs.ServerHello.Random, false)
-	if serverTls == nil {
-		fmt.Printf("tls.MakeConnWithCompleteHandshake error, unsupported TLS protocol?")
+	if err != nil {
+		fmt.Printf("tls.MakeConnWithCompleteHandshake error: %v\n", err)
 		return
 	}
 

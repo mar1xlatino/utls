@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // QUICEncryptionLevel represents a QUIC encryption level used to transmit
@@ -195,6 +197,9 @@ func (qs *quicState) closeChannels() {
 //
 // The config's MinVersion must be at least TLS 1.3.
 func QUICClient(config *QUICConfig) *QUICConn {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: creating client connection")
+	}
 	return newQUICConn(Client(nil, config.TLSConfig), config)
 }
 
@@ -203,6 +208,9 @@ func QUICClient(config *QUICConfig) *QUICConn {
 //
 // The config's MinVersion must be at least TLS 1.3.
 func QUICServer(config *QUICConfig) *QUICConn {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: creating server connection")
+	}
 	return newQUICConn(Server(nil, config.TLSConfig), config)
 }
 
@@ -223,16 +231,25 @@ func newQUICConn(conn *Conn, config *QUICConfig) *QUICConn {
 //
 // Start must be called at most once.
 func (q *QUICConn) Start(ctx context.Context) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "QUIC: starting handshake")
+	}
 	if q.conn.quic.started {
-		return quicError(errors.New("tls: Start called more than once"))
+		return quicError(utlserrors.New("tls: Start called more than once").AtError())
 	}
 	q.conn.quic.started = true
 	if q.conn.config.MinVersion < VersionTLS13 {
-		return quicError(errors.New("tls: Config MinVersion must be at least TLS 1.3"))
+		return quicError(utlserrors.New("tls: Config MinVersion must be at least TLS 1.3").AtError())
 	}
 	go q.conn.HandshakeContext(ctx)
 	if _, ok := <-q.conn.quic.blockedc; !ok {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "QUIC: handshake failed")
+		}
 		return q.conn.handshakeErr
+	}
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "QUIC: handshake started successfully")
 	}
 	return nil
 }
@@ -264,6 +281,9 @@ func (q *QUICConn) NextEvent() QUICEvent {
 
 // Close closes the connection and stops any in-progress handshake.
 func (q *QUICConn) Close() error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: closing connection")
+	}
 	if q.conn.quic.cancel == nil {
 		return nil // never started
 	}
@@ -271,15 +291,21 @@ func (q *QUICConn) Close() error {
 	for range q.conn.quic.blockedc {
 		// Wait for the handshake goroutine to return.
 	}
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: connection closed")
+	}
 	return q.conn.handshakeErr
 }
 
 // HandleData handles handshake bytes received from the peer.
 // It may produce connection events, which may be read with [QUICConn.NextEvent].
 func (q *QUICConn) HandleData(level QUICEncryptionLevel, data []byte) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: handling data at encryption level:", level.String(), "bytes:", len(data))
+	}
 	c := q.conn
 	if c.in.level != level {
-		return quicError(c.in.setErrorLocked(errors.New("tls: handshake data received at wrong level")))
+		return quicError(c.in.setErrorLocked(utlserrors.New("tls: handshake data received at wrong level").AtError()))
 	}
 	c.quic.readbuf = data
 	<-c.quic.signalc
@@ -297,7 +323,7 @@ func (q *QUICConn) HandleData(level QUICEncryptionLevel, data []byte) error {
 		b := q.conn.hand.Bytes()
 		n := int(b[1])<<16 | int(b[2])<<8 | int(b[3])
 		if n > maxHandshake {
-			q.conn.handshakeErr = fmt.Errorf("tls: handshake message of length %d bytes exceeds maximum of %d bytes", n, maxHandshake)
+			q.conn.handshakeErr = utlserrors.New("tls: handshake message of length", n, "bytes exceeds maximum of", maxHandshake, "bytes").AtError()
 			break
 		}
 		if len(b) < 4+n {
@@ -323,15 +349,18 @@ type QUICSessionTicketOptions struct {
 // It produces connection events, which may be read with [QUICConn.NextEvent].
 // Currently, it can only be called once.
 func (q *QUICConn) SendSessionTicket(opts QUICSessionTicketOptions) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: sending session ticket, earlyData:", opts.EarlyData)
+	}
 	c := q.conn
 	if !c.isHandshakeComplete.Load() {
-		return quicError(errors.New("tls: SendSessionTicket called before handshake completed"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called before handshake completed").AtError())
 	}
 	if c.isClient {
-		return quicError(errors.New("tls: SendSessionTicket called on the client"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called on the client").AtError())
 	}
 	if q.sessionTicketSent {
-		return quicError(errors.New("tls: SendSessionTicket called multiple times"))
+		return quicError(utlserrors.New("tls: SendSessionTicket called multiple times").AtError())
 	}
 	q.sessionTicketSent = true
 	return quicError(c.sendSessionTicket(opts.EarlyData, opts.Extra))
@@ -342,9 +371,12 @@ func (q *QUICConn) SendSessionTicket(opts QUICSessionTicketOptions) error {
 // The application may process additional events or modify the SessionState
 // before storing the session.
 func (q *QUICConn) StoreSession(session *SessionState) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: storing session")
+	}
 	c := q.conn
 	if !c.isClient {
-		return quicError(errors.New("tls: StoreSessionTicket called on the server"))
+		return quicError(utlserrors.New("tls: StoreSessionTicket called on the server").AtError())
 	}
 	cacheKey := c.clientSessionCacheKey()
 	if cacheKey == "" {
@@ -365,6 +397,9 @@ func (q *QUICConn) ConnectionState() ConnectionState {
 // Server connections may delay setting the transport parameters until after
 // receiving the client's transport parameters. See [QUICTransportParametersRequired].
 func (q *QUICConn) SetTransportParameters(params []byte) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: setting transport parameters, bytes:", len(params))
+	}
 	if params == nil {
 		params = []byte{}
 	}
@@ -404,6 +439,9 @@ func (c *Conn) quicReadHandshakeBytes(n int) error {
 }
 
 func (c *Conn) quicSetReadSecret(level QUICEncryptionLevel, suite uint16, secret []byte) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: deriving", level.String(), "read keys, suite:", suite)
+	}
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind:  QUICSetReadSecret,
 		Level: level,
@@ -413,6 +451,9 @@ func (c *Conn) quicSetReadSecret(level QUICEncryptionLevel, suite uint16, secret
 }
 
 func (c *Conn) quicSetWriteSecret(level QUICEncryptionLevel, suite uint16, secret []byte) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: deriving", level.String(), "write keys, suite:", suite)
+	}
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind:  QUICSetWriteSecret,
 		Level: level,
@@ -461,6 +502,9 @@ func (c *Conn) quicStoreSession(session *SessionState) {
 }
 
 func (c *Conn) quicSetTransportParameters(params []byte) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: received transport params, bytes:", len(params))
+	}
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind: QUICTransportParameters,
 		Data: params,
@@ -468,6 +512,9 @@ func (c *Conn) quicSetTransportParameters(params []byte) {
 }
 
 func (c *Conn) quicGetTransportParameters() ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: getting transport parameters")
+	}
 	if c.quic.transportParams == nil {
 		c.quic.events = append(c.quic.events, QUICEvent{
 			Kind: QUICTransportParametersRequired,
@@ -482,19 +529,25 @@ func (c *Conn) quicGetTransportParameters() ([]byte, error) {
 }
 
 func (c *Conn) quicHandshakeComplete() {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: handshake complete")
+	}
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind: QUICHandshakeDone,
 	})
 }
 
 func (c *Conn) quicRejectedEarlyData() {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "QUIC: early data rejected by server")
+	}
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind: QUICRejectedEarlyData,
 	})
 }
 
 // errQUICClosed is returned when a QUIC operation is attempted on a closed connection.
-var errQUICClosed = errors.New("tls: QUIC connection closed")
+var errQUICClosed = utlserrors.New("tls: QUIC connection closed").AtError()
 
 // quicWaitForSignal notifies the QUICConn that handshake progress is blocked,
 // and waits for a signal that the handshake should proceed.

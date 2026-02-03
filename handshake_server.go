@@ -12,12 +12,13 @@ import (
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
-	"errors"
+	stderrors "errors"
 	"fmt"
 	"hash"
 	"io"
 	"time"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/byteorder"
 )
 
@@ -41,12 +42,22 @@ type serverHandshakeState struct {
 
 // serverHandshake performs a TLS handshake as a server.
 func (c *Conn) serverHandshake(ctx context.Context) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "server: starting handshake")
+	}
+
 	clientHello, ech, err := c.readClientHello(ctx)
 	if err != nil {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebugInner(ctx, err, "server: failed to read ClientHello")
+		}
 		return err
 	}
 
 	if c.vers == VersionTLS13 {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(ctx, "server: negotiated TLS 1.3, delegating to TLS 1.3 handshake")
+		}
 		hs := serverHandshakeStateTLS13{
 			c:           c,
 			ctx:         ctx,
@@ -56,6 +67,9 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 		return hs.handshake()
 	}
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "server: negotiated TLS version", fmt.Sprintf("0x%04x", c.vers))
+	}
 	hs := serverHandshakeState{
 		c:           c,
 		ctx:         ctx,
@@ -66,6 +80,10 @@ func (c *Conn) serverHandshake(ctx context.Context) error {
 
 func (hs *serverHandshakeState) handshake() error {
 	c := hs.c
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.2 handshake starting")
+	}
 
 	if err := hs.processClientHello(); err != nil {
 		return err
@@ -78,6 +96,9 @@ func (hs *serverHandshakeState) handshake() error {
 	}
 	if hs.sessionState != nil {
 		// The client has included a session ticket and so we do an abbreviated handshake.
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(hs.ctx, "server: resuming session")
+		}
 		c.didResume = true
 		if err := hs.doResumeHandshake(); err != nil {
 			return err
@@ -101,6 +122,9 @@ func (hs *serverHandshakeState) handshake() error {
 	} else {
 		// The client didn't include a session ticket, or it wasn't
 		// valid so we do a full handshake.
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(hs.ctx, "server: performing full handshake")
+		}
 		if err := hs.pickCipherSuite(); err != nil {
 			return err
 		}
@@ -129,11 +153,19 @@ func (hs *serverHandshakeState) handshake() error {
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random)
 	c.isHandshakeComplete.Store(true)
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: TLS 1.2 handshake completed successfully")
+	}
+
 	return nil
 }
 
 // readClientHello reads a ClientHello message and selects the protocol version.
 func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServerContext, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "server: reading ClientHello")
+	}
+
 	// clientHelloMsg is included in the transcript, but we haven't initialized
 	// it yet. The respective handshake functions will record it themselves.
 	msg, err := c.readHandshake(nil)
@@ -179,11 +211,15 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServer
 	c.vers, ok = c.config.mutualVersion(roleServer, clientVersions)
 	if !ok {
 		c.sendAlert(alertProtocolVersion)
-		return nil, nil, fmt.Errorf("tls: client offered only unsupported versions: %x", clientVersions)
+		return nil, nil, utlserrors.New("tls: client offered only unsupported versions:", fmt.Sprintf("%x", clientVersions)).AtError()
 	}
 	c.haveVers = true
 	c.in.version = c.vers
 	c.out.version = c.vers
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(ctx, "server: negotiated version", fmt.Sprintf("0x%04x", c.vers))
+	}
 
 	// This check reflects some odd specification implied behavior. Client-facing servers
 	// are supposed to reject hellos with outer ECH and inner ECH that offers 1.2, but
@@ -194,7 +230,7 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServer
 	// but it didn't, and this matches the boringssl behavior.
 	if c.vers != VersionTLS13 && (ech != nil && !ech.inner) {
 		c.sendAlert(alertIllegalParameter)
-		return nil, nil, errors.New("tls: Encrypted Client Hello cannot be used pre-TLS 1.3")
+		return nil, nil, utlserrors.New("tls: Encrypted Client Hello cannot be used pre-TLS 1.3").AtError()
 	}
 
 	// [UTLS SECTION BEGIN]
@@ -211,6 +247,10 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServer
 func (hs *serverHandshakeState) processClientHello() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: processing ClientHello, SNI:", hs.clientHello.serverName)
+	}
+
 	hs.hello = new(serverHelloMsg)
 	hs.hello.vers = c.vers
 
@@ -225,7 +265,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 
 	if !foundCompression {
 		c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: client does not support uncompressed connections")
+		return utlserrors.New("tls: client does not support uncompressed connections").AtError()
 	}
 
 	hs.hello.random = make([]byte, 32)
@@ -254,9 +294,9 @@ func (hs *serverHandshakeState) processClientHello() error {
 		c.sendAlert(alertHandshakeFailure)
 		if c.handshakes > 0 {
 			// Client is attempting renegotiation, which is not supported
-			return errors.New("tls: renegotiation not supported")
+			return utlserrors.New("tls: renegotiation not supported").AtError()
 		}
-		return errors.New("tls: initial handshake had non-empty renegotiation extension")
+		return utlserrors.New("tls: initial handshake had non-empty renegotiation extension").AtError()
 	}
 
 	hs.hello.extendedMasterSecret = hs.clientHello.extendedMasterSecret
@@ -308,7 +348,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 			hs.rsaSignOk = true
 		default:
 			c.sendAlert(alertInternalError)
-			return fmt.Errorf("tls: unsupported signing key type (%T)", priv.Public())
+			return utlserrors.New("tls: unsupported signing key type", fmt.Sprintf("(%T)", priv.Public())).AtError()
 		}
 	}
 	if priv, ok := hs.cert.PrivateKey.(crypto.Decrypter); ok {
@@ -317,7 +357,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 			hs.rsaDecryptOk = true
 		default:
 			c.sendAlert(alertInternalError)
-			return fmt.Errorf("tls: unsupported decryption key type (%T)", priv.Public())
+			return utlserrors.New("tls: unsupported decryption key type", fmt.Sprintf("(%T)", priv.Public())).AtError()
 		}
 	}
 
@@ -333,9 +373,9 @@ func negotiateALPN(serverProtos, clientProtos []string, quic bool) (string, erro
 		// Both server and client must provide ALPN protocols.
 		if quic {
 			if len(serverProtos) == 0 {
-				return "", fmt.Errorf("tls: server must configure ALPN for QUIC connections")
+				return "", utlserrors.New("tls: server must configure ALPN for QUIC connections").AtError()
 			}
-			return "", fmt.Errorf("tls: client did not request an application protocol")
+			return "", utlserrors.New("tls: client did not request an application protocol").AtError()
 		}
 		return "", nil
 	}
@@ -358,7 +398,7 @@ func negotiateALPN(serverProtos, clientProtos []string, quic bool) (string, erro
 	if http11fallback && !quic {
 		return "", nil
 	}
-	return "", fmt.Errorf("tls: client requested unsupported application protocols (%s)", clientProtos)
+	return "", utlserrors.New("tls: client requested unsupported application protocols", fmt.Sprintf("(%s)", clientProtos)).AtError()
 }
 
 // supportsECDHE returns whether ECDHE key exchanges can be used with this
@@ -393,6 +433,10 @@ func supportsECDHE(c *Config, version uint16, supportedCurves []CurveID, support
 func (hs *serverHandshakeState) pickCipherSuite() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: selecting cipher suite from client offers:", len(hs.clientHello.cipherSuites), "suites")
+	}
+
 	preferenceOrder := cipherSuitesPreferenceOrder
 	if !hasAESGCMHardwareSupport || !aesgcmPreferred(hs.clientHello.cipherSuites) {
 		preferenceOrder = cipherSuitesPreferenceOrderNoAES
@@ -412,9 +456,13 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 	hs.suite = selectCipherSuite(preferenceList, hs.clientHello.cipherSuites, hs.cipherSuiteOk)
 	if hs.suite == nil {
 		c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: no cipher suite supported by both client and server")
+		return utlserrors.New("tls: no cipher suite supported by both client and server").AtError()
 	}
 	c.cipherSuite = hs.suite.id
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: selected cipher suite", fmt.Sprintf("0x%04x", hs.suite.id))
+	}
 
 	// [UTLS SECTION BEGIN]
 	// Disable unsupported godebug package
@@ -433,7 +481,7 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 			// The client is doing a fallback connection. See RFC 7507.
 			if hs.clientHello.vers < c.config.maxSupportedVersion(roleServer) {
 				c.sendAlert(alertInappropriateFallback)
-				return errors.New("tls: client using inappropriate protocol fallback")
+				return utlserrors.New("tls: client using inappropriate protocol fallback").AtError()
 			}
 			break
 		}
@@ -467,7 +515,14 @@ func (hs *serverHandshakeState) cipherSuiteOk(c *cipherSuite) bool {
 func (hs *serverHandshakeState) checkForResumption() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: checking for session resumption")
+	}
+
 	if c.config.SessionTicketsDisabled {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(hs.ctx, "server: session tickets disabled")
+		}
 		return nil
 	}
 
@@ -548,7 +603,7 @@ func (hs *serverHandshakeState) checkForResumption() error {
 	if sessionState.extMasterSecret && !hs.clientHello.extendedMasterSecret {
 		// Aborting is somewhat harsh, but it's a MUST and it would indicate a
 		// weird downgrade in client capabilities.
-		return errors.New("tls: session supported extended_master_secret but client does not")
+		return utlserrors.New("tls: session supported extended_master_secret but client does not").AtError()
 	}
 
 	c.peerCertificates = sessionState.peerCertificates
@@ -597,6 +652,10 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 
 func (hs *serverHandshakeState) doFullHandshake() error {
 	c := hs.c
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: starting full handshake")
+	}
 
 	if hs.clientHello.ocspStapling && len(hs.cert.OCSPStaple) > 0 {
 		hs.hello.ocspStapling = true
@@ -669,6 +728,10 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		// we can send them down, so that the client can choose
 		// an appropriate certificate to give to us.
 		if c.config.ClientCAs != nil {
+			// Note: Subjects() is deprecated for system cert pools because it
+			// won't include system roots. However, ClientCAs is user-configured
+			// and not the system pool, so this usage is correct and safe.
+			//lint:ignore SA1019 ClientCAs is user-configured, not a system cert pool
 			certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
 		}
 		if _, err := hs.c.writeHandshakeRecord(certReq, &hs.finishedHash); err != nil {
@@ -774,9 +837,16 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		var sigType uint8
 		var sigHash crypto.Hash
 		if c.vers >= VersionTLS12 {
+			// certReq is guaranteed non-nil here because we only have peer certificates
+			// when ClientAuth >= RequestClientCert, which is when certReq is assigned.
+			// This nil check satisfies static analysis tools.
+			if certReq == nil {
+				c.sendAlert(alertInternalError)
+				return utlserrors.New("tls: internal error: certificate request is nil").AtError()
+			}
 			if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, certReq.supportedSignatureAlgorithms) {
 				c.sendAlert(alertIllegalParameter)
-				return errors.New("tls: client certificate used with invalid signature algorithm")
+				return utlserrors.New("tls: client certificate used with invalid signature algorithm").AtError()
 			}
 			sigType, sigHash, err = typeAndHashFromSignatureScheme(certVerify.signatureAlgorithm)
 			if err != nil {
@@ -793,7 +863,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		signed := hs.finishedHash.hashForClientCertificate(sigType, sigHash)
 		if err := verifyHandshakeSignature(sigType, pub, sigHash, signed, certVerify.signature); err != nil {
 			c.sendAlert(alertDecryptError)
-			return errors.New("tls: invalid signature by the client certificate: " + err.Error())
+			return utlserrors.New("tls: invalid signature by the client certificate").Base(err).AtError()
 		}
 
 		if err := transcriptMsg(certVerify, &hs.finishedHash); err != nil {
@@ -809,6 +879,10 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 func (hs *serverHandshakeState) establishKeys() error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: establishing encryption keys")
+	}
+
 	clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV :=
 		keysFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random, hs.suite.macLen, hs.suite.keyLen, hs.suite.ivLen)
 
@@ -818,23 +892,23 @@ func (hs *serverHandshakeState) establishKeys() error {
 	if hs.suite.aead == nil {
 		clientCipher = hs.suite.cipher(clientKey, clientIV, true /* for reading */)
 		if clientCipher == nil {
-			return errors.New("tls: failed to create client cipher")
+			return utlserrors.New("tls: failed to create client cipher").AtError()
 		}
 		clientHash = hs.suite.mac(clientMAC)
 		serverCipher = hs.suite.cipher(serverKey, serverIV, false /* not for reading */)
 		if serverCipher == nil {
-			return errors.New("tls: failed to create server cipher")
+			return utlserrors.New("tls: failed to create server cipher").AtError()
 		}
 		serverHash = hs.suite.mac(serverMAC)
 	} else {
 		var err error
 		clientCipher, err = hs.suite.aead(clientKey, clientIV)
 		if err != nil {
-			return fmt.Errorf("tls: failed to create client AEAD cipher: %w", err)
+			return utlserrors.New("tls: failed to create client AEAD cipher").Base(err).AtError()
 		}
 		serverCipher, err = hs.suite.aead(serverKey, serverIV)
 		if err != nil {
-			return fmt.Errorf("tls: failed to create server AEAD cipher: %w", err)
+			return utlserrors.New("tls: failed to create server AEAD cipher").Base(err).AtError()
 		}
 	}
 
@@ -846,6 +920,10 @@ func (hs *serverHandshakeState) establishKeys() error {
 
 func (hs *serverHandshakeState) readFinished(out []byte) error {
 	c := hs.c
+
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: reading client Finished message")
+	}
 
 	if err := c.readChangeCipherSpec(); err != nil {
 		return err
@@ -868,7 +946,7 @@ func (hs *serverHandshakeState) readFinished(out []byte) error {
 	if len(verify) != len(clientFinished.verifyData) ||
 		subtle.ConstantTimeCompare(verify, clientFinished.verifyData) != 1 {
 		c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: client's Finished message is incorrect")
+		return utlserrors.New("tls: client's Finished message is incorrect").AtError()
 	}
 
 	if err := transcriptMsg(clientFinished, &hs.finishedHash); err != nil {
@@ -924,6 +1002,10 @@ func (hs *serverHandshakeState) sendSessionTicket() error {
 func (hs *serverHandshakeState) sendFinished(out []byte) error {
 	c := hs.c
 
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(hs.ctx, "server: sending Finished message")
+	}
+
 	if err := c.writeChangeCipherRecord(); err != nil {
 		return err
 	}
@@ -948,18 +1030,24 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 	for i, asn1Data := range certificates {
 		if certs[i], err = x509.ParseCertificate(asn1Data); err != nil {
 			c.sendAlert(alertBadCertificate)
-			return errors.New("tls: failed to parse client certificate: " + err.Error())
+			return utlserrors.New("tls: failed to parse client certificate").Base(err).AtError()
+		}
+		// Defensive nil check: x509.ParseCertificate should never return (nil, nil),
+		// but static analysis tools cannot prove this invariant.
+		if certs[i] == nil {
+			c.sendAlert(alertBadCertificate)
+			return utlserrors.New("tls: parsed certificate is unexpectedly nil").AtError()
 		}
 		if certs[i].PublicKeyAlgorithm == x509.RSA {
 			rsaKey, ok := certs[i].PublicKey.(*rsa.PublicKey)
 			if !ok {
 				c.sendAlert(alertBadCertificate)
-				return errors.New("tls: client certificate has RSA algorithm but non-RSA public key")
+				return utlserrors.New("tls: client certificate has RSA algorithm but non-RSA public key").AtError()
 			}
 			n := rsaKey.N.BitLen()
 			if max, ok := checkKeySize(n); !ok {
 				c.sendAlert(alertBadCertificate)
-				return fmt.Errorf("tls: client sent certificate containing RSA key larger than %d bits", max)
+				return utlserrors.New("tls: client sent certificate containing RSA key larger than", max, "bits").AtError()
 			}
 		}
 	}
@@ -970,7 +1058,7 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		} else {
 			c.sendAlert(alertBadCertificate)
 		}
-		return errors.New("tls: client didn't provide a certificate")
+		return utlserrors.New("tls: client didn't provide a certificate").AtError()
 	}
 
 	if c.config.ClientAuth >= VerifyClientCertIfGiven && len(certs) > 0 {
@@ -988,9 +1076,9 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		chains, err := certs[0].Verify(opts)
 		if err != nil {
 			var errCertificateInvalid x509.CertificateInvalidError
-			if errors.As(err, &x509.UnknownAuthorityError{}) {
+			if stderrors.As(err, &x509.UnknownAuthorityError{}) {
 				c.sendAlert(alertUnknownCA)
-			} else if errors.As(err, &errCertificateInvalid) && errCertificateInvalid.Reason == x509.Expired {
+			} else if stderrors.As(err, &errCertificateInvalid) && errCertificateInvalid.Reason == x509.Expired {
 				c.sendAlert(alertCertificateExpired)
 			} else {
 				c.sendAlert(alertBadCertificate)
@@ -1014,7 +1102,7 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
 		default:
 			c.sendAlert(alertUnsupportedCertificate)
-			return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
+			return utlserrors.New("tls: client certificate contains an unsupported public key of type", fmt.Sprintf("%T", certs[0].PublicKey)).AtError()
 		}
 	}
 

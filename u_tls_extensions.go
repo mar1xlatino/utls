@@ -5,13 +5,14 @@
 package tls
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/refraction-networking/utls/dicttls"
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -196,7 +197,7 @@ func (e *SNIExtension) Write(b []byte) (int, error) {
 	// RFC 6066, Section 3
 	var nameList cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&nameList) || nameList.Empty() {
-		return fullLen, errors.New("unable to read server name extension data")
+		return fullLen, utlserrors.New("unable to read server name extension data").AtError()
 	}
 	var serverName string
 	for !nameList.Empty() {
@@ -205,17 +206,17 @@ func (e *SNIExtension) Write(b []byte) (int, error) {
 		if !nameList.ReadUint8(&nameType) ||
 			!nameList.ReadUint16LengthPrefixed(&serverNameBytes) ||
 			serverNameBytes.Empty() {
-			return fullLen, errors.New("unable to read server name extension data")
+			return fullLen, utlserrors.New("unable to read server name extension data").AtError()
 		}
 		if nameType != 0 {
 			continue
 		}
 		if len(serverName) != 0 {
-			return fullLen, errors.New("multiple names of the same name_type in server name extension are prohibited")
+			return fullLen, utlserrors.New("multiple names of the same name_type in server name extension are prohibited").AtError()
 		}
 		serverName = string(serverNameBytes)
 		if strings.HasSuffix(serverName, ".") {
-			return fullLen, errors.New("SNI value may not include a trailing dot")
+			return fullLen, utlserrors.New("SNI value may not include a trailing dot").AtError()
 		}
 		// Validate hostname characters per RFC 6066.
 		if err := validateSNIHostname(serverName); err != nil {
@@ -226,7 +227,12 @@ func (e *SNIExtension) Write(b []byte) (int, error) {
 
 	// Reject trailing data after the name list
 	if !extData.Empty() {
-		return 0, errors.New("tls: trailing data in SNI extension")
+		return 0, utlserrors.New("tls: trailing data in SNI extension").AtError()
+	}
+
+	// Debug log SNI parsing
+	if utlserrors.DebugLoggingEnabled && serverName != "" {
+		utlserrors.LogDebug(context.Background(), "SNI extension parsed: server_name=", serverName)
 	}
 
 	// don't copy SNI from ClientHello to ClientHelloSpec!
@@ -279,15 +285,15 @@ func (e *StatusRequestExtension) Write(b []byte) (int, error) {
 	if !extData.ReadUint8(&statusType) ||
 		!extData.ReadUint16LengthPrefixed(&ignored) ||
 		!extData.ReadUint16LengthPrefixed(&ignored) {
-		return fullLen, errors.New("unable to read status request extension data")
+		return fullLen, utlserrors.New("unable to read status request extension data").AtError()
 	}
 
 	if statusType != statusTypeOCSP {
-		return fullLen, errors.New("status request extension statusType is not statusTypeOCSP(1)")
+		return fullLen, utlserrors.New("status request extension statusType is not statusTypeOCSP(1)").AtError()
 	}
 
 	if !extData.Empty() {
-		return fullLen, errors.New("status request extension has trailing data")
+		return fullLen, utlserrors.New("status request extension has trailing data").AtError()
 	}
 
 	return fullLen, nil
@@ -311,10 +317,10 @@ func (e *SupportedCurvesExtension) Read(b []byte) (int, error) {
 	// Extension header (4) + list length (2) + 2 bytes per curve
 	// Must fit in uint16 (max 65535), so max curves = (65535 - 6) / 2 = 32764
 	if len(e.Curves) > 32764 {
-		return 0, errors.New("tls: too many supported curves (max 32764)")
+		return 0, utlserrors.New("tls: too many supported curves (max 32764)").AtError()
 	}
 	if len(e.Curves) == 0 {
-		return 0, errors.New("tls: supported_groups extension cannot be empty")
+		return 0, utlserrors.New("tls: supported_groups extension cannot be empty").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -350,7 +356,7 @@ func (e *SupportedCurvesExtension) UnmarshalJSON(data []byte) error {
 		if group, ok := dicttls.DictSupportedGroupsNameIndexed[namedGroup]; ok {
 			e.Curves = append(e.Curves, CurveID(group))
 		} else {
-			return fmt.Errorf("unknown named group: %s", namedGroup)
+			return utlserrors.New("unknown named group: ", namedGroup).AtError()
 		}
 	}
 	return nil
@@ -362,18 +368,18 @@ func (e *SupportedCurvesExtension) Write(b []byte) (int, error) {
 	// RFC 4492, sections 5.1.1 and RFC 8446, Section 4.2.7
 	var curvesBytes cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&curvesBytes) || curvesBytes.Empty() {
-		return 0, errors.New("unable to read supported curves extension data")
+		return 0, utlserrors.New("unable to read supported curves extension data").AtError()
 	}
 	curves := []CurveID{}
 	for !curvesBytes.Empty() {
 		var curve uint16
 		if !curvesBytes.ReadUint16(&curve) {
-			return 0, errors.New("unable to read supported curves extension data")
+			return 0, utlserrors.New("unable to read supported curves extension data").AtError()
 		}
 		curves = append(curves, CurveID(unGREASEUint16(curve)))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: supported_groups extension has trailing data")
+		return 0, utlserrors.New("tls: supported_groups extension has trailing data").AtError()
 	}
 	e.Curves = curves
 	return fullLen, nil
@@ -397,11 +403,11 @@ func (e *SupportedPointsExtension) Len() int {
 func (e *SupportedPointsExtension) Read(b []byte) (int, error) {
 	// Points list is prefixed with 1-byte length, max 255 entries
 	if len(e.SupportedPoints) > 255 {
-		return 0, errors.New("tls: too many ec_point_formats (max 255)")
+		return 0, utlserrors.New("tls: too many ec_point_formats (max 255)").AtError()
 	}
 	// RFC 4492: at minimum, uncompressed point format must be supported
 	if len(e.SupportedPoints) == 0 {
-		return 0, errors.New("tls: ec_point_formats extension cannot be empty")
+		return 0, utlserrors.New("tls: ec_point_formats extension cannot be empty").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -430,7 +436,7 @@ func (e *SupportedPointsExtension) UnmarshalJSON(data []byte) error {
 		if format, ok := dicttls.DictECPointFormatNameIndexed[pointFormat]; ok {
 			e.SupportedPoints = append(e.SupportedPoints, format)
 		} else {
-			return fmt.Errorf("unknown point format: %s", pointFormat)
+			return utlserrors.New("unknown point format: ", pointFormat).AtError()
 		}
 	}
 	return nil
@@ -443,10 +449,10 @@ func (e *SupportedPointsExtension) Write(b []byte) (int, error) {
 	supportedPoints := []uint8{}
 	if !readUint8LengthPrefixed(&extData, &supportedPoints) ||
 		len(supportedPoints) == 0 {
-		return 0, errors.New("unable to read supported points extension data")
+		return 0, utlserrors.New("unable to read supported points extension data").AtError()
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: ec_point_formats extension has trailing data")
+		return 0, utlserrors.New("tls: ec_point_formats extension has trailing data").AtError()
 	}
 	e.SupportedPoints = supportedPoints
 	return fullLen, nil
@@ -468,7 +474,7 @@ func (e *SignatureAlgorithmsExtension) Len() int {
 
 func (e *SignatureAlgorithmsExtension) Read(b []byte) (int, error) {
 	if len(e.SupportedSignatureAlgorithms) == 0 {
-		return 0, errors.New("tls: signature_algorithms extension cannot be empty")
+		return 0, utlserrors.New("tls: signature_algorithms extension cannot be empty").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -504,7 +510,7 @@ func (e *SignatureAlgorithmsExtension) UnmarshalJSON(data []byte) error {
 		if scheme, ok := dicttls.DictSignatureSchemeNameIndexed[sigScheme]; ok {
 			e.SupportedSignatureAlgorithms = append(e.SupportedSignatureAlgorithms, SignatureScheme(scheme))
 		} else {
-			return fmt.Errorf("unknown signature scheme: %s", sigScheme)
+			return utlserrors.New("unknown signature scheme: ", sigScheme).AtError()
 		}
 	}
 	return nil
@@ -516,19 +522,19 @@ func (e *SignatureAlgorithmsExtension) Write(b []byte) (int, error) {
 	// RFC 5246, Section 7.4.1.4.1
 	var sigAndAlgs cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&sigAndAlgs) || sigAndAlgs.Empty() {
-		return 0, errors.New("unable to read signature algorithms extension data")
+		return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 	}
 	supportedSignatureAlgorithms := []SignatureScheme{}
 	for !sigAndAlgs.Empty() {
 		var sigAndAlg uint16
 		if !sigAndAlgs.ReadUint16(&sigAndAlg) {
-			return 0, errors.New("unable to read signature algorithms extension data")
+			return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 		}
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: signature_algorithms extension has trailing data")
+		return 0, utlserrors.New("tls: signature_algorithms extension has trailing data").AtError()
 	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil
@@ -536,7 +542,7 @@ func (e *SignatureAlgorithmsExtension) Write(b []byte) (int, error) {
 
 func (e *SignatureAlgorithmsExtension) writeToUConn(uc *UConn) error {
 	if len(e.SupportedSignatureAlgorithms) == 0 {
-		return errors.New("tls: signature_algorithms extension cannot be empty")
+		return utlserrors.New("tls: signature_algorithms extension cannot be empty").AtError()
 	}
 	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
 	return nil
@@ -581,15 +587,15 @@ func (e *StatusRequestV2Extension) Write(b []byte) (int, error) {
 	var statusType uint8
 	var ignored cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&ignored) || !ignored.ReadUint8(&statusType) {
-		return fullLen, errors.New("unable to read status request v2 extension data")
+		return fullLen, utlserrors.New("unable to read status request v2 extension data").AtError()
 	}
 
 	if statusType != statusV2TypeOCSP {
-		return fullLen, errors.New("status request v2 extension statusType is not statusV2TypeOCSP(2)")
+		return fullLen, utlserrors.New("status request v2 extension statusType is not statusV2TypeOCSP(2)").AtError()
 	}
 
 	if !extData.Empty() {
-		return fullLen, errors.New("status request v2 extension has trailing data")
+		return fullLen, utlserrors.New("status request v2 extension has trailing data").AtError()
 	}
 
 	return fullLen, nil
@@ -611,10 +617,10 @@ func (e *SignatureAlgorithmsCertExtension) Len() int {
 func (e *SignatureAlgorithmsCertExtension) Read(b []byte) (int, error) {
 	// Extension data must fit in uint16 (max 65535): 2 + 2*N <= 65535, so max N = 32766
 	if len(e.SupportedSignatureAlgorithms) > 32766 {
-		return 0, errors.New("tls: too many cert signature algorithms (max 32766)")
+		return 0, utlserrors.New("tls: too many cert signature algorithms (max 32766)").AtError()
 	}
 	if len(e.SupportedSignatureAlgorithms) == 0 {
-		return 0, errors.New("tls: signature_algorithms_cert extension cannot be empty")
+		return 0, utlserrors.New("tls: signature_algorithms_cert extension cannot be empty").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -651,7 +657,7 @@ func (e *SignatureAlgorithmsCertExtension) UnmarshalJSON(data []byte) error {
 		if scheme, ok := dicttls.DictSignatureSchemeNameIndexed[sigScheme]; ok {
 			e.SupportedSignatureAlgorithms = append(e.SupportedSignatureAlgorithms, SignatureScheme(scheme))
 		} else {
-			return fmt.Errorf("unknown cert signature scheme: %s", sigScheme)
+			return utlserrors.New("unknown cert signature scheme: ", sigScheme).AtError()
 		}
 	}
 	return nil
@@ -666,19 +672,19 @@ func (e *SignatureAlgorithmsCertExtension) Write(b []byte) (int, error) {
 	// RFC 8446, Section 4.2.3
 	var sigAndAlgs cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&sigAndAlgs) || sigAndAlgs.Empty() {
-		return 0, errors.New("unable to read signature algorithms extension data")
+		return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 	}
 	supportedSignatureAlgorithms := []SignatureScheme{}
 	for !sigAndAlgs.Empty() {
 		var sigAndAlg uint16
 		if !sigAndAlgs.ReadUint16(&sigAndAlg) {
-			return 0, errors.New("unable to read signature algorithms extension data")
+			return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 		}
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: signature_algorithms_cert extension has trailing data")
+		return 0, utlserrors.New("tls: signature_algorithms_cert extension has trailing data").AtError()
 	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil
@@ -686,7 +692,7 @@ func (e *SignatureAlgorithmsCertExtension) Write(b []byte) (int, error) {
 
 func (e *SignatureAlgorithmsCertExtension) writeToUConn(uc *UConn) error {
 	if len(e.SupportedSignatureAlgorithms) == 0 {
-		return errors.New("tls: signature_algorithms_cert extension cannot be empty")
+		return utlserrors.New("tls: signature_algorithms_cert extension cannot be empty").AtError()
 	}
 	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
 	return nil
@@ -700,11 +706,15 @@ type ALPNExtension struct {
 func (e *ALPNExtension) writeToUConn(uc *UConn) error {
 	for _, proto := range e.AlpnProtocols {
 		if len(proto) == 0 {
-			return errors.New("tls: ALPN protocol cannot be empty")
+			return utlserrors.New("tls: ALPN protocol cannot be empty").AtError()
 		}
 		if len(proto) > 255 {
-			return errors.New("tls: ALPN protocol too long (max 255 bytes)")
+			return utlserrors.New("tls: ALPN protocol too long (max 255 bytes)").AtError()
 		}
+	}
+	// Debug log ALPN negotiation
+	if utlserrors.DebugLoggingEnabled && len(e.AlpnProtocols) > 0 {
+		utlserrors.LogDebug(context.Background(), "ALPN extension configured: protocols=", e.AlpnProtocols)
 	}
 	uc.config.NextProtos = e.AlpnProtocols
 	uc.HandshakeState.Hello.AlpnProtocols = e.AlpnProtocols
@@ -727,7 +737,7 @@ func (e *ALPNExtension) Read(b []byte) (int, error) {
 	// Validate protocol lengths before writing (defense in depth)
 	for _, s := range e.AlpnProtocols {
 		if len(s) == 0 || len(s) > 255 {
-			return 0, errors.New("tls: invalid ALPN protocol length (must be 1-255 bytes)")
+			return 0, utlserrors.New("tls: invalid ALPN protocol length (must be 1-255 bytes)").AtError()
 		}
 	}
 
@@ -773,18 +783,22 @@ func (e *ALPNExtension) Write(b []byte) (int, error) {
 	// RFC 7301, Section 3.1
 	var protoList cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&protoList) || protoList.Empty() {
-		return 0, errors.New("unable to read ALPN extension data")
+		return 0, utlserrors.New("unable to read ALPN extension data").AtError()
 	}
 	alpnProtocols := []string{}
 	for !protoList.Empty() {
 		var proto cryptobyte.String
 		if !protoList.ReadUint8LengthPrefixed(&proto) || proto.Empty() {
-			return 0, errors.New("unable to read ALPN extension data")
+			return 0, utlserrors.New("unable to read ALPN extension data").AtError()
 		}
 		alpnProtocols = append(alpnProtocols, string(proto))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: ALPN extension has trailing data")
+		return 0, utlserrors.New("tls: ALPN extension has trailing data").AtError()
+	}
+	// Debug log ALPN parsing
+	if utlserrors.DebugLoggingEnabled && len(alpnProtocols) > 0 {
+		utlserrors.LogDebug(context.Background(), "ALPN extension parsed: protocols=", alpnProtocols)
 	}
 	e.AlpnProtocols = alpnProtocols
 	return fullLen, nil
@@ -811,7 +825,7 @@ func (e *applicationSettingsExtension) Len(supportedProtocols []string) int {
 
 func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []string) (int, error) {
 	if len(supportedProtocols) == 0 {
-		return 0, errors.New("tls: ALPS extension requires at least one protocol")
+		return 0, utlserrors.New("tls: ALPS extension requires at least one protocol").AtError()
 	}
 
 	if len(b) < e.Len(supportedProtocols) {
@@ -822,7 +836,7 @@ func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []strin
 	var totalProtocolBytes int
 	for _, s := range supportedProtocols {
 		if len(s) == 0 || len(s) > 255 {
-			return 0, errors.New("tls: invalid ALPS protocol length (must be 1-255 bytes)")
+			return 0, utlserrors.New("tls: invalid ALPS protocol length (must be 1-255 bytes)").AtError()
 		}
 		totalProtocolBytes += 1 + len(s) // 1 byte length prefix + protocol string
 	}
@@ -830,7 +844,7 @@ func (e *applicationSettingsExtension) Read(b []byte, supportedProtocols []strin
 	// Extension data layout: 2 bytes (ALPS list length) + protocol entries
 	// The ALPS list length field is uint16, so max value is 65535
 	if totalProtocolBytes > 65535 {
-		return 0, errors.New("tls: ALPS extension data too large (exceeds 65535 bytes)")
+		return 0, utlserrors.New("tls: ALPS extension data too large (exceeds 65535 bytes)").AtError()
 	}
 
 	// Read Type.
@@ -865,18 +879,18 @@ func (e *applicationSettingsExtension) Write(b []byte) ([]string, int, error) {
 	// https://datatracker.ietf.org/doc/html/draft-vvv-tls-alps-01
 	var protoList cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&protoList) || protoList.Empty() {
-		return nil, 0, errors.New("unable to read ALPN extension data")
+		return nil, 0, utlserrors.New("unable to read ALPN extension data").AtError()
 	}
 	alpnProtocols := []string{}
 	for !protoList.Empty() {
 		var proto cryptobyte.String
 		if !protoList.ReadUint8LengthPrefixed(&proto) || proto.Empty() {
-			return nil, 0, errors.New("unable to read ALPN extension data")
+			return nil, 0, utlserrors.New("unable to read ALPN extension data").AtError()
 		}
 		alpnProtocols = append(alpnProtocols, string(proto))
 	}
 	if !extData.Empty() {
-		return nil, 0, errors.New("tls: ALPS extension has trailing data")
+		return nil, 0, utlserrors.New("tls: ALPS extension has trailing data").AtError()
 	}
 	return alpnProtocols, fullLen, nil
 }
@@ -999,7 +1013,7 @@ func (e *SCTExtension) Read(b []byte) (int, error) {
 	dataLen := extLen - 4
 	// Validate extension data fits in uint16 length field
 	if dataLen > 65535 {
-		return 0, errors.New("tls: SCT extension data too large for uint16 length field")
+		return 0, utlserrors.New("tls: SCT extension data too large for uint16 length field").AtError()
 	}
 
 	b[0] = byte(extensionSCT >> 8)
@@ -1048,7 +1062,7 @@ func (e *SCTExtension) Write(b []byte) (int, error) {
 	// Read SCT list (uint16 length-prefixed)
 	var sctList cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&sctList) {
-		return 0, errors.New("tls: unable to read SCT list length")
+		return 0, utlserrors.New("tls: unable to read SCT list length").AtError()
 	}
 
 	// Empty SCT list after length prefix is valid (advertises support)
@@ -1062,10 +1076,10 @@ func (e *SCTExtension) Write(b []byte) (int, error) {
 	for !sctList.Empty() {
 		var sct []byte
 		if !readUint16LengthPrefixed(&sctList, &sct) {
-			return 0, errors.New("tls: unable to read SCT data")
+			return 0, utlserrors.New("tls: unable to read SCT data").AtError()
 		}
 		if len(sct) == 0 {
-			return 0, errors.New("tls: empty SCT in SCT list")
+			return 0, utlserrors.New("tls: empty SCT in SCT list").AtError()
 		}
 		scts = append(scts, sct)
 	}
@@ -1093,7 +1107,7 @@ func (e *GenericExtension) Read(b []byte) (int, error) {
 	// Extension data length is stored as uint16 (max 65535).
 	// Header is 4 bytes (2 type + 2 length), so max data is 65531.
 	if len(e.Data) > 65531 {
-		return 0, errors.New("tls: extension data too long")
+		return 0, utlserrors.New("tls: extension data too long").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -1122,7 +1136,7 @@ func (e *GenericExtension) UnmarshalJSON(b []byte) error {
 	if id, ok := dicttls.DictExtTypeNameIndexed[genericExtension.Name]; ok {
 		e.Id = id
 	} else {
-		return fmt.Errorf("unknown extension name %s", genericExtension.Name)
+		return utlserrors.New("unknown extension name ", genericExtension.Name).AtError()
 	}
 	e.Data = genericExtension.Data
 	return nil
@@ -1168,7 +1182,7 @@ func (e *ExtendedMasterSecretExtension) Write(b []byte) (int, error) {
 	// RFC 7627 Section 5.1: extended_master_secret extension MUST have
 	// zero-length extension_data. The entire encoding is 00 17 00 00.
 	if len(b) != 0 {
-		return 0, errors.New("tls: extended_master_secret extension must have empty data per RFC 7627")
+		return 0, utlserrors.New("tls: extended_master_secret extension must have empty data per RFC 7627").AtError()
 	}
 	return 0, nil
 }
@@ -1222,7 +1236,7 @@ func (e *UtlsGREASEExtension) SetGREASEValue(v uint16) error {
 		return nil
 	}
 	if !IsValidGREASEValue(v) {
-		return fmt.Errorf("tls: invalid extension value 0x%04x", v)
+		return utlserrors.New("tls: invalid extension value 0x", fmt.Sprintf("%04x", v)).AtError()
 	}
 	e.Value = v
 	return nil
@@ -1261,7 +1275,7 @@ func (e *UtlsGREASEExtension) Read(b []byte) (int, error) {
 	// Validate that Value is a valid GREASE value per RFC 8701.
 	// GREASE values must follow the pattern 0x?a?a where both bytes are identical.
 	if !IsValidGREASEValue(value) {
-		return 0, fmt.Errorf("tls: invalid extension value 0x%04x", value)
+		return 0, utlserrors.New("tls: invalid extension value 0x", fmt.Sprintf("%04x", value)).AtError()
 	}
 
 	b[0] = byte(value >> 8)
@@ -1298,7 +1312,7 @@ func (e *UtlsGREASEExtension) UnmarshalJSON(b []byte) error {
 	}
 
 	if !IsValidGREASEValue(jsonObj.Id) {
-		return fmt.Errorf("tls: invalid extension value 0x%04x", jsonObj.Id)
+		return utlserrors.New("tls: invalid extension value 0x", fmt.Sprintf("%04x", jsonObj.Id)).AtError()
 	}
 
 	if jsonObj.KeepID {
@@ -1360,7 +1374,7 @@ func (e *UtlsPaddingExtension) Read(b []byte) (int, error) {
 	}
 	// Validate PaddingLen before writing to buffer
 	if e.PaddingLen < 0 {
-		return 0, errors.New("tls: negative padding length")
+		return 0, utlserrors.New("tls: negative padding length").AtError()
 	}
 	// Max extension data is 65535 bytes (uint16), header is 4 bytes
 	paddingLen := e.PaddingLen
@@ -1458,12 +1472,12 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 
 	// Validate algorithms list is not empty (RFC 8879 requires at least one algorithm)
 	if len(e.Algorithms) == 0 {
-		return 0, errors.New("tls: compress_certificate extension requires at least one algorithm")
+		return 0, utlserrors.New("tls: compress_certificate extension requires at least one algorithm").AtError()
 	}
 
 	// Each algorithm is 2 bytes, length field is 1 byte (max 255), so max 127 algorithms
 	if len(e.Algorithms) > 127 {
-		return 0, errors.New("tls: too many compression algorithms (max 127)")
+		return 0, utlserrors.New("tls: too many compression algorithms (max 127)").AtError()
 	}
 
 	// Validate algorithm IDs per RFC 8879 Section 7.3:
@@ -1475,7 +1489,7 @@ func (e *UtlsCompressCertExtension) Read(b []byte) (int, error) {
 		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
 		isExperimentalRange := alg >= 16384
 		if !isStandardAlgorithm && !isExperimentalRange {
-			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d (valid: 1=zlib, 2=brotli, 3=zstd, or 16384-65535 for experimental)", alg)
+			return 0, utlserrors.New("tls: invalid certificate compression algorithm ID ", alg, " (valid: 1=zlib, 2=brotli, 3=zstd, or 16384-65535 for experimental)").AtError()
 		}
 	}
 
@@ -1506,29 +1520,29 @@ func (e *UtlsCompressCertExtension) Write(b []byte) (int, error) {
 	methods := []CertCompressionAlgo{}
 	methodsRaw := new(cryptobyte.String)
 	if !extData.ReadUint8LengthPrefixed(methodsRaw) {
-		return 0, errors.New("unable to read cert compression algorithms extension data")
+		return 0, utlserrors.New("unable to read cert compression algorithms extension data").AtError()
 	}
 	for !methodsRaw.Empty() {
 		var method uint16
 		if !methodsRaw.ReadUint16(&method) {
-			return 0, errors.New("unable to read cert compression algorithms extension data")
+			return 0, utlserrors.New("unable to read cert compression algorithms extension data").AtError()
 		}
 		methods = append(methods, CertCompressionAlgo(method))
 	}
 
 	// Validate parsed algorithms per RFC 8879
 	if len(methods) == 0 {
-		return 0, errors.New("tls: compress_certificate extension requires at least one algorithm")
+		return 0, utlserrors.New("tls: compress_certificate extension requires at least one algorithm").AtError()
 	}
 	for _, alg := range methods {
 		isStandardAlgorithm := alg == CertCompressionZlib || alg == CertCompressionBrotli || alg == CertCompressionZstd
 		isExperimentalRange := alg >= 16384
 		if !isStandardAlgorithm && !isExperimentalRange {
-			return 0, fmt.Errorf("tls: invalid certificate compression algorithm ID %d", alg)
+			return 0, utlserrors.New("tls: invalid certificate compression algorithm ID ", alg).AtError()
 		}
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: compress_certificate extension has trailing data")
+		return 0, utlserrors.New("tls: compress_certificate extension has trailing data").AtError()
 	}
 
 	e.Algorithms = methods
@@ -1547,7 +1561,7 @@ func (e *UtlsCompressCertExtension) UnmarshalJSON(b []byte) error {
 		if alg, ok := dicttls.DictCertificateCompressionAlgorithmNameIndexed[algorithm]; ok {
 			e.Algorithms = append(e.Algorithms, CertCompressionAlgo(alg))
 		} else {
-			return fmt.Errorf("unknown certificate compression algorithm %s", algorithm)
+			return utlserrors.New("unknown certificate compression algorithm ", algorithm).AtError()
 		}
 	}
 	return nil
@@ -1576,12 +1590,16 @@ func (e *KeyShareExtension) Read(b []byte) (int, error) {
 		// For Read, Data must be present and non-empty for non-GREASE groups
 		// GREASE key shares can have any data including empty (RFC 8701)
 		if len(ks.Data) == 0 && !isGREASEUint16(uint16(ks.Group)) && ks.Group != GREASE_PLACEHOLDER {
-			return 0, fmt.Errorf("tls: key_share at index %d has empty key data", i)
+			return 0, utlserrors.New("tls: key_share at index ", i, " has empty key data").AtError()
 		}
 		// Validate group ID and key size
 		if err := validateKeyShare(ks); err != nil {
 			return 0, err
 		}
+	}
+	// Debug log key share
+	if utlserrors.DebugLoggingEnabled && len(e.KeyShares) > 0 {
+		utlserrors.LogDebug(context.Background(), "key_share extension: groups=", len(e.KeyShares))
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -1614,7 +1632,7 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 	// RFC 8446, Section 4.2.8
 	var clientShares cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&clientShares) {
-		return 0, errors.New("unable to read key share extension data")
+		return 0, utlserrors.New("unable to read key share extension data").AtError()
 	}
 	keyShares := []KeyShare{}
 	for !clientShares.Empty() {
@@ -1623,7 +1641,7 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 		if !clientShares.ReadUint16(&group) ||
 			!readUint16LengthPrefixed(&clientShares, &ks.Data) ||
 			len(ks.Data) == 0 {
-			return 0, errors.New("unable to read key share extension data")
+			return 0, utlserrors.New("unable to read key share extension data").AtError()
 		}
 		ks.Group = CurveID(unGREASEUint16(group))
 		// if not GREASE, key share data will be discarded as it should
@@ -1634,7 +1652,11 @@ func (e *KeyShareExtension) Write(b []byte) (int, error) {
 		keyShares = append(keyShares, ks)
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: key_share extension has trailing data")
+		return 0, utlserrors.New("tls: key_share extension has trailing data").AtError()
+	}
+	// Debug log key share parsing
+	if utlserrors.DebugLoggingEnabled && len(keyShares) > 0 {
+		utlserrors.LogDebug(context.Background(), "key_share extension parsed: groups=", len(keyShares))
 	}
 	e.KeyShares = keyShares
 	return fullLen, nil
@@ -1714,7 +1736,7 @@ func validateKeyShare(ks KeyShare) error {
 	// Always validate group ID first - invalid groups must be rejected
 	// regardless of whether Data is present
 	if !isValidKeyShareGroup(ks.Group) {
-		return fmt.Errorf("tls: key_share has invalid group ID %d", ks.Group)
+		return utlserrors.New("tls: key_share has invalid group ID ", ks.Group).AtError()
 	}
 
 	// For GREASE values, any data is valid including empty (RFC 8701)
@@ -1732,14 +1754,13 @@ func validateKeyShare(ks KeyShare) error {
 
 	// Empty key data is invalid per RFC 8446 Section 4.2.8 (for non-GREASE groups)
 	if len(ks.Data) == 0 {
-		return fmt.Errorf("tls: key_share for group %d has empty key data", ks.Group)
+		return utlserrors.New("tls: key_share for group ", ks.Group, " has empty key data").AtError()
 	}
 
 	// Validate key size for known curves
 	expectedSize := expectedKeyShareSize(ks.Group)
 	if expectedSize > 0 && len(ks.Data) != expectedSize {
-		return fmt.Errorf("tls: key_share for group %d has invalid size %d (expected %d bytes)",
-			ks.Group, len(ks.Data), expectedSize)
+		return utlserrors.New("tls: key_share for group ", ks.Group, " has invalid size ", len(ks.Data), " (expected ", expectedSize, " bytes)").AtError()
 	}
 
 	return nil
@@ -1749,7 +1770,7 @@ func (e *KeyShareExtension) writeToUConn(uc *UConn) error {
 	// Validate all key shares before applying to connection
 	for i, ks := range e.KeyShares {
 		if err := validateKeyShare(ks); err != nil {
-			return fmt.Errorf("tls: invalid key share at index %d: %w", i, err)
+			return utlserrors.New("tls: invalid key share at index ", i).Base(err).AtError()
 		}
 	}
 	uc.HandshakeState.Hello.KeyShares = e.KeyShares
@@ -1783,7 +1804,7 @@ func (e *KeyShareExtension) UnmarshalJSON(b []byte) error {
 			}
 			e.KeyShares = append(e.KeyShares, ks)
 		} else {
-			return fmt.Errorf("unknown group %s", clientShare.Group)
+			return utlserrors.New("unknown group ", clientShare.Group).AtError()
 		}
 	}
 	return nil
@@ -1830,7 +1851,7 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 	// e.Len() is called above, which sets e.marshalResult
 	// TLS extension data length is encoded as uint16, so max 65535 bytes
 	if len(e.marshalResult) > 65535 {
-		return 0, errors.New("tls: QUIC transport parameters too large for TLS extension (max 65535 bytes)")
+		return 0, utlserrors.New("tls: QUIC transport parameters too large for TLS extension (max 65535 bytes)").AtError()
 	}
 
 	b[0] = byte(extensionQUICTransportParameters >> 8)
@@ -1875,12 +1896,12 @@ func (e *PSKKeyExchangeModesExtension) Read(b []byte) (int, error) {
 	}
 
 	if len(e.Modes) > 255 {
-		return 0, errors.New("too many PSK Key Exchange modes")
+		return 0, utlserrors.New("too many PSK Key Exchange modes").AtError()
 	}
 
 	// RFC 8446 Section 4.2.9: modes list cannot be empty
 	if len(e.Modes) == 0 {
-		return 0, errors.New("tls: PSK key exchange modes list cannot be empty per RFC 8446")
+		return 0, utlserrors.New("tls: PSK key exchange modes list cannot be empty per RFC 8446").AtError()
 	}
 
 	// Validate mode values and check for duplicates
@@ -1888,12 +1909,16 @@ func (e *PSKKeyExchangeModesExtension) Read(b []byte) (int, error) {
 	for _, mode := range e.Modes {
 		// Valid modes per RFC 8446: psk_ke (0) and psk_dhe_ke (1)
 		if mode != pskModePlain && mode != pskModeDHE {
-			return 0, fmt.Errorf("tls: invalid PSK key exchange mode %d, must be 0 (psk_ke) or 1 (psk_dhe_ke)", mode)
+			return 0, utlserrors.New("tls: invalid PSK key exchange mode ", mode, ", must be 0 (psk_ke) or 1 (psk_dhe_ke)").AtError()
 		}
 		if seen[mode] {
-			return 0, fmt.Errorf("tls: duplicate PSK key exchange mode %d", mode)
+			return 0, utlserrors.New("tls: duplicate PSK key exchange mode ", mode).AtError()
 		}
 		seen[mode] = true
+	}
+	// Debug log PSK modes
+	if utlserrors.DebugLoggingEnabled && len(e.Modes) > 0 {
+		utlserrors.LogDebug(context.Background(), "PSK key exchange modes: ", e.Modes)
 	}
 
 	b[0] = byte(extensionPSKModes >> 8)
@@ -1921,10 +1946,10 @@ func (e *PSKKeyExchangeModesExtension) Write(b []byte) (int, error) {
 	// https://tools.ietf.org/html/draft-ietf-tls-grease-01#section-2
 	pskModes := []uint8{}
 	if !readUint8LengthPrefixed(&extData, &pskModes) {
-		return 0, errors.New("unable to read PSK extension data")
+		return 0, utlserrors.New("unable to read PSK extension data").AtError()
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: psk_key_exchange_modes extension has trailing data")
+		return 0, utlserrors.New("tls: psk_key_exchange_modes extension has trailing data").AtError()
 	}
 	e.Modes = pskModes
 	return fullLen, nil
@@ -1947,7 +1972,7 @@ func (e *PSKKeyExchangeModesExtension) UnmarshalJSON(b []byte) error {
 		if modeID, ok := dicttls.DictPSKKeyExchangeModeNameIndexed[mode]; ok {
 			e.Modes = append(e.Modes, modeID)
 		} else {
-			return fmt.Errorf("unknown PSK Key Exchange Mode %s", mode)
+			return utlserrors.New("unknown PSK Key Exchange Mode ", mode).AtError()
 		}
 	}
 	return nil
@@ -1969,14 +1994,14 @@ func (e *SupportedVersionsExtension) Len() int {
 
 func (e *SupportedVersionsExtension) Read(b []byte) (int, error) {
 	if len(e.Versions) == 0 {
-		return 0, errors.New("tls: supported_versions extension cannot be empty")
+		return 0, utlserrors.New("tls: supported_versions extension cannot be empty").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
 	}
 	extLen := 2 * len(e.Versions)
 	if extLen > 255 {
-		return 0, errors.New("too many supported versions")
+		return 0, utlserrors.New("too many supported versions").AtError()
 	}
 
 	// Validate versions: must be valid TLS versions (0x0300-0x0304) or GREASE values
@@ -1985,15 +2010,19 @@ func (e *SupportedVersionsExtension) Read(b []byte) (int, error) {
 	for _, v := range e.Versions {
 		// Check for duplicates
 		if _, exists := seen[v]; exists {
-			return 0, fmt.Errorf("tls: duplicate version 0x%04x in supported_versions extension", v)
+			return 0, utlserrors.New("tls: duplicate version 0x", fmt.Sprintf("%04x", v), " in supported_versions extension").AtError()
 		}
 		seen[v] = struct{}{}
 
 		// Valid versions: SSL 3.0 (0x0300), TLS 1.0-1.3 (0x0301-0x0304), or GREASE values
 		isValidTLSVersion := v >= VersionSSL30 && v <= VersionTLS13
 		if !isValidTLSVersion && !isGREASEUint16(v) {
-			return 0, fmt.Errorf("tls: invalid version 0x%04x in supported_versions extension", v)
+			return 0, utlserrors.New("tls: invalid version 0x", fmt.Sprintf("%04x", v), " in supported_versions extension").AtError()
 		}
+	}
+	// Debug log supported versions
+	if utlserrors.DebugLoggingEnabled && len(e.Versions) > 0 {
+		utlserrors.LogDebug(context.Background(), "supported_versions extension: versions=", e.Versions)
 	}
 
 	b[0] = byte(extensionSupportedVersions >> 8)
@@ -2017,18 +2046,22 @@ func (e *SupportedVersionsExtension) Write(b []byte) (int, error) {
 	// RFC 8446, Section 4.2.1
 	var versList cryptobyte.String
 	if !extData.ReadUint8LengthPrefixed(&versList) || versList.Empty() {
-		return 0, errors.New("unable to read supported versions extension data")
+		return 0, utlserrors.New("unable to read supported versions extension data").AtError()
 	}
 	supportedVersions := []uint16{}
 	for !versList.Empty() {
 		var vers uint16
 		if !versList.ReadUint16(&vers) {
-			return 0, errors.New("unable to read supported versions extension data")
+			return 0, utlserrors.New("unable to read supported versions extension data").AtError()
 		}
 		supportedVersions = append(supportedVersions, unGREASEUint16(vers))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: supported_versions extension has trailing data")
+		return 0, utlserrors.New("tls: supported_versions extension has trailing data").AtError()
+	}
+	// Debug log supported versions parsing
+	if utlserrors.DebugLoggingEnabled && len(supportedVersions) > 0 {
+		utlserrors.LogDebug(context.Background(), "supported_versions extension parsed: versions=", supportedVersions)
 	}
 	e.Versions = supportedVersions
 	return fullLen, nil
@@ -2056,9 +2089,9 @@ func (e *SupportedVersionsExtension) UnmarshalJSON(b []byte) error {
 			e.Versions = append(e.Versions, VersionTLS10)
 		case "SSL 3.0": // deprecated
 			// 	e.Versions = append(e.Versions, VersionSSL30)
-			return fmt.Errorf("SSL 3.0 is deprecated")
+			return utlserrors.New("SSL 3.0 is deprecated").AtError()
 		default:
-			return fmt.Errorf("unknown version %s", version)
+			return utlserrors.New("unknown version ", version).AtError()
 		}
 	}
 	return nil
@@ -2068,12 +2101,12 @@ func (e *SupportedVersionsExtension) UnmarshalJSON(b []byte) error {
 //
 // This extension supports two modes:
 //
-// 1. Placeholder mode: When Cookie is nil/empty, Len() returns 0 and the extension
-//    is not serialized. This allows including a CookieExtension in ClientHelloSpec
-//    to reserve the position for HRR scenarios without affecting the initial ClientHello.
+//  1. Placeholder mode: When Cookie is nil/empty, Len() returns 0 and the extension
+//     is not serialized. This allows including a CookieExtension in ClientHelloSpec
+//     to reserve the position for HRR scenarios without affecting the initial ClientHello.
 //
-// 2. Active mode: When Cookie is set (typically after receiving HelloRetryRequest),
-//    the extension is serialized normally.
+//  2. Active mode: When Cookie is set (typically after receiving HelloRetryRequest),
+//     the extension is serialized normally.
 //
 // Using placeholder mode ensures that ClientHello2 (after HRR) maintains the same
 // extension ORDER as ClientHello1, which is important for fingerprint consistency.
@@ -2117,7 +2150,7 @@ func (e *CookieExtension) Read(b []byte) (int, error) {
 	}
 
 	if len(e.Cookie) > 65531 {
-		return 0, errors.New("tls: cookie too long")
+		return 0, utlserrors.New("tls: cookie too long").AtError()
 	}
 
 	cookieLen := len(e.Cookie)
@@ -2167,10 +2200,10 @@ func (e *NPNExtension) writeToUConn(uc *UConn) error {
 	// Per NPN spec, protocol names have the same constraints as ALPN
 	for _, proto := range e.NextProtos {
 		if len(proto) == 0 {
-			return errors.New("tls: NPN protocol cannot be empty")
+			return utlserrors.New("tls: NPN protocol cannot be empty").AtError()
 		}
 		if len(proto) > 255 {
-			return errors.New("tls: NPN protocol too long (max 255 bytes)")
+			return utlserrors.New("tls: NPN protocol too long (max 255 bytes)").AtError()
 		}
 	}
 	uc.config.NextProtos = e.NextProtos
@@ -2227,7 +2260,7 @@ func (e *RenegotiationInfoExtension) Len() int {
 func (e *RenegotiationInfoExtension) Read(b []byte) (int, error) {
 	// RFC 5746: renegotiated_connection is prefixed with 1-byte length, max 255 bytes
 	if len(e.RenegotiatedConnection) > 255 {
-		return 0, errors.New("tls: renegotiation_info data exceeds maximum length of 255 bytes")
+		return 0, utlserrors.New("tls: renegotiation_info data exceeds maximum length of 255 bytes").AtError()
 	}
 
 	if len(b) < e.Len() {
@@ -2322,7 +2355,7 @@ func (e *FakeChannelIDExtension) Write(b []byte) (int, error) {
 	// draft-balfanz-tls-channelid: Channel ID extension has zero-length data.
 	// This is a flag-only extension signaling support without payload.
 	if len(b) != 0 {
-		return 0, errors.New("tls: channel_id extension must have empty data")
+		return 0, utlserrors.New("tls: channel_id extension must have empty data").AtError()
 	}
 	return 0, nil
 }
@@ -2361,7 +2394,7 @@ func (e *FakeEncryptThenMACExtension) Write(b []byte) (int, error) {
 	// RFC 7366: encrypt_then_mac extension MUST have zero-length extension_data.
 	// This is a flag-only extension with no payload.
 	if len(b) != 0 {
-		return 0, errors.New("tls: encrypt_then_mac extension must have empty data per RFC 7366")
+		return 0, utlserrors.New("tls: encrypt_then_mac extension must have empty data per RFC 7366").AtError()
 	}
 	return 0, nil
 }
@@ -2419,7 +2452,7 @@ func (e *EarlyDataExtension) Read(b []byte) (int, error) {
 func (e *EarlyDataExtension) Write(b []byte) (int, error) {
 	// RFC 8446 Section 4.2.10: In ClientHello, early_data MUST have zero-length extension_data.
 	if len(b) != 0 {
-		return 0, errors.New("tls: early_data extension in ClientHello must have empty data per RFC 8446")
+		return 0, utlserrors.New("tls: early_data extension in ClientHello must have empty data per RFC 8446").AtError()
 	}
 	return 0, nil
 }
@@ -2457,7 +2490,7 @@ type RecordSizeLimitExtension struct {
 func (e *RecordSizeLimitExtension) writeToUConn(uc *UConn) error {
 	// Validate the limit before storing
 	if e.Limit < 64 || e.Limit > 16385 {
-		return errors.New("tls: record_size_limit must be between 64 and 16385")
+		return utlserrors.New("tls: record_size_limit must be between 64 and 16385").AtError()
 	}
 	// Store our advertised limit for receiver-side enforcement (RFC 8449 Section 4)
 	uc.Conn.utls.advertisedRecordSizeLimit = e.Limit
@@ -2474,7 +2507,7 @@ func (e *RecordSizeLimitExtension) Read(b []byte) (int, error) {
 	}
 	// RFC 8449: record_size_limit must be between 64 and 16385 (2^14+1)
 	if e.Limit < 64 || e.Limit > 16385 {
-		return 0, errors.New("tls: record_size_limit must be between 64 and 16385")
+		return 0, utlserrors.New("tls: record_size_limit must be between 64 and 16385").AtError()
 	}
 	// Use the standard extension constant
 	b[0] = byte(extensionRecordSizeLimit >> 8)
@@ -2492,11 +2525,11 @@ func (e *RecordSizeLimitExtension) Write(b []byte) (int, error) {
 	fullLen := len(b)
 	extData := cryptobyte.String(b)
 	if !extData.ReadUint16(&e.Limit) {
-		return 0, errors.New("unable to read record size limit extension data")
+		return 0, utlserrors.New("unable to read record size limit extension data").AtError()
 	}
 	// RFC 8449: record_size_limit must be between 64 and 16385 (2^14+1)
 	if e.Limit < 64 || e.Limit > 16385 {
-		return 0, errors.New("tls: record_size_limit must be between 64 and 16385")
+		return 0, utlserrors.New("tls: record_size_limit must be between 64 and 16385").AtError()
 	}
 	return fullLen, nil
 }
@@ -2538,16 +2571,16 @@ func (e *FakeTokenBindingExtension) Len() int {
 func (e *FakeTokenBindingExtension) Read(b []byte) (int, error) {
 	// Validate key parameters list is not empty
 	if len(e.KeyParameters) == 0 {
-		return 0, errors.New("tls: token_binding extension requires at least one key parameter")
+		return 0, utlserrors.New("tls: token_binding extension requires at least one key parameter").AtError()
 	}
 	// Key parameters length is stored in a single byte (uint8), max 255
 	if len(e.KeyParameters) > 255 {
-		return 0, errors.New("tls: token_binding extension key parameters list too long (max 255)")
+		return 0, utlserrors.New("tls: token_binding extension key parameters list too long (max 255)").AtError()
 	}
 	// Validate version is reasonable (RFC 8472 defines version 1.0)
 	// Allow some flexibility for future versions but catch obviously invalid values
 	if e.MajorVersion > 10 {
-		return 0, fmt.Errorf("tls: token_binding extension major version %d exceeds reasonable maximum (10)", e.MajorVersion)
+		return 0, utlserrors.New("tls: token_binding extension major version ", e.MajorVersion, " exceeds reasonable maximum (10)").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -2573,10 +2606,10 @@ func (e *FakeTokenBindingExtension) Write(b []byte) (int, error) {
 	if !extData.ReadUint8(&e.MajorVersion) ||
 		!extData.ReadUint8(&e.MinorVersion) ||
 		!extData.ReadUint8LengthPrefixed(&keyParameters) {
-		return 0, errors.New("unable to read token binding extension data")
+		return 0, utlserrors.New("unable to read token binding extension data").AtError()
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: token_binding extension has trailing data")
+		return 0, utlserrors.New("tls: token_binding extension has trailing data").AtError()
 	}
 	e.KeyParameters = keyParameters
 	return fullLen, nil
@@ -2605,7 +2638,7 @@ func (e *FakeTokenBindingExtension) UnmarshalJSON(data []byte) error {
 		case "ecdsap256":
 			e.KeyParameters = append(e.KeyParameters, 2)
 		default:
-			return fmt.Errorf("unknown token binding key parameter: %s", param)
+			return utlserrors.New("unknown token binding key parameter: ", param).AtError()
 		}
 	}
 	return nil
@@ -2627,12 +2660,12 @@ func (e *FakeDelegatedCredentialsExtension) Len() int {
 
 func (e *FakeDelegatedCredentialsExtension) Read(b []byte) (int, error) {
 	if len(e.SupportedSignatureAlgorithms) == 0 {
-		return 0, errors.New("tls: delegated_credentials extension requires at least one signature algorithm")
+		return 0, utlserrors.New("tls: delegated_credentials extension requires at least one signature algorithm").AtError()
 	}
 	// 2 bytes per algorithm, 2 byte length prefix, max 65533 for data in uint16 field
 	// (65535 - 2 byte list length prefix) / 2 = 32766 max algorithms
 	if len(e.SupportedSignatureAlgorithms) > 32766 {
-		return 0, errors.New("tls: too many signature algorithms in delegated_credentials")
+		return 0, utlserrors.New("tls: too many signature algorithms in delegated_credentials").AtError()
 	}
 	if len(b) < e.Len() {
 		return 0, io.ErrShortBuffer
@@ -2657,19 +2690,19 @@ func (e *FakeDelegatedCredentialsExtension) Write(b []byte) (int, error) {
 	//https://datatracker.ietf.org/doc/html/draft-ietf-tls-subcerts-15#section-4.1.1
 	var supportedAlgs cryptobyte.String
 	if !extData.ReadUint16LengthPrefixed(&supportedAlgs) || supportedAlgs.Empty() {
-		return 0, errors.New("unable to read signature algorithms extension data")
+		return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 	}
 	supportedSignatureAlgorithms := []SignatureScheme{}
 	for !supportedAlgs.Empty() {
 		var sigAndAlg uint16
 		if !supportedAlgs.ReadUint16(&sigAndAlg) {
-			return 0, errors.New("unable to read signature algorithms extension data")
+			return 0, utlserrors.New("unable to read signature algorithms extension data").AtError()
 		}
 		supportedSignatureAlgorithms = append(
 			supportedSignatureAlgorithms, SignatureScheme(sigAndAlg))
 	}
 	if !extData.Empty() {
-		return 0, errors.New("tls: delegated_credentials extension has trailing data")
+		return 0, utlserrors.New("tls: delegated_credentials extension has trailing data").AtError()
 	}
 	e.SupportedSignatureAlgorithms = supportedSignatureAlgorithms
 	return fullLen, nil
@@ -2693,7 +2726,7 @@ func (e *FakeDelegatedCredentialsExtension) UnmarshalJSON(data []byte) error {
 		if scheme, ok := dicttls.DictSignatureSchemeNameIndexed[sigScheme]; ok {
 			e.SupportedSignatureAlgorithms = append(e.SupportedSignatureAlgorithms, SignatureScheme(scheme))
 		} else {
-			return fmt.Errorf("unknown delegated credentials signature scheme: %s", sigScheme)
+			return utlserrors.New("unknown delegated credentials signature scheme: ", sigScheme).AtError()
 		}
 	}
 	return nil

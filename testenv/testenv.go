@@ -162,15 +162,22 @@ func GoTool() (string, error) {
 	if runtime.GOOS == "windows" {
 		exeSuffix = ".exe"
 	}
-	path := filepath.Join(runtime.GOROOT(), "bin", "go"+exeSuffix)
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	}
+
+	// Prefer LookPath which searches PATH reliably
 	goBin, err := exec.LookPath("go" + exeSuffix)
-	if err != nil {
-		return "", errors.New("cannot find go tool: " + err.Error())
+	if err == nil {
+		return goBin, nil
 	}
-	return goBin, nil
+
+	// Fallback: check GOROOT env var (not runtime.GOROOT which is deprecated since Go 1.24)
+	if goroot := os.Getenv("GOROOT"); goroot != "" {
+		path := filepath.Join(goroot, "bin", "go"+exeSuffix)
+		if _, statErr := os.Stat(path); statErr == nil {
+			return path, nil
+		}
+	}
+
+	return "", errors.New("cannot find go tool: " + err.Error())
 }
 
 // HasExec reports whether the current system can start new processes

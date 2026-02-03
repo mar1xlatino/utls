@@ -5,6 +5,7 @@
 package tls
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -992,6 +993,9 @@ func TestKeyMaterialZeroing_SetSessionTicketZerosOld(t *testing.T) {
 
 	// Get ticket and verify it's a copy
 	retrieved := state.GetSessionTicket()
+	if len(retrieved) == 0 {
+		t.Fatal("GetSessionTicket returned nil/empty after SetSessionTicket")
+	}
 	if &retrieved[0] == &oldTicket[0] {
 		t.Error("GetSessionTicket should return a copy, not the original slice")
 	}
@@ -1256,10 +1260,11 @@ func TestDefaultSessionCache_Exists(t *testing.T) {
 // TestErrSessionFrozen_ErrorMessage verifies the error message.
 func TestErrSessionFrozen_ErrorMessage(t *testing.T) {
 	t.Parallel()
-	expected := "tls: session state is frozen"
-	if ErrSessionFrozen.Error() != expected {
-		t.Errorf("ErrSessionFrozen.Error() = %q, expected %q",
-			ErrSessionFrozen.Error(), expected)
+	expectedMsg := "tls: session state is frozen"
+	actualErr := ErrSessionFrozen.Error()
+	if !strings.Contains(actualErr, expectedMsg) {
+		t.Errorf("ErrSessionFrozen.Error() = %q, expected to contain %q",
+			actualErr, expectedMsg)
 	}
 }
 
@@ -1487,6 +1492,9 @@ func TestGetFrozenExtensionOrder_ReturnsCopy(t *testing.T) {
 
 	// Get another copy
 	copy2 := state.GetFrozenExtensionOrder()
+	if copy2 == nil {
+		t.Fatal("Second GetFrozenExtensionOrder returned nil unexpectedly")
+	}
 
 	// Original should be unchanged
 	if copy2[0] != originalFirst {
@@ -1524,6 +1532,9 @@ func TestGetFrozenKeyShareGroups_ReturnsCopy(t *testing.T) {
 
 	// Get another copy
 	copy2 := state.GetFrozenKeyShareGroups()
+	if copy2 == nil {
+		t.Fatal("Second GetFrozenKeyShareGroups returned nil unexpectedly")
+	}
 
 	// Original should be unchanged
 	if copy2[0] != originalFirst {
@@ -1565,6 +1576,9 @@ func TestGetFrozenSigAlgOrder_ReturnsCopy(t *testing.T) {
 
 	// Get another copy
 	copy2 := state.GetFrozenSigAlgOrder()
+	if copy2 == nil {
+		t.Fatal("Second GetFrozenSigAlgOrder returned nil unexpectedly")
+	}
 
 	// Original should be unchanged
 	if copy2[0] != originalFirst {

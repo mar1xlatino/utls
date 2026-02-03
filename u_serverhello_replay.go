@@ -5,15 +5,17 @@
 package tls
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // JA4SVariationConfig controls JA4S fingerprint variation for anti-detection.
@@ -537,8 +539,15 @@ func (s *ServerHelloSynthesizer) Synthesize() ([]byte, error) {
 
 // synthesizeStandard creates a ServerHello using the original extension order.
 func (s *ServerHelloSynthesizer) synthesizeStandard() ([]byte, error) {
+	return s.synthesizeStandardWithContext(context.Background())
+}
+
+// synthesizeStandardWithContext creates a ServerHello using the original extension order with context for logging.
+func (s *ServerHelloSynthesizer) synthesizeStandardWithContext(ctx context.Context) ([]byte, error) {
+	utlserrors.LogDebug(ctx, "replay: synthesizing ServerHello (standard mode)")
+
 	if s.captured == nil {
-		return nil, errors.New("tls: no captured ServerHello")
+		return nil, utlserrors.New("tls: no captured ServerHello").AtError()
 	}
 
 	// Minimum: version(2) + random(32) + session_id_len(1) + cipher(2) + compression(1) = 38
@@ -552,7 +561,7 @@ func (s *ServerHelloSynthesizer) synthesizeStandard() ([]byte, error) {
 	}
 
 	if len(s.captured.Raw) < minSize {
-		return nil, errors.New("tls: captured ServerHello too short")
+		return nil, utlserrors.New("tls: captured ServerHello too short").AtError()
 	}
 
 	// Create a copy to modify
@@ -605,16 +614,18 @@ func (s *ServerHelloSynthesizer) synthesizeStandard() ([]byte, error) {
 
 	// Bounds check: ensure extension block fits within data
 	if offset+extLen > len(result) {
-		return nil, errors.New("tls: extension length exceeds data bounds")
+		return nil, utlserrors.New("tls: extension length exceeds data bounds").AtError()
 	}
 
 	if s.keyShareData != nil {
 		// Find and replace key share extension data
+		utlserrors.LogDebug(ctx, "replay: replacing key share data")
 		if err := s.replaceKeyShareInPlace(result, offset, extLen); err != nil {
 			return nil, err
 		}
 	}
 
+	utlserrors.LogDebug(ctx, "replay: ServerHello synthesis complete")
 	return result, nil
 }
 
@@ -629,12 +640,20 @@ func (s *ServerHelloSynthesizer) synthesizeStandard() ([]byte, error) {
 //
 // Returns the synthesized ServerHello with varied JA4S fingerprint.
 func (s *ServerHelloSynthesizer) SynthesizeWithShuffledExtensions() ([]byte, error) {
+	return s.SynthesizeWithShuffledExtensionsAndContext(context.Background())
+}
+
+// SynthesizeWithShuffledExtensionsAndContext rebuilds ServerHello with shuffled extensions and context for logging.
+func (s *ServerHelloSynthesizer) SynthesizeWithShuffledExtensionsAndContext(ctx context.Context) ([]byte, error) {
+	utlserrors.LogDebug(ctx, "replay: synthesizing ServerHello with shuffled extensions (JA4S variation)")
+
 	if s.captured == nil {
-		return nil, errors.New("tls: no captured ServerHello")
+		return nil, utlserrors.New("tls: no captured ServerHello").AtError()
 	}
 	if s.captured.ExtensionData == nil || len(s.captured.Extensions) == 0 {
 		// No extension data available for shuffling, fall back to standard
-		return s.synthesizeStandard()
+		utlserrors.LogDebug(ctx, "replay: no extension data for shuffling, falling back to standard")
+		return s.synthesizeStandardWithContext(ctx)
 	}
 
 	// Shuffle the extension order
@@ -761,7 +780,7 @@ func (s *ServerHelloSynthesizer) SynthesizeWithShuffledExtensions() ([]byte, err
 // Useful for logging and debugging JA4S variation.
 func (s *ServerHelloSynthesizer) GetShuffledJA4S() (string, error) {
 	if s.captured == nil {
-		return "", errors.New("tls: no captured ServerHello")
+		return "", utlserrors.New("tls: no captured ServerHello").AtError()
 	}
 	if len(s.captured.Extensions) <= 1 {
 		return s.captured.JA4S, nil
@@ -829,7 +848,7 @@ func computeJA4SFromComponents(version, cipher uint16, extensions []uint16, alpn
 // rebuildWithNewSessionID rebuilds the ServerHello with a different session ID length.
 func (s *ServerHelloSynthesizer) rebuildWithNewSessionID() ([]byte, error) {
 	// This is complex - for now, return error if session ID lengths don't match
-	return nil, errors.New("tls: session ID length mismatch, rebuild not implemented")
+	return nil, utlserrors.New("tls: session ID length mismatch, rebuild not implemented").AtError()
 }
 
 // replaceKeyShareInPlace replaces key share data in extensions.
@@ -839,20 +858,20 @@ func (s *ServerHelloSynthesizer) replaceKeyShareInPlace(data []byte, extStart, e
 
 	// Bounds check: ensure end doesn't exceed actual data length
 	if end > len(data) {
-		return errors.New("tls: extension block exceeds data bounds")
+		return utlserrors.New("tls: extension block exceeds data bounds").AtError()
 	}
 
 	for offset+4 <= end {
 		// Bounds check: ensure we can read extension header from actual data
 		if offset+4 > len(data) {
-			return errors.New("tls: truncated extension header")
+			return utlserrors.New("tls: truncated extension header").AtError()
 		}
 		extType := binary.BigEndian.Uint16(data[offset:])
 		extDataLen := int(binary.BigEndian.Uint16(data[offset+2:]))
 		offset += 4
 
 		if offset+extDataLen > end {
-			return errors.New("tls: malformed extension")
+			return utlserrors.New("tls: malformed extension").AtError()
 		}
 
 		if extType == extensionKeyShare {
@@ -861,23 +880,22 @@ func (s *ServerHelloSynthesizer) replaceKeyShareInPlace(data []byte, extStart, e
 			// - 2 bytes: key exchange length
 			// - N bytes: key exchange data
 			if extDataLen < 4 {
-				return errors.New("tls: key share extension too short")
+				return utlserrors.New("tls: key share extension too short").AtError()
 			}
 
 			// Bounds check: ensure we can read key exchange length
 			if offset+4 > len(data) {
-				return errors.New("tls: truncated key share extension")
+				return utlserrors.New("tls: truncated key share extension").AtError()
 			}
 
 			keyExchangeLen := int(binary.BigEndian.Uint16(data[offset+2:]))
 			if len(s.keyShareData) != keyExchangeLen {
-				return fmt.Errorf("tls: key share data length mismatch: got %d, need %d",
-					len(s.keyShareData), keyExchangeLen)
+				return utlserrors.New("tls: key share data length mismatch: got ", len(s.keyShareData), ", need ", keyExchangeLen).AtError()
 			}
 
 			// Bounds check: ensure we can write key share data
 			if offset+4+keyExchangeLen > len(data) {
-				return errors.New("tls: key share data exceeds buffer")
+				return utlserrors.New("tls: key share data exceeds buffer").AtError()
 			}
 
 			// Replace key share data
@@ -888,17 +906,17 @@ func (s *ServerHelloSynthesizer) replaceKeyShareInPlace(data []byte, extStart, e
 		offset += extDataLen
 	}
 
-	return errors.New("tls: key share extension not found")
+	return utlserrors.New("tls: key share extension not found").AtError()
 }
 
 // ValidateCompatibility checks if captured ServerHello is compatible with ClientHello.
 func (s *ServerHelloSynthesizer) ValidateCompatibility(clientHello *ClientHelloInfo) error {
 	if s.captured == nil {
-		return errors.New("tls: no captured ServerHello")
+		return utlserrors.New("tls: no captured ServerHello").AtError()
 	}
 
 	if clientHello == nil {
-		return errors.New("tls: no ClientHello provided")
+		return utlserrors.New("tls: no ClientHello provided").AtError()
 	}
 
 	// Check cipher suite is in client's list
@@ -910,7 +928,7 @@ func (s *ServerHelloSynthesizer) ValidateCompatibility(clientHello *ClientHelloI
 		}
 	}
 	if !cipherOK {
-		return fmt.Errorf("tls: cipher suite 0x%04x not in client's list", s.captured.CipherSuite)
+		return utlserrors.New("tls: cipher suite ", fmt.Sprintf("0x%04x", s.captured.CipherSuite), " not in client's list").AtError()
 	}
 
 	// Check key share group is supported
@@ -923,7 +941,7 @@ func (s *ServerHelloSynthesizer) ValidateCompatibility(clientHello *ClientHelloI
 			}
 		}
 		if !groupOK {
-			return fmt.Errorf("tls: key share group %d not supported by client", s.captured.KeyShareGroup)
+			return utlserrors.New("tls: key share group ", s.captured.KeyShareGroup, " not supported by client").AtError()
 		}
 	}
 
@@ -937,7 +955,7 @@ func (s *ServerHelloSynthesizer) ValidateCompatibility(clientHello *ClientHelloI
 			}
 		}
 		if !alpnOK {
-			return fmt.Errorf("tls: ALPN %q not in client's list", s.captured.SelectedALPN)
+			return utlserrors.New("tls: ALPN ", s.captured.SelectedALPN, " not in client's list").AtError()
 		}
 	}
 
@@ -973,7 +991,7 @@ type ProfileWarmer struct {
 // For panic-on-nil behavior, use MustNewProfileWarmer.
 func NewProfileWarmer(cache *ServerHelloCache, targets []string) (*ProfileWarmer, error) {
 	if cache == nil {
-		return nil, errors.New("tls: NewProfileWarmer requires non-nil cache")
+		return nil, utlserrors.New("tls: NewProfileWarmer requires non-nil cache").AtError()
 	}
 	return &ProfileWarmer{
 		cache:       cache,
@@ -1166,9 +1184,9 @@ func captureServerHello(conn net.Conn, config *Config, spec *ClientHelloSpec) (*
 	rawServerHello := uconn.RawServerHello()
 	if len(rawServerHello) == 0 {
 		if err != nil {
-			return nil, fmt.Errorf("handshake: %w", err)
+			return nil, utlserrors.New("tls: handshake failed").Base(err).AtError()
 		}
-		return nil, errors.New("tls: ServerHello not captured")
+		return nil, utlserrors.New("tls: ServerHello not captured").AtError()
 	}
 
 	// Parse the captured ServerHello
@@ -1197,6 +1215,13 @@ func extractHostname(target string) string {
 
 // ParseServerHello parses raw ServerHello bytes into CapturedServerHello.
 func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
+	return ParseServerHelloWithContext(context.Background(), raw)
+}
+
+// ParseServerHelloWithContext parses raw ServerHello bytes into CapturedServerHello with context for logging.
+func ParseServerHelloWithContext(ctx context.Context, raw []byte) (*CapturedServerHello, error) {
+	utlserrors.LogDebug(ctx, "replay: parsing ServerHello, length=", len(raw))
+
 	// Minimum: version(2) + random(32) + session_id_len(1) + cipher(2) + compression(1) = 38
 	minSize := 38
 
@@ -1208,7 +1233,7 @@ func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
 	}
 
 	if len(raw) < minSize {
-		return nil, errors.New("tls: ServerHello too short")
+		return nil, utlserrors.New("tls: ServerHello too short").AtError()
 	}
 
 	captured := &CapturedServerHello{
@@ -1218,32 +1243,32 @@ func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
 
 	// Legacy version
 	if offset+2 > len(raw) {
-		return nil, errors.New("tls: ServerHello truncated at version")
+		return nil, utlserrors.New("tls: ServerHello truncated at version").AtError()
 	}
 	captured.Version = binary.BigEndian.Uint16(raw[offset:])
 	offset += 2
 
 	// Random (32 bytes)
 	if offset+32 > len(raw) {
-		return nil, errors.New("tls: ServerHello truncated at random")
+		return nil, utlserrors.New("tls: ServerHello truncated at random").AtError()
 	}
 	copy(captured.Random[:], raw[offset:offset+32])
 	offset += 32
 
 	// Session ID length
 	if offset >= len(raw) {
-		return nil, errors.New("tls: ServerHello truncated at session ID length")
+		return nil, utlserrors.New("tls: ServerHello truncated at session ID length").AtError()
 	}
 	sessionIDLen := int(raw[offset])
 
 	// RFC 8446: legacy_session_id must be 0-32 bytes
 	if sessionIDLen > 32 {
-		return nil, errors.New("tls: ServerHello session ID exceeds maximum length (32 bytes)")
+		return nil, utlserrors.New("tls: ServerHello session ID exceeds maximum length (32 bytes)").AtError()
 	}
 	offset++
 	if sessionIDLen > 0 {
 		if offset+sessionIDLen > len(raw) {
-			return nil, errors.New("tls: invalid session ID length")
+			return nil, utlserrors.New("tls: invalid session ID length").AtError()
 		}
 		captured.SessionID = make([]byte, sessionIDLen)
 		copy(captured.SessionID, raw[offset:offset+sessionIDLen])
@@ -1252,14 +1277,15 @@ func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
 
 	// Cipher suite
 	if offset+2 > len(raw) {
-		return nil, errors.New("tls: ServerHello truncated at cipher suite")
+		return nil, utlserrors.New("tls: ServerHello truncated at cipher suite").AtError()
 	}
 	captured.CipherSuite = binary.BigEndian.Uint16(raw[offset:])
+	utlserrors.LogDebug(ctx, "replay: ServerHello cipher suite=", fmt.Sprintf("0x%04x", captured.CipherSuite))
 	offset += 2
 
 	// Compression method
 	if offset >= len(raw) {
-		return nil, errors.New("tls: ServerHello truncated at compression")
+		return nil, utlserrors.New("tls: ServerHello truncated at compression").AtError()
 	}
 	captured.CompressionMethod = raw[offset]
 	offset++
@@ -1271,7 +1297,7 @@ func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
 
 		// Bounds check: ensure extLen doesn't exceed remaining data
 		if offset+extLen > len(raw) {
-			return nil, errors.New("tls: ServerHello extensions length exceeds data")
+			return nil, utlserrors.New("tls: ServerHello extensions length exceeds data").AtError()
 		}
 
 		if err := parseServerHelloExtensions(captured, raw[offset:offset+extLen]); err != nil {
@@ -1280,6 +1306,7 @@ func ParseServerHello(raw []byte) (*CapturedServerHello, error) {
 	}
 
 	captured.Fingerprint = captured.ComputeFingerprint()
+	utlserrors.LogDebug(ctx, "replay: ServerHello parsing complete")
 	return captured, nil
 }
 
@@ -1300,7 +1327,7 @@ func parseServerHelloExtensions(captured *CapturedServerHello, data []byte) erro
 		offset += 4
 
 		if offset+extLen > len(data) {
-			return errors.New("tls: malformed extension")
+			return utlserrors.New("tls: malformed extension").AtError()
 		}
 
 		captured.Extensions = append(captured.Extensions, extType)

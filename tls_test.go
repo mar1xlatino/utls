@@ -308,9 +308,6 @@ func TestDeadlineOnWrite(t *testing.T) {
 	}
 
 	// Verify the error
-	if ne := err.(net.Error); ne.Temporary() != false {
-		t.Error("Write timed out but incorrectly classified the error as Temporary")
-	}
 	if !isTimeoutError(err) {
 		t.Error("Write timed out but did not classify the error as a Timeout")
 	}
@@ -990,6 +987,8 @@ func TestCloneNonFuncFields(t *testing.T) {
 			f.Set(reflect.ValueOf(true))
 		case "InsecureServerNameToVerify":
 			f.Set(reflect.ValueOf("c"))
+		case "InsecureMaxExpiredAge": // [uTLS] max expired cert age
+			f.Set(reflect.ValueOf(time.Hour * 24 * 7)) // 7 days
 		case "MinVersion", "MaxVersion":
 			f.Set(reflect.ValueOf(uint16(VersionTLS12)))
 		case "SessionTicketKey":

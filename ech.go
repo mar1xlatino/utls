@@ -6,11 +6,13 @@ package tls
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/hpke"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -67,40 +69,51 @@ type echConfig struct {
 }
 
 // Use generic error to avoid revealing ECH configuration parsing
-var errMalformedECHConfig = errors.New("tls: malformed configuration")
+var errMalformedECHConfig = utlserrors.New("tls: malformed configuration").AtError()
 
 func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: parsing config, input length=", len(enc))
+
 	s := cryptobyte.String(enc)
 	ec.raw = []byte(enc)
 	if !s.ReadUint16(&ec.Version) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read config version")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	if !s.ReadUint16(&ec.Length) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read config length")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	// Use int arithmetic to prevent uint16 overflow when ec.Length is near MaxUint16.
 	// Without this, ec.Length+4 could wrap around (e.g., 65535+4=3 in uint16).
 	totalLen := int(ec.Length) + 4
 	if len(ec.raw) < totalLen {
+		utlserrors.LogDebug(ctx, "ECH: config data too short, have=", len(ec.raw), " need=", totalLen)
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	ec.raw = ec.raw[:totalLen]
 	if ec.Version != extensionEncryptedClientHello {
+		utlserrors.LogDebug(ctx, "ECH: skipping config with unsupported version=0x", fmt.Sprintf("%04x", ec.Version))
 		s.Skip(int(ec.Length))
 		return true, echConfig{}, nil
 	}
 	if !s.ReadUint8(&ec.ConfigID) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read config ID")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	if !s.ReadUint16(&ec.KemID) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read KEM ID")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	if !readUint16LengthPrefixed(&s, &ec.PublicKey) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read public key")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	// Validate public key is not empty
 	if len(ec.PublicKey) == 0 {
-		return false, echConfig{}, errors.New("tls: config has empty public key")
+		utlserrors.LogDebug(ctx, "ECH: config has empty public key")
+		return false, echConfig{}, utlserrors.New("tls: config has empty public key").AtError()
 	}
 	// Validate public key length based on KEM type.
 	// This prevents cryptographic errors when SetupSender() is called.
@@ -108,34 +121,41 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	case 0x0010: // DHKEM(P-256, HKDF-SHA256)
 		// P-256 uncompressed point: 0x04 prefix + 32 bytes X + 32 bytes Y = 65 bytes
 		if len(ec.PublicKey) != 65 {
-			return false, echConfig{}, errors.New("tls: config has invalid P-256 public key length")
+			utlserrors.LogDebug(ctx, "ECH: invalid P-256 public key length=", len(ec.PublicKey), " expected=65")
+			return false, echConfig{}, utlserrors.New("tls: config has invalid P-256 public key length").AtError()
 		}
 	case 0x0011: // DHKEM(P-384, HKDF-SHA384)
 		// P-384 uncompressed point: 0x04 prefix + 48 bytes X + 48 bytes Y = 97 bytes
 		if len(ec.PublicKey) != 97 {
-			return false, echConfig{}, errors.New("tls: config has invalid P-384 public key length")
+			utlserrors.LogDebug(ctx, "ECH: invalid P-384 public key length=", len(ec.PublicKey), " expected=97")
+			return false, echConfig{}, utlserrors.New("tls: config has invalid P-384 public key length").AtError()
 		}
 	case 0x0020: // DHKEM(X25519, HKDF-SHA256)
 		// X25519 public key is exactly 32 bytes
 		if len(ec.PublicKey) != 32 {
-			return false, echConfig{}, errors.New("tls: config has invalid X25519 public key length")
+			utlserrors.LogDebug(ctx, "ECH: invalid X25519 public key length=", len(ec.PublicKey), " expected=32")
+			return false, echConfig{}, utlserrors.New("tls: config has invalid X25519 public key length").AtError()
 		}
 	}
 	var cipherSuites cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&cipherSuites) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read cipher suites")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	for !cipherSuites.Empty() {
 		var c echCipher
 		if !cipherSuites.ReadUint16(&c.KDFID) {
+			utlserrors.LogDebug(ctx, "ECH: failed to read KDF ID from cipher suite")
 			return false, echConfig{}, errMalformedECHConfig
 		}
 		if !cipherSuites.ReadUint16(&c.AEADID) {
+			utlserrors.LogDebug(ctx, "ECH: failed to read AEAD ID from cipher suite")
 			return false, echConfig{}, errMalformedECHConfig
 		}
 		ec.SymmetricCipherSuite = append(ec.SymmetricCipherSuite, c)
 	}
 	if !s.ReadUint8(&ec.MaxNameLength) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read max name length")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	// Note: MaxNameLength=0 is allowed for backwards compatibility with real-world
@@ -146,23 +166,32 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 	// This effectively means "no padding hint" which is acceptable behavior.
 	var publicName cryptobyte.String
 	if !s.ReadUint8LengthPrefixed(&publicName) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read public name")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	ec.PublicName = publicName
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read extensions")
 		return false, echConfig{}, errMalformedECHConfig
 	}
 	for !extensions.Empty() {
 		var e echExtension
 		if !extensions.ReadUint16(&e.Type) {
+			utlserrors.LogDebug(ctx, "ECH: failed to read extension type")
 			return false, echConfig{}, errMalformedECHConfig
 		}
 		if !extensions.ReadUint16LengthPrefixed((*cryptobyte.String)(&e.Data)) {
+			utlserrors.LogDebug(ctx, "ECH: failed to read extension data")
 			return false, echConfig{}, errMalformedECHConfig
 		}
 		ec.Extensions = append(ec.Extensions, e)
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: parsed config successfully, configID=", ec.ConfigID,
+		" kemID=0x", fmt.Sprintf("%04x", ec.KemID),
+		" publicName=", string(ec.PublicName),
+		" cipherSuites=", len(ec.SymmetricCipherSuite))
 
 	return false, ec, nil
 }
@@ -171,24 +200,33 @@ func parseECHConfig(enc []byte) (skip bool, ec echConfig, err error) {
 // slice of parsed ECHConfigs, in the same order they were parsed, or an error
 // if the list is malformed.
 func parseECHConfigList(data []byte) ([]echConfig, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: parsing config list, length=", len(data))
+
 	s := cryptobyte.String(data)
 	var length uint16
 	if !s.ReadUint16(&length) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read config list length prefix")
 		return nil, errMalformedECHConfig
 	}
 	if length != uint16(len(data)-2) {
+		utlserrors.LogDebug(ctx, "ECH: config list length mismatch, declared=", length, " actual=", len(data)-2)
 		return nil, errMalformedECHConfig
 	}
 	var configs []echConfig
+	configIndex := 0
 	for len(s) > 0 {
 		if len(s) < 4 {
-			return nil, errors.New("tls: malformed configuration")
+			utlserrors.LogDebug(ctx, "ECH: config list truncated at index=", configIndex)
+			return nil, utlserrors.New("tls: malformed configuration").AtError()
 		}
 		configLen := uint16(s[2])<<8 | uint16(s[3])
 		// Bounds check: ensure we have enough data before reslicing
 		totalLen := int(configLen) + 4
 		if totalLen > len(s) {
-			return nil, errors.New("tls: ECH config length exceeds available data")
+			utlserrors.LogDebug(ctx, "ECH: config length exceeds available data at index=", configIndex,
+				" configLen=", configLen, " available=", len(s))
+			return nil, utlserrors.New("tls: ECH config length exceeds available data").AtError()
 		}
 		skip, ec, err := parseECHConfig(s)
 		if err != nil {
@@ -198,13 +236,21 @@ func parseECHConfigList(data []byte) ([]echConfig, error) {
 		if !skip {
 			configs = append(configs, ec)
 		}
+		configIndex++
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: parsed config list successfully, totalConfigs=", configIndex, " usableConfigs=", len(configs))
 	return configs, nil
 }
 
 func pickECHConfig(list []echConfig) *echConfig {
-	for _, ec := range list {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: picking config from list of ", len(list), " configs")
+
+	for i, ec := range list {
 		if _, ok := hpke.SupportedKEMs[ec.KemID]; !ok {
+			utlserrors.LogDebug(ctx, "ECH: skipping config[", i, "] configID=", ec.ConfigID,
+				" unsupported KEM=0x", fmt.Sprintf("%04x", ec.KemID))
 			continue
 		}
 		var validSCS bool
@@ -219,9 +265,13 @@ func pickECHConfig(list []echConfig) *echConfig {
 			break
 		}
 		if !validSCS {
+			utlserrors.LogDebug(ctx, "ECH: skipping config[", i, "] configID=", ec.ConfigID,
+				" no supported cipher suite")
 			continue
 		}
 		if !validDNSName(string(ec.PublicName)) {
+			utlserrors.LogDebug(ctx, "ECH: skipping config[", i, "] configID=", ec.ConfigID,
+				" invalid public name=", string(ec.PublicName))
 			continue
 		}
 		var unsupportedExt bool
@@ -234,27 +284,44 @@ func pickECHConfig(list []echConfig) *echConfig {
 			}
 		}
 		if unsupportedExt {
+			utlserrors.LogDebug(ctx, "ECH: skipping config[", i, "] configID=", ec.ConfigID,
+				" has unsupported mandatory extension")
 			continue
 		}
+		utlserrors.LogDebug(ctx, "ECH: selected config[", i, "] configID=", ec.ConfigID,
+			" publicName=", string(ec.PublicName))
 		return &ec
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: no suitable config found in list")
 	return nil
 }
 
 func pickECHCipherSuite(suites []echCipher) (echCipher, error) {
-	for _, s := range suites {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: picking cipher suite from ", len(suites), " candidates")
+
+	for i, s := range suites {
 		// NOTE: all of the supported AEADs and KDFs are fine, rather than
 		// imposing some sort of preference here, we just pick the first valid
 		// suite.
 		if _, ok := hpke.SupportedAEADs[s.AEADID]; !ok {
+			utlserrors.LogDebug(ctx, "ECH: skipping cipher suite[", i, "] unsupported AEAD=0x",
+				fmt.Sprintf("%04x", s.AEADID))
 			continue
 		}
 		if _, ok := hpke.SupportedKDFs[s.KDFID]; !ok {
+			utlserrors.LogDebug(ctx, "ECH: skipping cipher suite[", i, "] unsupported KDF=0x",
+				fmt.Sprintf("%04x", s.KDFID))
 			continue
 		}
+		utlserrors.LogDebug(ctx, "ECH: selected cipher suite KDF=0x", fmt.Sprintf("%04x", s.KDFID),
+			" AEAD=0x", fmt.Sprintf("%04x", s.AEADID))
 		return s, nil
 	}
-	return echCipher{}, errors.New("tls: no supported symmetric ciphersuites for ECH")
+
+	utlserrors.LogDebug(ctx, "ECH: no supported cipher suite found")
+	return echCipher{}, utlserrors.New("tls: no supported symmetric ciphersuites for ECH").AtError()
 }
 
 // filterUsableECHConfigs parses and re-encodes only the usable ECH configs from
@@ -263,20 +330,28 @@ func pickECHCipherSuite(suites []echCipher) (echCipher, error) {
 //
 // Returns nil if no usable configs exist or on parse errors.
 func filterUsableECHConfigs(rawConfigs []byte) []byte {
+	ctx := context.Background()
+
 	if len(rawConfigs) == 0 {
+		utlserrors.LogDebug(ctx, "ECH: filterUsableECHConfigs called with empty input")
 		return nil
 	}
 
+	utlserrors.LogDebug(ctx, "ECH: filtering usable configs from ", len(rawConfigs), " bytes")
+
 	configs, err := parseECHConfigList(rawConfigs)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to parse config list for filtering")
 		return nil
 	}
 
 	// Filter to only usable configs
 	var usableRawConfigs []byte
-	for _, ec := range configs {
+	usableCount := 0
+	for i, ec := range configs {
 		// Check KEM support
 		if _, ok := hpke.SupportedKEMs[ec.KemID]; !ok {
+			utlserrors.LogDebug(ctx, "ECH: filter skipping config[", i, "] unsupported KEM")
 			continue
 		}
 
@@ -293,11 +368,13 @@ func filterUsableECHConfigs(rawConfigs []byte) []byte {
 			break
 		}
 		if !hasValidSuite {
+			utlserrors.LogDebug(ctx, "ECH: filter skipping config[", i, "] no valid cipher suite")
 			continue
 		}
 
 		// Check valid public name
 		if !validDNSName(string(ec.PublicName)) {
+			utlserrors.LogDebug(ctx, "ECH: filter skipping config[", i, "] invalid public name")
 			continue
 		}
 
@@ -310,14 +387,17 @@ func filterUsableECHConfigs(rawConfigs []byte) []byte {
 			}
 		}
 		if unsupportedExt {
+			utlserrors.LogDebug(ctx, "ECH: filter skipping config[", i, "] unsupported mandatory extension")
 			continue
 		}
 
 		// This config is usable, include its raw bytes
 		usableRawConfigs = append(usableRawConfigs, ec.raw...)
+		usableCount++
 	}
 
 	if len(usableRawConfigs) == 0 {
+		utlserrors.LogDebug(ctx, "ECH: no usable configs found after filtering")
 		return nil
 	}
 
@@ -327,6 +407,7 @@ func filterUsableECHConfigs(rawConfigs []byte) []byte {
 	result[1] = byte(len(usableRawConfigs))
 	copy(result[2:], usableRawConfigs)
 
+	utlserrors.LogDebug(ctx, "ECH: filtered to ", usableCount, " usable configs, result length=", len(result))
 	return result
 }
 
@@ -338,8 +419,13 @@ func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, e
 // [uTLS SECTION END]
 
 func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength int, outerExts []uint16) ([]byte, error) { // uTLS
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: encoding inner ClientHello, serverName=", inner.serverName,
+		" maxNameLength=", maxNameLength)
+
 	h, err := inner.marshalMsgReorderOuterExts(true, outerExts)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to marshal inner ClientHello")
 		return nil, err
 	}
 	h = h[4:] // strip four byte prefix
@@ -363,6 +449,9 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 	alignPadding := (32 - (baseLen % 32)) % 32
 	// Total padding is the sum of name padding and alignment padding
 	paddingLen := namePadding + alignPadding
+
+	utlserrors.LogDebug(ctx, "ECH: inner ClientHello encoded, baseLen=", len(h),
+		" namePadding=", namePadding, " alignPadding=", alignPadding, " totalLen=", len(h)+paddingLen)
 
 	return append(h, make([]byte, paddingLen)...), nil
 }
@@ -389,17 +478,21 @@ type rawExtension struct {
 }
 
 func extractRawExtensions(hello *clientHelloMsg) ([]rawExtension, error) {
+	ctx := context.Background()
+
 	s := cryptobyte.String(hello.original)
 	if !s.Skip(4+2+32) || // header, version, random
 		!skipUint8LengthPrefixed(&s) || // session ID
 		!skipUint16LengthPrefixed(&s) || // cipher suites
 		!skipUint8LengthPrefixed(&s) { // compression methods
-		return nil, errors.New("tls: malformed outer client hello")
+		utlserrors.LogDebug(ctx, "ECH: failed to skip fixed fields in outer ClientHello")
+		return nil, utlserrors.New("tls: malformed outer client hello").AtError()
 	}
 	var rawExtensions []rawExtension
 	var extensions cryptobyte.String
 	if !s.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: malformed outer client hello")
+		utlserrors.LogDebug(ctx, "ECH: failed to read extensions from outer ClientHello")
+		return nil, utlserrors.New("tls: malformed outer client hello").AtError()
 	}
 
 	for !extensions.Empty() {
@@ -407,14 +500,20 @@ func extractRawExtensions(hello *clientHelloMsg) ([]rawExtension, error) {
 		var extData cryptobyte.String
 		if !extensions.ReadUint16(&extension) ||
 			!extensions.ReadUint16LengthPrefixed(&extData) {
-			return nil, errors.New("tls: invalid inner client hello")
+			utlserrors.LogDebug(ctx, "ECH: failed to parse extension in outer ClientHello")
+			return nil, utlserrors.New("tls: invalid inner client hello").AtError()
 		}
 		rawExtensions = append(rawExtensions, rawExtension{extension, extData})
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: extracted ", len(rawExtensions), " raw extensions from outer ClientHello")
 	return rawExtensions, nil
 }
 
 func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHelloMsg, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: decoding inner ClientHello, encoded length=", len(encoded))
+
 	// Reconstructing the inner client hello from its encoded form is somewhat
 	// complicated. It is missing its header (message type and length), session
 	// ID, and the extensions may be compressed. Since we need to put the
@@ -432,7 +531,8 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 		!readUint16LengthPrefixed(&innerReader, &cipherSuites) ||
 		!readUint8LengthPrefixed(&innerReader, &compressionMethods) ||
 		!innerReader.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: invalid inner client hello")
+		utlserrors.LogDebug(ctx, "ECH: failed to parse inner ClientHello structure")
+		return nil, utlserrors.New("tls: invalid inner client hello").AtError()
 	}
 
 	// The specification says we must verify that the trailing padding is all
@@ -443,16 +543,19 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// 16KB is more than sufficient for any realistic ECH padding.
 	const maxECHPadding = 16384
 	if len(innerReader) > maxECHPadding {
-		return nil, errors.New("tls: padding too large")
+		utlserrors.LogDebug(ctx, "ECH: inner ClientHello padding too large=", len(innerReader))
+		return nil, utlserrors.New("tls: padding too large").AtError()
 	}
 	for _, p := range innerReader {
 		if p != 0 {
-			return nil, errors.New("tls: invalid inner client hello")
+			utlserrors.LogDebug(ctx, "ECH: inner ClientHello has non-zero padding")
+			return nil, utlserrors.New("tls: invalid inner client hello").AtError()
 		}
 	}
 
 	rawOuterExts, err := extractRawExtensions(outer)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to extract raw extensions from outer ClientHello")
 		return nil, err
 	}
 
@@ -475,28 +578,28 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 				var extData cryptobyte.String
 				if !extensions.ReadUint16(&extension) ||
 					!extensions.ReadUint16LengthPrefixed(&extData) {
-					recon.SetError(errors.New("tls: invalid inner client hello"))
+					recon.SetError(utlserrors.New("tls: invalid inner client hello").AtError())
 					return
 				}
 				if extension == extensionECHOuterExtensions {
 					if !extData.ReadUint8LengthPrefixed(&extData) {
-						recon.SetError(errors.New("tls: invalid inner client hello"))
+						recon.SetError(utlserrors.New("tls: invalid inner client hello").AtError())
 						return
 					}
 					var i int
 					for !extData.Empty() {
 						var extType uint16
 						if !extData.ReadUint16(&extType) {
-							recon.SetError(errors.New("tls: invalid inner client hello"))
+							recon.SetError(utlserrors.New("tls: invalid inner client hello").AtError())
 							return
 						}
 						if extType == extensionEncryptedClientHello {
-							recon.SetError(errors.New("tls: invalid outer extensions"))
+							recon.SetError(utlserrors.New("tls: invalid outer extensions").AtError())
 							return
 						}
 						for ; i <= len(rawOuterExts); i++ {
 							if i == len(rawOuterExts) {
-								recon.SetError(errors.New("tls: invalid outer extensions"))
+								recon.SetError(utlserrors.New("tls: invalid outer extensions").AtError())
 								return
 							}
 							if rawOuterExts[i].extType == extType {
@@ -520,14 +623,17 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 
 	reconBytes, err := recon.Bytes()
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to reconstruct inner ClientHello")
 		return nil, err
 	}
 	inner := &clientHelloMsg{}
 	if !inner.unmarshal(reconBytes) {
-		return nil, errors.New("tls: invalid reconstructed inner client hello")
+		utlserrors.LogDebug(ctx, "ECH: failed to unmarshal reconstructed inner ClientHello")
+		return nil, utlserrors.New("tls: invalid reconstructed inner client hello").AtError()
 	}
 
 	if !bytes.Equal(inner.encryptedClientHello, []byte{uint8(innerECHExt)}) {
+		utlserrors.LogDebug(ctx, "ECH: inner ClientHello has invalid ECH extension marker")
 		return nil, errInvalidECHExt
 	}
 
@@ -535,9 +641,11 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// The second condition is simplified: if len != 1, we fail; otherwise len == 1,
 	// so we can safely check supportedVersions[0] without the redundant length check.
 	if len(inner.supportedVersions) != 1 || inner.supportedVersions[0] != VersionTLS13 {
-		return nil, errors.New("tls: incompatible protocol versions")
+		utlserrors.LogDebug(ctx, "ECH: inner ClientHello has incompatible protocol versions")
+		return nil, utlserrors.New("tls: incompatible protocol versions").AtError()
 	}
 
+	utlserrors.LogDebug(ctx, "ECH: successfully decoded inner ClientHello, serverName=", inner.serverName)
 	return inner, nil
 }
 
@@ -613,24 +721,45 @@ func findECHPayloadPosition(hello []byte, payloadLen int) int {
 	return -1
 }
 
-func decryptECHPayload(context *hpke.Recipient, hello, payload []byte) ([]byte, error) {
-	// Create AAD by zeroing out the ECH payload at its exact position.
-	// This is safer than bytes.Replace which could match wrong bytes.
-	payloadPos := findECHPayloadPosition(hello, len(payload))
+func decryptECHPayload(hpkeContext *hpke.Recipient, hello, payload []byte) ([]byte, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: decrypting payload, helloLen=", len(hello), " payloadLen=", len(payload))
 
+	// SECURITY: Find the exact position of the ECH payload within the ClientHello.
+	// Using position-based zeroing instead of bytes.Replace is critical for security:
+	// bytes.Replace finds the FIRST occurrence of payload bytes, which could be in
+	// SNI, ALPN, or other extensions if the same byte sequence happens to appear there.
+	// This would cause AAD mismatch and decryption failure or potential security issues.
+	payloadPos := findECHPayloadPosition(hello, len(payload))
+	if payloadPos < 0 {
+		utlserrors.LogDebug(ctx, "ECH: failed to find payload position in ClientHello")
+		return nil, utlserrors.New("tls: failed to locate ECH payload position for AAD construction").AtError()
+	}
+
+	// Create AAD by copying hello[4:] (without the 4-byte header) and zeroing
+	// out the ECH payload at its exact known position.
 	outerAAD := make([]byte, len(hello)-4)
 	copy(outerAAD, hello[4:])
 
-	if payloadPos >= 0 && payloadPos+len(payload) <= len(outerAAD) {
-		// Zero out payload at the correct position
-		copy(outerAAD[payloadPos:], make([]byte, len(payload)))
-	} else {
-		// Fallback to bytes.Replace if position-based approach fails.
-		// This maintains backward compatibility while logging the issue.
-		outerAAD = bytes.Replace(hello[4:], payload, make([]byte, len(payload)), 1)
+	if payloadPos+len(payload) > len(outerAAD) {
+		utlserrors.LogDebug(ctx, "ECH: payload position exceeds outerAAD bounds, pos=", payloadPos,
+			" payloadLen=", len(payload), " outerAADLen=", len(outerAAD))
+		return nil, utlserrors.New("tls: ECH payload position out of bounds").AtError()
 	}
 
-	return context.Open(outerAAD, payload)
+	// Zero out the payload at its exact position using direct memory copy.
+	// This is safe because we have verified bounds and found the exact offset.
+	copy(outerAAD[payloadPos:payloadPos+len(payload)], make([]byte, len(payload)))
+	utlserrors.LogDebug(ctx, "ECH: zeroed payload at position=", payloadPos, " length=", len(payload))
+
+	plaintext, err := hpkeContext.Open(outerAAD, payload)
+	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: HPKE decryption failed")
+		return nil, err
+	}
+
+	utlserrors.LogDebug(ctx, "ECH: successfully decrypted payload, plaintext length=", len(plaintext))
+	return plaintext, nil
 }
 
 func generateOuterECHExt(id uint8, kdfID, aeadID uint16, encodedKey []byte, payload []byte) ([]byte, error) {
@@ -645,35 +774,49 @@ func generateOuterECHExt(id uint8, kdfID, aeadID uint16, encodedKey []byte, payl
 }
 
 func computeAndUpdateOuterECHExtension(outer, inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: computing outer ECH extension, configID=", ech.config.ConfigID,
+		" useKey=", useKey)
+
 	var encapKey []byte
 	if useKey {
 		encapKey = ech.encapsulatedKey
+		utlserrors.LogDebug(ctx, "ECH: using encapsulated key, length=", len(encapKey))
 	}
 	encodedInner, err := encodeInnerClientHello(inner, int(ech.config.MaxNameLength))
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to encode inner ClientHello")
 		return err
 	}
 	// Use the AEAD's Overhead() method to get the tag length dynamically.
 	// This ensures correct operation if AEADs with different tag lengths
 	// are added in the future.
 	encryptedLen := len(encodedInner) + ech.hpkeContext.Overhead()
+	utlserrors.LogDebug(ctx, "ECH: encoded inner length=", len(encodedInner), " encrypted length=", encryptedLen)
+
 	outer.encryptedClientHello, err = generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, make([]byte, encryptedLen))
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to generate placeholder outer extension")
 		return err
 	}
 	serializedOuter, err := outer.marshal()
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to marshal outer ClientHello")
 		return err
 	}
 	serializedOuter = serializedOuter[4:] // strip the four byte prefix
 	encryptedInner, err := ech.hpkeContext.Seal(serializedOuter, encodedInner)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: HPKE encryption failed")
 		return err
 	}
 	outer.encryptedClientHello, err = generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, encryptedInner)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to generate final outer extension")
 		return err
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: successfully computed outer extension, length=", len(outer.encryptedClientHello))
 	return nil
 }
 
@@ -726,8 +869,8 @@ func (e *ECHRejectionError) Error() string {
 
 // Use generic error messages to avoid revealing ECH usage in logs/error reports.
 // Specific ECH-related errors could be used to fingerprint clients using ECH.
-var errMalformedECHExt = errors.New("tls: malformed extension")
-var errInvalidECHExt = errors.New("tls: invalid extension")
+var errMalformedECHExt = utlserrors.New("tls: malformed extension").AtError()
+var errInvalidECHExt = utlserrors.New("tls: invalid extension").AtError()
 
 type echExtType uint8
 
@@ -737,46 +880,63 @@ const (
 )
 
 func parseECHExt(ext []byte) (echType echExtType, cs echCipher, configID uint8, encap []byte, payload []byte, err error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: parsing ECH extension, length=", len(ext))
+
 	data := make([]byte, len(ext))
 	copy(data, ext)
 	s := cryptobyte.String(data)
 	var echInt uint8
 	if !s.ReadUint8(&echInt) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read ECH type byte")
 		err = errMalformedECHExt
 		return
 	}
 	echType = echExtType(echInt)
 	if echType == innerECHExt {
 		if !s.Empty() {
+			utlserrors.LogDebug(ctx, "ECH: inner ECH extension has trailing data")
 			err = errMalformedECHExt
 			return
 		}
+		utlserrors.LogDebug(ctx, "ECH: parsed inner ECH extension")
 		return echType, cs, 0, nil, nil, nil
 	}
 	if echType != outerECHExt {
+		utlserrors.LogDebug(ctx, "ECH: invalid ECH type=", echInt)
 		err = errInvalidECHExt
 		return
 	}
 	if !s.ReadUint16(&cs.KDFID) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read KDF ID")
 		err = errMalformedECHExt
 		return
 	}
 	if !s.ReadUint16(&cs.AEADID) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read AEAD ID")
 		err = errMalformedECHExt
 		return
 	}
 	if !s.ReadUint8(&configID) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read config ID")
 		err = errMalformedECHExt
 		return
 	}
 	if !readUint16LengthPrefixed(&s, &encap) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read encapsulated key")
 		err = errMalformedECHExt
 		return
 	}
 	if !readUint16LengthPrefixed(&s, &payload) {
+		utlserrors.LogDebug(ctx, "ECH: failed to read payload")
 		err = errMalformedECHExt
 		return
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: parsed outer extension, configID=", configID,
+		" KDF=0x", fmt.Sprintf("%04x", cs.KDFID),
+		" AEAD=0x", fmt.Sprintf("%04x", cs.AEADID),
+		" encapLen=", len(encap), " payloadLen=", len(payload))
 
 	// NOTE: clone encap and payload so that mutating them does not mutate the
 	// raw extension bytes.
@@ -784,8 +944,12 @@ func parseECHExt(ext []byte) (echType echExtType, cs echCipher, configID uint8, 
 }
 
 func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *echServerContext, error) {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH: server processing ClientHello with ECH extension")
+
 	echType, echCiphersuite, configID, encap, payload, err := parseECHExt(outer.encryptedClientHello)
 	if err != nil {
+		utlserrors.LogDebug(ctx, "ECH: failed to parse ECH extension")
 		if errors.Is(err, errInvalidECHExt) {
 			c.sendAlert(alertIllegalParameter)
 		} else {
@@ -795,13 +959,21 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		return nil, nil, errInvalidECHExt
 	}
 
+	utlserrors.LogDebug(ctx, "ECH: parsed extension, type=", echType, " configID=", configID,
+		" KDF=0x", fmt.Sprintf("%04x", echCiphersuite.KDFID),
+		" AEAD=0x", fmt.Sprintf("%04x", echCiphersuite.AEADID))
+
 	if echType == innerECHExt {
+		utlserrors.LogDebug(ctx, "ECH: received inner ECH extension type, passing through")
 		return outer, &echServerContext{inner: true}, nil
 	}
 
 	if len(c.config.EncryptedClientHelloKeys) == 0 {
+		utlserrors.LogDebug(ctx, "ECH: no server ECH keys configured, passing through outer ClientHello")
 		return outer, nil, nil
 	}
+
+	utlserrors.LogDebug(ctx, "ECH: attempting decryption with ", len(c.config.EncryptedClientHelloKeys), " server keys")
 
 	// Limit trial decryption attempts to prevent CPU exhaustion attacks.
 	// An attacker could send many requests with different encapsulated keys
@@ -809,15 +981,17 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 	const maxTrialDecryptions = 10
 	var trialAttempts int
 
-	for _, echKey := range c.config.EncryptedClientHelloKeys {
+	for keyIndex, echKey := range c.config.EncryptedClientHelloKeys {
 		skip, config, err := parseECHConfig(echKey.Config)
 		if err != nil {
+			utlserrors.LogDebug(ctx, "ECH: invalid server config at index=", keyIndex)
 			c.sendAlert(alertInternalError)
-			return nil, nil, fmt.Errorf("tls: invalid EncryptedClientHelloKeys Config: %s", err)
+			return nil, nil, utlserrors.New("tls: invalid EncryptedClientHelloKeys Config").Base(err).AtError()
 		}
 		if skip {
 			// Config version is not supported (not extensionEncryptedClientHello),
 			// skip to next config without error
+			utlserrors.LogDebug(ctx, "ECH: skipping unsupported config version at index=", keyIndex)
 			continue
 		}
 		// Optimization: skip configs that don't match the client's configID.
@@ -825,6 +999,8 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		// Note: configID is only 1 byte, so we still do trial decryption
 		// for matching configs in case of misconfiguration.
 		if config.ConfigID != configID {
+			utlserrors.LogDebug(ctx, "ECH: config ID mismatch at index=", keyIndex,
+				" have=", config.ConfigID, " want=", configID)
 			continue
 		}
 
@@ -833,13 +1009,17 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		if trialAttempts > maxTrialDecryptions {
 			// Return outer ClientHello without decryption on limit exceeded.
 			// This is safer than returning an error that could reveal ECH usage.
+			utlserrors.LogDebug(ctx, "ECH: trial decryption limit exceeded, passing through outer ClientHello")
 			return outer, nil, nil
 		}
 
+		utlserrors.LogDebug(ctx, "ECH: trying decryption with key index=", keyIndex, " attempt=", trialAttempts)
+
 		echPriv, err := hpke.ParseHPKEPrivateKey(config.KemID, echKey.PrivateKey)
 		if err != nil {
+			utlserrors.LogDebug(ctx, "ECH: invalid private key at index=", keyIndex)
 			c.sendAlert(alertInternalError)
-			return nil, nil, fmt.Errorf("tls: invalid EncryptedClientHelloKeys PrivateKey: %s", err)
+			return nil, nil, utlserrors.New("tls: invalid EncryptedClientHelloKeys PrivateKey").Base(err).AtError()
 		}
 		info := append([]byte("tls ech\x00"), echKey.Config...)
 		// Use config.KemID instead of hardcoded DHKEM_X25519_HKDF_SHA256
@@ -847,12 +1027,14 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		hpkeContext, err := hpke.SetupRecipient(config.KemID, echCiphersuite.KDFID, echCiphersuite.AEADID, echPriv, info, encap)
 		if err != nil {
 			// attempt next trial decryption
+			utlserrors.LogDebug(ctx, "ECH: HPKE setup failed at index=", keyIndex, ", trying next")
 			continue
 		}
 
 		encodedInner, err := decryptECHPayload(hpkeContext, outer.original, payload)
 		if err != nil {
 			// attempt next trial decryption
+			utlserrors.LogDebug(ctx, "ECH: decryption failed at index=", keyIndex, ", trying next")
 			continue
 		}
 
@@ -864,11 +1046,15 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 
 		echInner, err := decodeInnerClientHello(outer, encodedInner)
 		if err != nil {
+			utlserrors.LogDebug(ctx, "ECH: failed to decode inner ClientHello")
 			c.sendAlert(alertIllegalParameter)
 			return nil, nil, errInvalidECHExt
 		}
 
 		c.echAccepted = true
+
+		utlserrors.LogDebug(ctx, "ECH: successfully decrypted and accepted, configID=", configID,
+			" innerServerName=", echInner.serverName)
 
 		return echInner, &echServerContext{
 			hpkeContext: hpkeContext,
@@ -877,6 +1063,7 @@ func (c *Conn) processECHClientHello(outer *clientHelloMsg) (*clientHelloMsg, *e
 		}, nil
 	}
 
+	utlserrors.LogDebug(ctx, "ECH: no matching config found, passing through outer ClientHello")
 	return outer, nil, nil
 }
 

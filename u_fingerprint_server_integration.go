@@ -7,9 +7,10 @@ package tls
 import (
 	"crypto"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"sync"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // ServerFingerprintController orchestrates server-side TLS fingerprint control.
@@ -140,7 +141,7 @@ func (sfc *ServerFingerprintController) GetConfigForClient(chi *ClientHelloInfo)
 	// Validate client fingerprint if enabled
 	if sfc.opts.ValidateClientFingerprint && clientFP != nil {
 		if !sfc.validateClientFingerprint(clientFP) {
-			return nil, errors.New("tls: client fingerprint not allowed")
+			return nil, utlserrors.New("tls: client fingerprint not allowed").AtError()
 		}
 	}
 
@@ -165,7 +166,7 @@ func (sfc *ServerFingerprintController) GetConfigForClient(chi *ClientHelloInfo)
 // AnalyzeClientHello computes fingerprints from ClientHelloInfo.
 func (sfc *ServerFingerprintController) AnalyzeClientHello(chi *ClientHelloInfo) (*TLSFingerprint, error) {
 	if chi == nil {
-		return nil, errors.New("tls: nil ClientHelloInfo")
+		return nil, utlserrors.New("tls: nil ClientHelloInfo").AtError()
 	}
 
 	// Unfortunately ClientHelloInfo doesn't give us raw bytes
@@ -545,7 +546,7 @@ func (fl *FingerprintedListener) Accept() (*Conn, error) {
 	tlsConn, ok := conn.(*Conn)
 	if !ok {
 		// This should not happen with a properly configured TLS listener
-		return nil, errors.New("tls: expected *Conn from listener")
+		return nil, utlserrors.New("tls: expected *Conn from listener").AtError()
 	}
 
 	return tlsConn, nil

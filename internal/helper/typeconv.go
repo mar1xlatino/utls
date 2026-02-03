@@ -1,8 +1,7 @@
 package helper
 
 import (
-	"errors"
-
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -16,7 +15,7 @@ func Uint8to16(in []uint8) ([]uint16, error) {
 		if s.ReadUint16(&v) {
 			out = append(out, v)
 		} else {
-			return nil, errors.New("ReadUint16 failed")
+			return nil, utlserrors.New("tls: ReadUint16 failed").AtError()
 		}
 	}
 	return out, nil

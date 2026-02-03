@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 // A Conn represents a secured connection.
@@ -92,6 +94,12 @@ type Conn struct {
 	// state changes. Used to detect ABA race conditions when the lock is temporarily
 	// released during closeNotify jitter delays. Protected by out.Mutex.
 	closeNotifySeq uint64
+
+	// fatalAlertSent prevents sending multiple fatal alerts on the same connection.
+	// RFC 8446 Section 6: After sending or receiving a fatal alert, implementations
+	// MUST NOT send any additional alerts. Once set, all subsequent alert sends
+	// (including close_notify) are suppressed.
+	fatalAlertSent atomic.Bool
 
 	// clientFinished and serverFinished contain the Finished message sent
 	// by the client or server in the most recent handshake. This is
@@ -178,6 +186,19 @@ func (c *Conn) NetConn() net.Conn {
 // called without copying the full connection state.
 func (c *Conn) ClientProtocol() string {
 	return c.clientProtocol
+}
+
+// safeRemoteAddr returns the remote address as a string, or "" if unavailable.
+// This safely handles both nil connection and nil address cases.
+func (c *Conn) safeRemoteAddr() string {
+	if c.conn == nil {
+		return ""
+	}
+	addr := c.conn.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
 }
 
 // A halfConn represents one direction of the record layer
@@ -272,16 +293,46 @@ func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncrypti
 	return nil
 }
 
+// zeroSecrets zeros all secret material in the connection.
+// Called on fatal errors per RFC 8446 Section 6: "Servers and clients MUST forget
+// the secret values and keys established in failed connections."
+//
+// Uses explicit nil assignment after zeroing to help GC and prevent accidental reuse.
+// The zeroing loop overwrites sensitive cryptographic material in memory before
+// releasing the reference. Uses zeroSlice which includes runtime.KeepAlive to
+// prevent compiler optimization from eliding the zeroing operation.
+func (c *Conn) zeroSecrets() {
+	// Zero input traffic secret
+	if c.in.trafficSecret != nil {
+		zeroSlice(c.in.trafficSecret)
+		c.in.trafficSecret = nil
+	}
+	// Zero output traffic secret
+	if c.out.trafficSecret != nil {
+		zeroSlice(c.out.trafficSecret)
+		c.out.trafficSecret = nil
+	}
+	// Zero resumption secret (TLS 1.3)
+	if c.resumptionSecret != nil {
+		zeroSlice(c.resumptionSecret)
+		c.resumptionSecret = nil
+	}
+}
+
 // errSequenceOverflow is returned when TLS sequence number would wrap around.
 // This indicates the connection has processed 2^64 records and must be closed.
-var errSequenceOverflow = errors.New("tls: sequence number overflow")
+var errSequenceOverflow = utlserrors.New("tls: sequence number overflow").AtError()
 
 // errUnknownCipherType is returned when an unrecognized cipher type is encountered.
 // This typically indicates a programming error or corrupted state.
-var errUnknownCipherType = errors.New("tls: unknown cipher type")
+var errUnknownCipherType = utlserrors.New("tls: unknown cipher type").AtError()
 
 // incSeq increments the sequence number.
 // Returns an error if the sequence number would overflow.
+//
+// Per RFC 8446 Section 5.3: "If a TLS implementation would need to wrap a
+// sequence number, it MUST either rekey (Section 4.6.3) or terminate the
+// connection."
 func (hc *halfConn) incSeq() error {
 	for i := 7; i >= 0; i-- {
 		hc.seq[i]++
@@ -291,8 +342,11 @@ func (hc *halfConn) incSeq() error {
 	}
 
 	// Not allowed to let sequence number wrap.
-	// Instead, must renegotiate before it does.
-	// Return error instead of panic for graceful handling.
+	// Per RFC 8446, must rekey or terminate the connection.
+	// Set permanent error to prevent any further use of this connection half,
+	// ensuring the connection cannot continue in an undefined state even if
+	// calling code ignores the returned error.
+	hc.err = errSequenceOverflow
 	return errSequenceOverflow
 }
 
@@ -459,6 +513,11 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			if typ != recordTypeApplicationData {
 				return nil, 0, alertUnexpectedMessage
 			}
+			// TLS 1.3 always uses AEAD ciphers, so plaintext must be assigned above.
+			// This check satisfies static analyzers and provides defense in depth.
+			if plaintext == nil {
+				return nil, 0, alertInternalError
+			}
 			if len(plaintext) > maxPlaintext+1 {
 				return nil, 0, alertRecordOverflow
 			}
@@ -516,7 +575,10 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 // slice, while tail is the appended part. If the original slice has sufficient
 // capacity no allocation is performed.
 func sliceForAppend(in []byte, n int) (head, tail []byte) {
-	if total := len(in) + n; cap(in) >= total {
+	total := len(in) + n
+	// Explicit nil check satisfies static analyzers. For nil slice with n > 0,
+	// cap(in) is 0 so we'd allocate anyway, but nilaway cannot prove this.
+	if in != nil && cap(in) >= total {
 		head = in[:total]
 	} else {
 		head = make([]byte, total)
@@ -680,18 +742,21 @@ func (c *Conn) readChangeCipherSpec() error {
 //   - an error is returned
 func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	if c.in.err != nil {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "conn: readRecordOrCCS returning cached error: ", c.in.err)
+		}
 		return c.in.err
 	}
 	handshakeComplete := c.isHandshakeComplete.Load()
 
 	// This function modifies c.rawInput, which owns the c.input memory.
 	if c.input.Len() != 0 {
-		return c.in.setErrorLocked(errors.New("tls: internal error: attempted to read record with pending application data"))
+		return c.in.setErrorLocked(utlserrors.New("tls: internal error: attempted to read record with pending application data").AtError())
 	}
 	c.input.Reset(nil)
 
 	if c.quic != nil {
-		return c.in.setErrorLocked(errors.New("tls: internal error: attempted to read record with QUIC transport"))
+		return c.in.setErrorLocked(utlserrors.New("tls: internal error: attempted to read record with QUIC transport").AtError())
 	}
 
 	// Read header, payload.
@@ -702,13 +767,36 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		if err == io.ErrUnexpectedEOF && c.rawInput.Len() == 0 {
 			err = io.EOF
 		}
-		if e, ok := err.(net.Error); !ok || !e.Temporary() {
-			c.in.setErrorLocked(err)
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "conn: readRecordOrCCS header read error: ", err)
 		}
+		// Note: net.Error.Temporary() is deprecated since Go 1.18.
+		// Timeout errors can be checked via Timeout(), but "temporary" errors
+		// are unreliable. Always set the error to ensure proper cleanup.
+
+		// Call observability hook for network errors (not EOF)
+		if err != io.EOF {
+			remoteAddr := c.safeRemoteAddr()
+			var netErr net.Error
+			if errors.As(err, &netErr) {
+				if netErr.Timeout() {
+					callOnTimeoutError(remoteAddr)
+				} else {
+					callOnNetworkError(remoteAddr, err)
+				}
+			} else {
+				callOnNetworkError(remoteAddr, err)
+			}
+		}
+
+		c.in.setErrorLocked(err)
 		return err
 	}
 	hdr := c.rawInput.Bytes()[:recordHeaderLen]
 	typ := recordType(hdr[0])
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: readRecordOrCCS type=", typ, " vers=", uint16(hdr[1])<<8|uint16(hdr[2]))
+	}
 
 	// No valid TLS record has a type of 0x80, however SSLv2 handshakes
 	// start with a uint16 length where the MSB is set and the first record
@@ -747,9 +835,25 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		return c.in.setErrorLocked(c.newRecordHeaderError(nil, msg))
 	}
 	if err := c.readFromUntil(c.conn, recordHeaderLen+n); err != nil {
-		if e, ok := err.(net.Error); !ok || !e.Temporary() {
-			c.in.setErrorLocked(err)
+		// Note: net.Error.Temporary() is deprecated since Go 1.18.
+		// Always set the error to ensure proper cleanup.
+
+		// Call observability hook for network errors (not EOF)
+		if err != io.EOF {
+			remoteAddr := c.safeRemoteAddr()
+			var netErr net.Error
+			if errors.As(err, &netErr) {
+				if netErr.Timeout() {
+					callOnTimeoutError(remoteAddr)
+				} else {
+					callOnNetworkError(remoteAddr, err)
+				}
+			} else {
+				callOnNetworkError(remoteAddr, err)
+			}
 		}
+
+		c.in.setErrorLocked(err)
 		return err
 	}
 
@@ -757,7 +861,16 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 	record := c.rawInput.Next(recordHeaderLen + n)
 	data, typ, err := c.in.decrypt(record)
 	if err != nil {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "conn: decrypt failed: ", err)
+		}
+		// Call observability hook for crypto/decryption errors
+		remoteAddr := c.safeRemoteAddr()
+		callOnCryptoError(remoteAddr, err)
 		return c.in.setErrorLocked(c.sendAlert(err.(alert)))
+	}
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: decrypted record type=", typ, " len=", len(data))
 	}
 	if len(data) > maxPlaintext {
 		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
@@ -797,6 +910,9 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		}
 		if len(data) != 2 {
 			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		}
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "alert: received", alert(data[1]).String())
 		}
 		if alert(data[1]) == alertCloseNotify {
 			return c.in.setErrorLocked(io.EOF)
@@ -867,7 +983,7 @@ func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 	c.retryCount++
 	if c.retryCount > maxUselessRecords {
 		c.sendAlert(alertUnexpectedMessage)
-		return c.in.setErrorLocked(errors.New("tls: too many ignored records"))
+		return c.in.setErrorLocked(utlserrors.New("tls: too many ignored records").AtError())
 	}
 	return c.readRecordOrCCS(expectChangeCipherSpec)
 }
@@ -911,9 +1027,50 @@ func (c *Conn) readFromUntil(r io.Reader, n int) error {
 }
 
 // sendAlertLocked sends a TLS alert message.
+// For fatal alerts, it also zeros all secret material per RFC 8446 Section 6:
+// "Servers and clients MUST forget the secret values and keys established
+// in failed connections."
+//
+// Prevents sending multiple fatal alerts on the same connection per RFC 8446
+// Section 6: "Upon transmission or receipt of a fatal alert message, both
+// parties MUST immediately close the connection." Once a fatal alert is sent,
+// all subsequent alerts (including close_notify) are suppressed.
 func (c *Conn) sendAlertLocked(err alert) error {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "alert: sending", err.String())
+	}
 	if c.quic != nil {
 		return c.out.setErrorLocked(&net.OpError{Op: "local error", Err: err})
+	}
+
+	// Determine if this is a fatal alert per RFC 8446 Section 6.
+	// In TLS 1.3, only close_notify and user_canceled are warning-level;
+	// all other alerts are fatal. alertNoRenegotiation is TLS 1.2 only
+	// (renegotiation is forbidden in TLS 1.3) and uses warning level.
+	isFatal := err != alertCloseNotify && err != alertUserCanceled && err != alertNoRenegotiation
+
+	// RFC 8446 Section 6: Once a fatal alert has been sent, no further alerts
+	// should be transmitted. This prevents sending close_notify after a fatal
+	// alert (which would be an RFC violation) and prevents duplicate fatal alerts.
+	if isFatal {
+		if !c.fatalAlertSent.CompareAndSwap(false, true) {
+			// Already sent a fatal alert - suppress this duplicate
+			return nil
+		}
+	} else {
+		// For non-fatal alerts (close_notify, user_canceled, no_renegotiation):
+		// suppress if a fatal alert was already sent
+		if c.fatalAlertSent.Load() {
+			return nil
+		}
+	}
+
+	// RFC 8446 Section 6: Zero all secret material on fatal alert.
+	// This ensures traffic secrets and resumption secrets don't persist
+	// in memory after a failed connection, preventing potential extraction
+	// via memory inspection attacks.
+	if isFatal {
+		c.zeroSecrets()
 	}
 
 	switch err {
@@ -1085,9 +1242,12 @@ var outBufPool = sync.Pool{
 // writeRecordLocked writes a TLS record with the given type and payload to the
 // connection and updates the record layer state.
 func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: writeRecordLocked type=", typ, " len=", len(data))
+	}
 	if c.quic != nil {
 		if typ != recordTypeHandshake {
-			return 0, errors.New("tls: internal error: sending non-handshake message to QUIC transport")
+			return 0, utlserrors.New("tls: internal error: sending non-handshake message to QUIC transport").AtError()
 		}
 		c.quicWriteCryptoData(c.out.level, data)
 		if !c.buffering {
@@ -1327,7 +1487,7 @@ func (c *Conn) unmarshalHandshakeMessage(data []byte, transcript transcriptHash)
 }
 
 var (
-	errShutdown = errors.New("tls: protocol is shutdown")
+	errShutdown = utlserrors.New("tls: protocol is shutdown").AtError()
 )
 
 // Write writes data to the connection.
@@ -1337,6 +1497,9 @@ var (
 // has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and
 // [Conn.SetWriteDeadline].
 func (c *Conn) Write(b []byte) (int, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: Write len=", len(b))
+	}
 	// interlock with Close below
 	for {
 		x := c.activeCall.Load()
@@ -1395,7 +1558,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 // handleRenegotiation processes a HelloRequest handshake message.
 func (c *Conn) handleRenegotiation() error {
 	if c.vers == VersionTLS13 {
-		return errors.New("tls: internal error: unexpected renegotiation")
+		return utlserrors.New("tls: internal error: unexpected renegotiation").AtError()
 	}
 
 	msg, err := c.readHandshake(nil)
@@ -1424,7 +1587,7 @@ func (c *Conn) handleRenegotiation() error {
 		// Ok.
 	default:
 		c.sendAlert(alertInternalError)
-		return errors.New("tls: unknown Renegotiation value")
+		return utlserrors.New("tls: unknown Renegotiation value").AtError()
 	}
 
 	c.handshakeMutex.Lock()
@@ -1451,7 +1614,7 @@ func (c *Conn) handlePostHandshakeMessage() error {
 	c.retryCount++
 	if c.retryCount > maxUselessRecords {
 		c.sendAlert(alertUnexpectedMessage)
-		return c.in.setErrorLocked(errors.New("tls: too many non-advancing records"))
+		return c.in.setErrorLocked(utlserrors.New("tls: too many non-advancing records").AtError())
 	}
 
 	switch msg := msg.(type) {
@@ -1526,6 +1689,9 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 // has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and
 // [Conn.SetWriteDeadline].
 func (c *Conn) Read(b []byte) (int, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: Read bufLen=", len(b))
+	}
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
@@ -1540,6 +1706,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 
 	for c.input.Len() == 0 {
 		if err := c.readRecord(); err != nil {
+			if utlserrors.DebugLoggingEnabled {
+				utlserrors.LogDebug(context.Background(), "conn: Read readRecord error: ", err)
+			}
 			return 0, err
 		}
 		for c.hand.Len() > 0 {
@@ -1550,6 +1719,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 	}
 
 	n, _ := c.input.Read(b)
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "conn: Read returned n=", n)
+	}
 
 	// If a close-notify alert is waiting, read it so that we can return (n,
 	// EOF) instead of (n, nil), to signal to the HTTP response reading
@@ -1569,7 +1741,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 // Close closes the connection.
+// Per RFC 8446 Section 6, all secret material is zeroed on close to prevent
+// key material from persisting in memory after the connection ends.
 func (c *Conn) Close() error {
+	utlserrors.LogDebug(context.Background(), "conn: Close called")
 	// Interlock with Conn.Write above.
 	var x int32
 	for {
@@ -1588,6 +1763,8 @@ func (c *Conn) Close() error {
 		// being used to break the Write and/or clean up resources and
 		// avoid sending the alertCloseNotify, which may block
 		// waiting on handshakeMutex or the c.out mutex.
+		// Still zero secrets before closing for security.
+		c.zeroSecrets()
 		return c.conn.Close()
 	}
 
@@ -1598,13 +1775,18 @@ func (c *Conn) Close() error {
 		}
 	}
 
+	// RFC 8446 Section 6: Zero all session-specific cryptographic material.
+	// This zeros traffic secrets and resumption secret to prevent key material
+	// from lingering in memory after the connection is closed.
+	c.zeroSecrets()
+
 	if err := c.conn.Close(); err != nil {
 		return err
 	}
 	return alertErr
 }
 
-var errEarlyCloseWrite = errors.New("tls: CloseWrite called before handshake complete")
+var errEarlyCloseWrite = utlserrors.New("tls: CloseWrite called before handshake complete").AtError()
 
 // CloseWrite shuts down the writing side of the connection. It should only be
 // called once the handshake has completed and does not call CloseWrite on the
@@ -1710,6 +1892,7 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 	if c.isHandshakeComplete.Load() {
 		return nil
 	}
+	utlserrors.LogDebug(ctx, "conn: handshakeContext starting")
 
 	handshakeCtx, cancel := context.WithCancel(ctx)
 	// Note: defer this before starting the "interrupter" goroutine
@@ -1762,14 +1945,16 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 	c.handshakeErr = c.handshakeFn(handshakeCtx)
 	if c.handshakeErr == nil {
 		c.handshakes++
+		utlserrors.LogDebug(ctx, "conn: handshake complete, cipher=", c.cipherSuite, " vers=", c.vers)
 	} else {
+		utlserrors.LogDebug(ctx, "conn: handshake failed: ", c.handshakeErr)
 		// If an error occurred during the handshake try to flush the
 		// alert that might be left in the buffer.
 		c.flush()
 	}
 
 	if c.handshakeErr == nil && !c.isHandshakeComplete.Load() {
-		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")
+		c.handshakeErr = utlserrors.New("tls: internal error: handshake should have had a result").AtError()
 	}
 	if c.handshakeErr != nil && c.isHandshakeComplete.Load() {
 		panic("tls: internal error: handshake returned an error but is marked successful")
@@ -1875,16 +2060,16 @@ func (c *Conn) VerifyHostname(host string) error {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 	if !c.isClient {
-		return errors.New("tls: VerifyHostname called on TLS server connection")
+		return utlserrors.New("tls: VerifyHostname called on TLS server connection").AtError()
 	}
 	if !c.isHandshakeComplete.Load() {
-		return errors.New("tls: handshake has not yet been performed")
+		return utlserrors.New("tls: handshake has not yet been performed").AtError()
 	}
 	if len(c.verifiedChains) == 0 {
-		return errors.New("tls: handshake did not verify certificate chain")
+		return utlserrors.New("tls: handshake did not verify certificate chain").AtError()
 	}
 	if len(c.peerCertificates) == 0 {
-		return errors.New("tls: no peer certificates available")
+		return utlserrors.New("tls: no peer certificates available").AtError()
 	}
 	return c.peerCertificates[0].VerifyHostname(host)
 }

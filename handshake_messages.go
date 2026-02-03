@@ -5,11 +5,13 @@
 package tls
 
 import (
-	"errors"
+	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -109,6 +111,9 @@ type clientHelloMsg struct {
 }
 
 func (m *clientHelloMsg) marshalMsg(echInner bool) ([]byte, error) {
+	if m == nil {
+		return nil, utlserrors.New("tls: cannot marshal nil clientHelloMsg").AtError()
+	}
 	// [uTLS SECTION BEGIN]
 	return m.marshalMsgReorderOuterExts(echInner, nil)
 }
@@ -416,6 +421,9 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 }
 
 func (m *clientHelloMsg) marshal() ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "marshaling ClientHello, vers:", m.vers, " serverName:", m.serverName)
+	}
 	// [uTLS SECTION START]
 	if m.original != nil {
 		return m.original, nil
@@ -449,7 +457,7 @@ func (m *clientHelloMsg) marshalWithoutBinders() ([]byte, error) {
 	// RFC 8446 Section 4.2.11.2: Validate that binders length does not exceed
 	// message length to prevent slice bounds panic from malformed messages.
 	if bindersLen > len(fullMessage) {
-		return nil, errors.New("tls: binders length exceeds message length")
+		return nil, utlserrors.New("tls: binders length exceeds message length").AtError()
 	}
 
 	return fullMessage[:len(fullMessage)-bindersLen], nil
@@ -459,11 +467,11 @@ func (m *clientHelloMsg) marshalWithoutBinders() ([]byte, error) {
 // the same length as the current m.pskBinders.
 func (m *clientHelloMsg) updateBinders(pskBinders [][]byte) error {
 	if len(pskBinders) != len(m.pskBinders) {
-		return errors.New("tls: internal error: pskBinders length mismatch")
+		return utlserrors.New("tls: internal error: pskBinders length mismatch").AtError()
 	}
 	for i := range m.pskBinders {
 		if len(pskBinders[i]) != len(m.pskBinders[i]) {
-			return errors.New("tls: internal error: pskBinders length mismatch")
+			return utlserrors.New("tls: internal error: pskBinders length mismatch").AtError()
 		}
 	}
 	m.pskBinders = pskBinders
@@ -472,12 +480,18 @@ func (m *clientHelloMsg) updateBinders(pskBinders [][]byte) error {
 }
 
 func (m *clientHelloMsg) unmarshal(data []byte) bool {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "parsing ClientHello, len:", len(data))
+	}
 	*m = clientHelloMsg{original: data}
 	s := cryptobyte.String(data)
 
 	if !s.Skip(4) || // message type and uint24 length field
 		!s.ReadUint16(&m.vers) || !s.ReadBytes(&m.random, 32) ||
 		!readUint8LengthPrefixed(&s, &m.sessionId) {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "ClientHello parse failed: invalid header")
+		}
 		return false
 	}
 
@@ -868,6 +882,9 @@ type serverHelloMsg struct {
 }
 
 func (m *serverHelloMsg) marshal() ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "marshaling ServerHello, vers:", m.vers, " cipherSuite:", fmt.Sprintf("0x%04x", m.cipherSuite))
+	}
 	var exts cryptobyte.Builder
 	if m.ocspStapling {
 		exts.AddUint16(extensionStatusRequest)
@@ -993,6 +1010,9 @@ func (m *serverHelloMsg) marshal() ([]byte, error) {
 }
 
 func (m *serverHelloMsg) unmarshal(data []byte) bool {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "parsing ServerHello, len:", len(data))
+	}
 	*m = serverHelloMsg{original: data}
 	s := cryptobyte.String(data)
 
@@ -1001,6 +1021,9 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 		!readUint8LengthPrefixed(&s, &m.sessionId) ||
 		!s.ReadUint16(&m.cipherSuite) ||
 		!s.ReadUint8(&m.compressionMethod) {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "ServerHello parse failed: invalid header")
+		}
 		return false
 	}
 
@@ -1570,10 +1593,34 @@ type certificateMsg struct {
 func (m *certificateMsg) marshal() ([]byte, error) {
 	var i int
 	for _, slice := range m.certificates {
+		// Check for overflow before accumulation
+		if i > math.MaxInt-len(slice) {
+			return nil, utlserrors.New("tls: certificate data too large").AtError()
+		}
 		i += len(slice)
 	}
 
-	length := 3 + 3*len(m.certificates) + i
+	// Check for overflow: 3*len(m.certificates)
+	certCount := len(m.certificates)
+	if certCount > (math.MaxInt-3)/3 {
+		return nil, utlserrors.New("tls: too many certificates").AtError()
+	}
+	certHeaderLen := 3 * certCount
+
+	// Check for overflow: 3 + certHeaderLen + i
+	if certHeaderLen > math.MaxInt-3 {
+		return nil, utlserrors.New("tls: certificate length overflow").AtError()
+	}
+	length := 3 + certHeaderLen
+	if length > math.MaxInt-i {
+		return nil, utlserrors.New("tls: certificate length overflow").AtError()
+	}
+	length += i
+
+	// Check for overflow before allocation
+	if length > math.MaxInt-4 {
+		return nil, utlserrors.New("tls: certificate message too large").AtError()
+	}
 	x := make([]byte, 4+length)
 	x[0] = typeCertificate
 	x[1] = uint8(length >> 16)
@@ -1702,15 +1749,21 @@ func marshalCertificate(b *cryptobyte.Builder, certificate Certificate) {
 }
 
 func (m *certificateMsgTLS13) unmarshal(data []byte) bool {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "parsing CertificateTLS13, len:", len(data))
+	}
 	*m = certificateMsgTLS13{}
 	s := cryptobyte.String(data)
 
-	var context cryptobyte.String
+	var ctx cryptobyte.String
 	// [uTLS] Modified to capture delegated credential
 	if !s.Skip(4) || // message type and uint24 length field
-		!s.ReadUint8LengthPrefixed(&context) || !context.Empty() ||
+		!s.ReadUint8LengthPrefixed(&ctx) || !ctx.Empty() ||
 		!unmarshalCertificateWithDC(&s, &m.certificate, &m.delegatedCredential) ||
 		!s.Empty() {
+		if utlserrors.DebugLoggingEnabled {
+			utlserrors.LogDebug(context.Background(), "CertificateTLS13 parse failed")
+		}
 		return false
 	}
 
@@ -1805,6 +1858,10 @@ type serverKeyExchangeMsg struct {
 
 func (m *serverKeyExchangeMsg) marshal() ([]byte, error) {
 	length := len(m.key)
+	// Check for overflow before allocation
+	if length > math.MaxInt-4 {
+		return nil, utlserrors.New("tls: server key exchange data too large").AtError()
+	}
 	x := make([]byte, length+4)
 	x[0] = typeServerKeyExchange
 	x[1] = uint8(length >> 16)
@@ -1871,6 +1928,10 @@ type clientKeyExchangeMsg struct {
 
 func (m *clientKeyExchangeMsg) marshal() ([]byte, error) {
 	length := len(m.ciphertext)
+	// Check for overflow before allocation
+	if length > math.MaxInt-4 {
+		return nil, utlserrors.New("tls: client key exchange data too large").AtError()
+	}
 	x := make([]byte, length+4)
 	x[0] = typeClientKeyExchange
 	x[1] = uint8(length >> 16)
@@ -1898,6 +1959,9 @@ type finishedMsg struct {
 }
 
 func (m *finishedMsg) marshal() ([]byte, error) {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "marshaling Finished, verifyData len:", len(m.verifyData))
+	}
 	var b cryptobyte.Builder
 	b.AddUint8(typeFinished)
 	b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
@@ -1908,6 +1972,9 @@ func (m *finishedMsg) marshal() ([]byte, error) {
 }
 
 func (m *finishedMsg) unmarshal(data []byte) bool {
+	if utlserrors.DebugLoggingEnabled {
+		utlserrors.LogDebug(context.Background(), "parsing Finished, len:", len(data))
+	}
 	s := cryptobyte.String(data)
 	return s.Skip(1) &&
 		readUint24LengthPrefixed(&s, &m.verifyData) &&
@@ -1926,17 +1993,50 @@ type certificateRequestMsg struct {
 
 func (m *certificateRequestMsg) marshal() ([]byte, error) {
 	// See RFC 4346, Section 7.4.4.
-	length := 1 + len(m.certificateTypes) + 2
+	// Check for overflow: 1 + len(m.certificateTypes) + 2
+	certTypesLen := len(m.certificateTypes)
+	if certTypesLen > math.MaxInt-3 {
+		return nil, utlserrors.New("tls: certificate types too large").AtError()
+	}
+	length := 1 + certTypesLen + 2
+
 	casLength := 0
 	for _, ca := range m.certificateAuthorities {
-		casLength += 2 + len(ca)
+		caLen := len(ca)
+		// Check for overflow: 2 + len(ca)
+		if caLen > math.MaxInt-2 {
+			return nil, utlserrors.New("tls: certificate authority too large").AtError()
+		}
+		// Check for overflow in accumulation
+		if casLength > math.MaxInt-(2+caLen) {
+			return nil, utlserrors.New("tls: certificate authorities total length overflow").AtError()
+		}
+		casLength += 2 + caLen
+	}
+	// Check for overflow: length += casLength
+	if length > math.MaxInt-casLength {
+		return nil, utlserrors.New("tls: certificate request length overflow").AtError()
 	}
 	length += casLength
 
 	if m.hasSignatureAlgorithm {
-		length += 2 + 2*len(m.supportedSignatureAlgorithms)
+		sigAlgCount := len(m.supportedSignatureAlgorithms)
+		// Check for overflow: 2*len(m.supportedSignatureAlgorithms)
+		if sigAlgCount > (math.MaxInt-2)/2 {
+			return nil, utlserrors.New("tls: too many signature algorithms").AtError()
+		}
+		sigAlgLen := 2 + 2*sigAlgCount
+		// Check for overflow: length += sigAlgLen
+		if length > math.MaxInt-sigAlgLen {
+			return nil, utlserrors.New("tls: certificate request length overflow").AtError()
+		}
+		length += sigAlgLen
 	}
 
+	// Check for overflow before allocation
+	if length > math.MaxInt-4 {
+		return nil, utlserrors.New("tls: certificate request message too large").AtError()
+	}
 	x := make([]byte, 4+length)
 	x[0] = typeCertificateRequest
 	x[1] = uint8(length >> 16)
@@ -2090,7 +2190,15 @@ type newSessionTicketMsg struct {
 func (m *newSessionTicketMsg) marshal() ([]byte, error) {
 	// See RFC 5077, Section 3.3.
 	ticketLen := len(m.ticket)
+	// Check for overflow: 2 + 4 + ticketLen
+	if ticketLen > math.MaxInt-6 {
+		return nil, utlserrors.New("tls: session ticket too large").AtError()
+	}
 	length := 2 + 4 + ticketLen
+	// Check for overflow before allocation
+	if length > math.MaxInt-4 {
+		return nil, utlserrors.New("tls: session ticket message too large").AtError()
+	}
 	x := make([]byte, 4+length)
 	x[0] = typeNewSessionTicket
 	x[1] = uint8(length >> 16)
@@ -2150,6 +2258,9 @@ type transcriptHash interface {
 // extension ordering and other malleable fields, which may cause differences
 // between what was received and what we marshal.
 func transcriptMsg(msg handshakeMessage, h transcriptHash) error {
+	if h == nil {
+		return utlserrors.New("tls: nil transcriptHash").AtError()
+	}
 	if msgWithOrig, ok := msg.(handshakeMessageWithOriginalBytes); ok {
 		if orig := msgWithOrig.originalBytes(); orig != nil {
 			h.Write(msgWithOrig.originalBytes())

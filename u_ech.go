@@ -1,14 +1,15 @@
 package tls
 
 import (
+	"context"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"sync"
 
 	"github.com/refraction-networking/utls/dicttls"
+	utlserrors "github.com/refraction-networking/utls/errors"
 	"github.com/refraction-networking/utls/internal/hpke"
 	"golang.org/x/crypto/cryptobyte"
 )
@@ -66,6 +67,9 @@ type GREASEECHExtension = GREASEEncryptedClientHelloExtension // alias
 // Note: The error is stored in g.initErr so subsequent calls return the same error.
 func (g *GREASEEncryptedClientHelloExtension) init() error {
 	g.initOnce.Do(func() {
+		ctx := context.Background()
+		utlserrors.LogDebug(ctx, "ECH GREASE: initializing extension")
+
 		// Skip configId and cipherSuite generation if EncapsulatedKey is already set.
 		// This indicates the extension was created via cloneWithState from an already-
 		// initialized extension, so we should preserve the copied values.
@@ -74,6 +78,10 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 		// 2. It's never empty for an initialized extension
 		// 3. It's always copied by cloneWithState
 		alreadyInitialized := len(g.EncapsulatedKey) > 0
+
+		if alreadyInitialized {
+			utlserrors.LogDebug(ctx, "ECH GREASE: already initialized (cloned state)")
+		}
 
 		if !alreadyInitialized {
 			// Set the config_id field to a random byte.
@@ -85,18 +93,20 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 				var b []byte = make([]byte, 1)
 				_, err := rand.Read(b[:])
 				if err != nil {
-					g.initErr = fmt.Errorf("error generating random byte for config_id: %w", err)
+					g.initErr = utlserrors.New("ECH GREASE: error generating random byte for config_id").Base(err).AtError()
 					return
 				}
 				g.configId = b[0]
+				utlserrors.LogDebug(ctx, "ECH GREASE: generated random configId=", g.configId)
 			} else {
 				// randomly pick one from the list
 				rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateConfigIds))))
 				if err != nil {
-					g.initErr = fmt.Errorf("error generating random index for config_id: %w", err)
+					g.initErr = utlserrors.New("ECH GREASE: error generating random index for config_id").Base(err).AtError()
 					return
 				}
 				g.configId = g.CandidateConfigIds[rndIndex.Int64()]
+				utlserrors.LogDebug(ctx, "ECH GREASE: selected configId=", g.configId, " from candidates")
 			}
 
 			// Set the cipher_suite field to a supported HpkeSymmetricCipherSuite.
@@ -105,17 +115,21 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// in the same session.
 			if len(g.CandidateCipherSuites) == 0 {
 				g.cipherSuite = HPKESymmetricCipherSuite{uint16(defaultHpkeKdf), uint16(defaultHpkeAead)}
+				utlserrors.LogDebug(ctx, "ECH GREASE: using default cipher suite KDF=0x",
+					fmt.Sprintf("%04x", defaultHpkeKdf), " AEAD=0x", fmt.Sprintf("%04x", defaultHpkeAead))
 			} else {
 				// randomly pick one from the list
 				rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidateCipherSuites))))
 				if err != nil {
-					g.initErr = fmt.Errorf("error generating random index for cipher_suite: %w", err)
+					g.initErr = utlserrors.New("ECH GREASE: error generating random index for cipher_suite").Base(err).AtError()
 					return
 				}
 				g.cipherSuite = HPKESymmetricCipherSuite{
 					g.CandidateCipherSuites[rndIndex.Int64()].KdfId,
 					g.CandidateCipherSuites[rndIndex.Int64()].AeadId,
 				}
+				utlserrors.LogDebug(ctx, "ECH GREASE: selected cipher suite KDF=0x",
+					fmt.Sprintf("%04x", g.cipherSuite.KdfId), " AEAD=0x", fmt.Sprintf("%04x", g.cipherSuite.AeadId))
 			}
 		}
 
@@ -124,7 +138,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 
 			echPK, err := hpke.ParseHPKEPublicKey(uint16(kem), dummyX25519PublicKey)
 			if err != nil {
-				g.initErr = fmt.Errorf("tls: ECH key parse error: %w", err)
+				g.initErr = utlserrors.New("tls: ECH GREASE key parse error").Base(err).AtError()
 				return
 			}
 			suite := echCipher{
@@ -133,9 +147,10 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			}
 			g.EncapsulatedKey, _, err = hpke.SetupSender(kem, suite.KDFID, suite.AEADID, echPK, []byte{})
 			if err != nil {
-				g.initErr = fmt.Errorf("tls: ECH setup error: %w", err)
+				g.initErr = utlserrors.New("tls: ECH GREASE setup error").Base(err).AtError()
 				return
 			}
+			utlserrors.LogDebug(ctx, "ECH GREASE: generated encapsulated key, length=", len(g.EncapsulatedKey))
 		}
 
 		if len(g.payload) == 0 {
@@ -153,7 +168,7 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// randomly pick one from the list
 			rndIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(g.CandidatePayloadLens))))
 			if err != nil {
-				g.initErr = fmt.Errorf("error generating random index for payload length: %w", err)
+				g.initErr = utlserrors.New("ECH GREASE: error generating random index for payload length").Base(err).AtError()
 				return
 			}
 
@@ -163,12 +178,20 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 			// This prevents exact size matching even when the same base size is selected.
 			jitterBig, err := rand.Int(rand.Reader, big.NewInt(16))
 			if err != nil {
-				g.initErr = fmt.Errorf("error generating random jitter for payload length: %w", err)
+				g.initErr = utlserrors.New("ECH GREASE: error generating random jitter for payload length").Base(err).AtError()
 				return
 			}
 			finalLen := baseLen + uint16(jitterBig.Int64())
 
+			utlserrors.LogDebug(ctx, "ECH GREASE: generating payload, baseLen=", baseLen,
+				" jitter=", jitterBig.Int64(), " finalLen=", finalLen)
+
 			g.initErr = g.randomizePayload(finalLen)
+			if g.initErr != nil {
+				return
+			}
+
+			utlserrors.LogDebug(ctx, "ECH GREASE: initialization complete, payloadLen=", len(g.payload))
 		}
 	})
 
@@ -176,18 +199,25 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 }
 
 func (g *GREASEEncryptedClientHelloExtension) randomizePayload(encodedHelloInnerLen uint16) error {
+	ctx := context.Background()
+
 	if len(g.payload) != 0 {
-		return errors.New("tls: ECH extension already initialized")
+		utlserrors.LogDebug(ctx, "ECH GREASE: payload already initialized")
+		return utlserrors.New("tls: ECH extension already initialized").AtError()
 	}
 
 	payloadLen := cipherLen(g.cipherSuite.AeadId, int(encodedHelloInnerLen))
 	if payloadLen < 0 {
-		return errors.New("tls: invalid ECH cipher suite")
+		utlserrors.LogDebug(ctx, "ECH GREASE: invalid cipher suite AEAD=0x", fmt.Sprintf("%04x", g.cipherSuite.AeadId))
+		return utlserrors.New("tls: invalid ECH cipher suite").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "ECH GREASE: randomizing payload, encodedLen=", encodedHelloInnerLen, " payloadLen=", payloadLen)
+
 	g.payload = make([]byte, payloadLen)
 	_, err := rand.Read(g.payload)
 	if err != nil {
-		return fmt.Errorf("tls: ECH random generation error: %w", err)
+		return utlserrors.New("tls: ECH GREASE random generation error").Base(err).AtError()
 	}
 	return nil
 }
@@ -204,24 +234,33 @@ func (g *GREASEEncryptedClientHelloExtension) writeToUConn(uconn *UConn) error {
 // Returns 0 if initialization fails, consistent with Read() which will return
 // the error. Callers should handle the error from Read() to diagnose issues.
 func (g *GREASEEncryptedClientHelloExtension) Len() int {
+	ctx := context.Background()
+
 	if err := g.init(); err != nil {
 		// Return 0 on error for consistency: Read() will return 0 bytes written
 		// along with the actual error. Returning non-zero here while Read()
 		// writes nothing would cause buffer allocation/usage inconsistencies.
+		utlserrors.LogDebug(ctx, "ECH GREASE: Len returning 0 due to init error")
 		return 0
 	}
-	return 2 + 2 + 1 /* ClientHello Type */ + 4 /* CipherSuite */ + 1 /* Config ID */ + 2 + len(g.EncapsulatedKey) + 2 + len(g.payload)
+	extLen := 2 + 2 + 1 /* ClientHello Type */ + 4 /* CipherSuite */ + 1 /* Config ID */ + 2 + len(g.EncapsulatedKey) + 2 + len(g.payload)
+	utlserrors.LogDebug(ctx, "ECH GREASE: Len=", extLen)
+	return extLen
 }
 
 // Read implements TLSExtension.
 func (g *GREASEEncryptedClientHelloExtension) Read(b []byte) (int, error) {
+	ctx := context.Background()
+
 	// Check for initialization errors first
 	if err := g.init(); err != nil {
-		return 0, fmt.Errorf("tls: ech extension initialization failed: %w", err)
+		utlserrors.LogDebug(ctx, "ECH GREASE: Read failed, initialization error")
+		return 0, utlserrors.New("tls: ech extension initialization failed").Base(err).AtError()
 	}
 
 	extLen := 2 + 2 + 1 + 4 + 1 + 2 + len(g.EncapsulatedKey) + 2 + len(g.payload)
 	if len(b) < extLen {
+		utlserrors.LogDebug(ctx, "ECH GREASE: buffer too small, have=", len(b), " need=", extLen)
 		return 0, io.ErrShortBuffer
 	}
 
@@ -242,17 +281,23 @@ func (g *GREASEEncryptedClientHelloExtension) Read(b []byte) (int, error) {
 	b[12+len(g.EncapsulatedKey)+1] = byte(len(g.payload) & 0xFF)
 	copy(b[12+len(g.EncapsulatedKey)+2:], g.payload)
 
+	utlserrors.LogDebug(ctx, "ECH GREASE: Read complete, extLen=", extLen,
+		" configID=", g.configId, " payloadLen=", len(g.payload))
+
 	return extLen, io.EOF
 }
 
 // MarshalClientHello implements EncryptedClientHelloExtension.
 func (*GREASEEncryptedClientHelloExtension) MarshalClientHello(*UConn) error {
-	return errors.New("tls: ECH marshal not supported on this extension type")
+	return utlserrors.New("tls: ECH marshal not supported on this extension type").AtError()
 }
 
 // Write implements TLSExtensionWriter.
 func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
+	ctx := context.Background()
 	fullLen := len(b)
+	utlserrors.LogDebug(ctx, "ECH GREASE: parsing extension data, length=", fullLen)
+
 	extData := cryptobyte.String(b)
 
 	// Check the extension type, it must be OuterClientHello otherwise we are not
@@ -260,83 +305,105 @@ func (g *GREASEEncryptedClientHelloExtension) Write(b []byte) (int, error) {
 	var chType uint8 // 0: outer, 1: inner
 	var ignored cryptobyte.String
 	if !extData.ReadUint8(&chType) || chType != 0 {
-		return fullLen, errors.New("bad Client Hello type, expected 0, got " + fmt.Sprintf("%d", chType))
+		utlserrors.LogDebug(ctx, "ECH GREASE: bad ClientHello type=", chType)
+		return fullLen, utlserrors.New("bad Client Hello type, expected 0, got ", chType).AtError()
 	}
 
 	// Parse the cipher suite
 	if !extData.ReadUint16(&g.cipherSuite.KdfId) || !extData.ReadUint16(&g.cipherSuite.AeadId) {
-		return fullLen, errors.New("bad cipher suite")
+		utlserrors.LogDebug(ctx, "ECH GREASE: failed to read cipher suite")
+		return fullLen, utlserrors.New("bad cipher suite").AtError()
 	}
 	if g.cipherSuite.KdfId != dicttls.HKDF_SHA256 &&
 		g.cipherSuite.KdfId != dicttls.HKDF_SHA384 &&
 		g.cipherSuite.KdfId != dicttls.HKDF_SHA512 {
-		return fullLen, errors.New("bad KDF ID: " + fmt.Sprintf("%d", g.cipherSuite.KdfId))
+		utlserrors.LogDebug(ctx, "ECH GREASE: unsupported KDF ID=", g.cipherSuite.KdfId)
+		return fullLen, utlserrors.New("bad KDF ID: ", g.cipherSuite.KdfId).AtError()
 	}
 	if g.cipherSuite.AeadId != dicttls.AEAD_AES_128_GCM &&
 		g.cipherSuite.AeadId != dicttls.AEAD_AES_256_GCM &&
 		g.cipherSuite.AeadId != dicttls.AEAD_CHACHA20_POLY1305 {
-		return fullLen, errors.New("bad AEAD ID: " + fmt.Sprintf("%d", g.cipherSuite.AeadId))
+		utlserrors.LogDebug(ctx, "ECH GREASE: unsupported AEAD ID=", g.cipherSuite.AeadId)
+		return fullLen, utlserrors.New("bad AEAD ID: ", g.cipherSuite.AeadId).AtError()
 	}
 	g.CandidateCipherSuites = []HPKESymmetricCipherSuite{g.cipherSuite}
 
+	utlserrors.LogDebug(ctx, "ECH GREASE: parsed cipher suite KDF=0x",
+		fmt.Sprintf("%04x", g.cipherSuite.KdfId), " AEAD=0x", fmt.Sprintf("%04x", g.cipherSuite.AeadId))
+
 	// GREASE the ConfigId
 	if !extData.ReadUint8(&g.configId) {
-		return fullLen, errors.New("bad config ID")
+		utlserrors.LogDebug(ctx, "ECH GREASE: failed to read config ID")
+		return fullLen, utlserrors.New("bad config ID").AtError()
 	}
 	// we don't write to CandidateConfigIds because we don't really want to reuse the same config_id
 
 	// GREASE the EncapsulatedKey
 	if !extData.ReadUint16LengthPrefixed(&ignored) {
-		return fullLen, errors.New("bad encapsulated key")
+		utlserrors.LogDebug(ctx, "ECH GREASE: failed to read encapsulated key")
+		return fullLen, utlserrors.New("bad encapsulated key").AtError()
 	}
 	// Validate encapsulated key size: must not be empty and must have reasonable bounds.
 	// X25519 uses 32 bytes, P-256 uses 65 bytes, P-384/P-521 use more. 256 bytes covers all KEMs.
 	const maxEncapsulatedKeyLen = 256
 	if len(ignored) == 0 {
-		return fullLen, errors.New("tls: empty encapsulated key")
+		utlserrors.LogDebug(ctx, "ECH GREASE: empty encapsulated key")
+		return fullLen, utlserrors.New("tls: empty encapsulated key").AtError()
 	}
 	if len(ignored) > maxEncapsulatedKeyLen {
-		return fullLen, fmt.Errorf("tls: encapsulated key too large: %d > %d", len(ignored), maxEncapsulatedKeyLen)
+		utlserrors.LogDebug(ctx, "ECH GREASE: encapsulated key too large=", len(ignored))
+		return fullLen, utlserrors.New("tls: encapsulated key too large: ", len(ignored), " > ", maxEncapsulatedKeyLen).AtError()
 	}
 	g.EncapsulatedKey = make([]byte, len(ignored))
 	n, err := rand.Read(g.EncapsulatedKey)
 	if err != nil {
-		return fullLen, fmt.Errorf("tls: generating ech key: %w", err)
+		return fullLen, utlserrors.New("tls: generating ech key").Base(err).AtError()
 	}
 	if n != len(g.EncapsulatedKey) {
-		return fullLen, fmt.Errorf("tls: short read generating ech key")
+		return fullLen, utlserrors.New("tls: short read generating ech key").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "ECH GREASE: generated encapsulated key, length=", len(g.EncapsulatedKey))
 
 	// GREASE the payload
 	if !extData.ReadUint16LengthPrefixed(&ignored) {
-		return fullLen, errors.New("bad payload")
+		utlserrors.LogDebug(ctx, "ECH GREASE: failed to read payload")
+		return fullLen, utlserrors.New("bad payload").AtError()
 	}
 	// Validate payload size: must contain at least AEAD overhead + 1 byte of plaintext,
 	// and must not exceed reasonable bounds to prevent memory exhaustion.
 	const maxPayloadLen = 16384 // 16KB is sufficient for any realistic ECH payload
 	cipherOverhead := cipherLen(g.cipherSuite.AeadId, 0)
 	if cipherOverhead < 0 {
-		return fullLen, errors.New("tls: invalid AEAD identifier")
+		utlserrors.LogDebug(ctx, "ECH GREASE: invalid AEAD identifier")
+		return fullLen, utlserrors.New("tls: invalid AEAD identifier").AtError()
 	}
 	if len(ignored) == 0 {
-		return fullLen, errors.New("tls: empty ECH payload")
+		utlserrors.LogDebug(ctx, "ECH GREASE: empty payload")
+		return fullLen, utlserrors.New("tls: empty ECH payload").AtError()
 	}
 	if len(ignored) <= cipherOverhead {
-		return fullLen, fmt.Errorf("tls: payload too short for AEAD overhead: %d <= %d", len(ignored), cipherOverhead)
+		utlserrors.LogDebug(ctx, "ECH GREASE: payload too short=", len(ignored), " overhead=", cipherOverhead)
+		return fullLen, utlserrors.New("tls: payload too short for AEAD overhead: ", len(ignored), " <= ", cipherOverhead).AtError()
 	}
 	if len(ignored) > maxPayloadLen {
-		return fullLen, fmt.Errorf("tls: ECH payload too large: %d > %d", len(ignored), maxPayloadLen)
+		utlserrors.LogDebug(ctx, "ECH GREASE: payload too large=", len(ignored))
+		return fullLen, utlserrors.New("tls: ECH payload too large: ", len(ignored), " > ", maxPayloadLen).AtError()
 	}
 	// Set payload directly with exact size to preserve fingerprint during round-trip.
 	// This bypasses the jitter logic in init() which would alter the size.
 	g.payload = make([]byte, len(ignored))
 	if _, err := rand.Read(g.payload); err != nil {
-		return fullLen, fmt.Errorf("tls: generating ech payload: %w", err)
+		return fullLen, utlserrors.New("tls: generating ech payload").Base(err).AtError()
 	}
 
 	if !extData.Empty() {
-		return fullLen, errors.New("tls: extension has trailing data")
+		utlserrors.LogDebug(ctx, "ECH GREASE: extension has trailing data")
+		return fullLen, utlserrors.New("tls: extension has trailing data").AtError()
 	}
+
+	utlserrors.LogDebug(ctx, "ECH GREASE: successfully parsed extension, configID=", g.configId,
+		" payloadLen=", len(g.payload))
 
 	return fullLen, nil
 }
@@ -350,6 +417,9 @@ func (g *GREASEEncryptedClientHelloExtension) cloneWithState(
 	payloadLens []uint16,
 	encapKey []byte,
 ) *GREASEEncryptedClientHelloExtension {
+	ctx := context.Background()
+	utlserrors.LogDebug(ctx, "ECH GREASE: cloning extension with state")
+
 	// Ensure initialization is complete before reading internal state.
 	// This prevents race conditions when cloneWithState is called concurrently
 	// while another goroutine might be running init() via sync.Once.
@@ -362,6 +432,8 @@ func (g *GREASEEncryptedClientHelloExtension) cloneWithState(
 		payload = make([]byte, len(g.payload))
 		copy(payload, g.payload)
 	}
+
+	utlserrors.LogDebug(ctx, "ECH GREASE: cloned, configID=", g.configId, " payloadLen=", len(payload))
 
 	return &GREASEEncryptedClientHelloExtension{
 		CandidateCipherSuites: cipherSuites,
@@ -384,7 +456,7 @@ type UnimplementedECHExtension struct{}
 
 // writeToUConn implements TLSExtension.
 func (*UnimplementedECHExtension) writeToUConn(_ *UConn) error {
-	return errors.New("tls: unimplemented ECHExtension")
+	return utlserrors.New("tls: unimplemented ECHExtension").AtError()
 }
 
 // Len implements TLSExtension.
@@ -394,12 +466,12 @@ func (*UnimplementedECHExtension) Len() int {
 
 // Read implements TLSExtension.
 func (*UnimplementedECHExtension) Read(_ []byte) (int, error) {
-	return 0, errors.New("tls: unimplemented ECHExtension")
+	return 0, utlserrors.New("tls: unimplemented ECHExtension").AtError()
 }
 
 // MarshalClientHello implements EncryptedClientHelloExtension.
 func (*UnimplementedECHExtension) MarshalClientHello(*UConn) error {
-	return errors.New("tls: unimplemented ECHExtension")
+	return utlserrors.New("tls: unimplemented ECHExtension").AtError()
 }
 
 // mustEmbedUnimplementedECHExtension is a noop function but is required to

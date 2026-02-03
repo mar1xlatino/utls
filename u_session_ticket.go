@@ -1,8 +1,9 @@
 package tls
 
 import (
-	"errors"
 	"io"
+
+	utlserrors "github.com/refraction-networking/utls/errors"
 )
 
 type ISessionTicketExtension interface {
@@ -44,7 +45,7 @@ func (e *SessionTicketExtension) Read(b []byte) (int, error) {
 	// Extension data length is stored as uint16 (max 65535).
 	// Header is 4 bytes (2 type + 2 length), so max ticket is 65531.
 	if len(e.Ticket) > 65531 {
-		return 0, errors.New("tls: session ticket too long")
+		return 0, utlserrors.New("tls: session ticket too long").AtError()
 	}
 
 	if len(b) < e.Len() {
@@ -73,19 +74,19 @@ func (e *SessionTicketExtension) InitializeByUtls(session *SessionState, ticket 
 
 	// Validate preconditions - set specific error and return if invalid
 	if e.Initialized {
-		e.InitError = errors.New("tls: session ticket extension already initialized")
+		e.InitError = utlserrors.New("tls: session ticket extension already initialized").AtError()
 		return
 	}
 	if session == nil {
-		e.InitError = errors.New("tls: session ticket initialization failed: session is nil")
+		e.InitError = utlserrors.New("tls: session ticket initialization failed: session is nil").AtError()
 		return
 	}
 	if ticket == nil {
-		e.InitError = errors.New("tls: session ticket initialization failed: ticket is nil")
+		e.InitError = utlserrors.New("tls: session ticket initialization failed: ticket is nil").AtError()
 		return
 	}
 	if session.version != VersionTLS12 {
-		e.InitError = errors.New("tls: session ticket initialization failed: session version mismatch (expected TLS 1.2)")
+		e.InitError = utlserrors.New("tls: session ticket initialization failed: session version mismatch (expected TLS 1.2)").AtError()
 		return
 	}
 

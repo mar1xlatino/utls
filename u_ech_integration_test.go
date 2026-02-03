@@ -184,7 +184,10 @@ func testECHRealServer(t *testing.T, server ECHTestServer, clientHelloID ClientH
 	}
 
 	// Create uTLS connection
-	uconn := UClient(tcpConn, tlsConfig, clientHelloID)
+	uconn, err := UClient(tcpConn, tlsConfig, clientHelloID)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	defer uconn.Close()
 
 	// Set handshake deadline
@@ -295,7 +298,10 @@ func testECHRetry(t *testing.T, server ECHTestServer, clientHelloID ClientHelloI
 	}
 
 	// Create uTLS connection
-	uconn := UClient(tcpConn, tlsConfig, clientHelloID)
+	uconn, err := UClient(tcpConn, tlsConfig, clientHelloID)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	defer uconn.Close()
 
 	// Set deadline
@@ -349,7 +355,10 @@ func TestECHGREASE(t *testing.T) {
 				MinVersion:         VersionTLS12,
 			}
 
-			uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			defer uconn.Close()
 
 			if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -400,7 +409,10 @@ func TestECHFallbackToPlaintext(t *testing.T) {
 		EncryptedClientHelloConfigList: nil, // No ECH config - should work normally
 	}
 
-	uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	defer uconn.Close()
 
 	if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -456,7 +468,10 @@ func TestECHWithInvalidConfig(t *testing.T) {
 				EncryptedClientHelloConfigList: tc.config,
 			}
 
-			uconn := UClient(tcpConn, tlsConfig, HelloGolang)
+			uconn, err := UClient(tcpConn, tlsConfig, HelloGolang)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			defer uconn.Close()
 
 			if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -516,7 +531,11 @@ func TestECHConcurrent(t *testing.T) {
 				EncryptedClientHelloConfigList: echConfig,
 			}
 
-			uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			if err != nil {
+				errors <- fmt.Errorf("conn %d: UClient failed: %w", connID, err)
+				return
+			}
 			defer uconn.Close()
 
 			if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -619,7 +638,10 @@ func TestECHCertificateVerification(t *testing.T) {
 				EncryptedClientHelloConfigList: echConfig,
 			}
 
-			uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			defer uconn.Close()
 
 			if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -694,7 +716,10 @@ func TestECHWithDifferentProfiles(t *testing.T) {
 				EncryptedClientHelloConfigList: echConfig,
 			}
 
-			uconn := UClient(tcpConn, tlsConfig, profile.id)
+			uconn, err := UClient(tcpConn, tlsConfig, profile.id)
+			if err != nil {
+				t.Fatalf("UClient failed: %v", err)
+			}
 			defer uconn.Close()
 
 			if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -743,7 +768,10 @@ func TestECHResponseBody(t *testing.T) {
 		EncryptedClientHelloConfigList: echConfig,
 	}
 
-	uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	defer uconn.Close()
 
 	if err := uconn.SetDeadline(time.Now().Add(testHandshakeTimeout)); err != nil {
@@ -925,7 +953,10 @@ func TestECHTimeoutHandling(t *testing.T) {
 		EncryptedClientHelloConfigList: echConfig,
 	}
 
-	uconn := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	uconn, err := UClient(tcpConn, tlsConfig, HelloChrome_Auto)
+	if err != nil {
+		t.Fatalf("UClient failed: %v", err)
+	}
 	defer uconn.Close()
 
 	// Set a very short deadline to test timeout handling
