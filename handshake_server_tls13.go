@@ -348,7 +348,16 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 		// X25519MLKEM768, the shared secret is the concatenation of the ML-KEM
 		// shared secret and the X25519 shared secret. The shared secret is 64
 		// bytes (32 bytes for each part)."
-		hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
+		//
+		// FIX: Explicit allocation to prevent append aliasing.
+		// Encapsulate() returns cap=64 for a 32-byte secret (SHA-512 internal buffer),
+		// so append(mlkemSharedSecret, ecdhKey...) reuses the same backing array.
+		// If anyone later adds zeroSlice(mlkemSharedSecret), it would silently
+		// destroy the first 32 bytes of the combined shared key.
+		combined := make([]byte, len(mlkemSharedSecret)+len(hs.sharedKey))
+		copy(combined, mlkemSharedSecret)
+		copy(combined[len(mlkemSharedSecret):], hs.sharedKey)
+		hs.sharedKey = combined
 		// draft-ietf-tls-ecdhe-mlkem-03, Section 3.1.2: "When the
 		// X25519MLKEM768 group is negotiated, the server's key exchange value
 		// is the concatenation of an ML-KEM ciphertext returned from
